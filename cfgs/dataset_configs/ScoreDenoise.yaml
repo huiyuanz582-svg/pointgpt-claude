@@ -1,0 +1,17 @@
+NAME: ScoreDenoise
+ROOT: data/ScoreDenoise
+NOISE_MIN: 0.005
+NOISE_MAX: 0.020
+VAL_NOISE: 0.010
+AUG_ROTATE: True
+# DATASET: examples 
+DATASET: PUNet
+# RESOLUTIONS: ['50000_poisson']
+RESOLUTIONS: ['10000_poisson','30000_poisson','50000_poisson']
+# RESOLUTIONS_10k: ['10000_poisson']
+# RESOLUTIONS_30k: ['30000_poisson']
+# RESOLUTIONS_50;: ['50000_poisson']
+PATCH_SIZE: 10000
+NUM_PATCHES: 1
+TRAIN_BATCH_SIZE: 1
+NUM_WORKERS: 0
