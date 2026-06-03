@@ -200,19 +200,28 @@ def run_net(args, config, train_writer=None, val_writer=None):
 
     # 2. 构建模型
     base_model = builder.model_builder(config.model)
-    # 冻结 encoder
-    for p in base_model.encoder.parameters():
-        p.requires_grad = False
+
+    # Score-based 去噪：encoder 不冻结
+    # 理由：预训练 encoder 学的是"为自回归生成 patch 内点"的特征，跟"估计 score 场"的目标不完全对齐
+    # 整体微调（小 lr）让 encoder 适配 score 任务，比纯冻结好
 
     # parameter setting
     start_epoch = 0
-    # 初始化cd距离
     best_metrics = DenoiseMetrics(0.0)
     best_metrics_vote = DenoiseMetrics(0.0)
     metrics = DenoiseMetrics(0.0)
-    # 加载模型
+
+    # 加载预训练
     if args.ckpts is not None:
         base_model.load_model_from_ckpt(args.ckpts)
+        # Score-based 关键步骤：重新初始化 generator 输出头
+        # 预训练的输出头学的是"生成绝对坐标"，作为 score 估计起点会让 noisy + σ²·score 大幅漂移
+        # 小方差初始化让模型从"不动"起步，逐步学习 score 方向
+        with torch.no_grad():
+            nn.init.normal_(base_model.generator_blocks.increase_dim[0].weight, std=0.01)
+            if base_model.generator_blocks.increase_dim[0].bias is not None:
+                nn.init.zeros_(base_model.generator_blocks.increase_dim[0].bias)
+        print_log('[Score-based] Re-initialized generator output head for score prediction', logger=logger)
     else:
         print_log('Training from scratch', logger=logger)
     
@@ -258,7 +267,7 @@ def run_net(args, config, train_writer=None, val_writer=None):
         npoints = config.npoints #2048
        
 
-        for idx, (pcl_noisy, pcl_clean, center, scale, name) in enumerate(train_dataloader):
+        for idx, (pcl_noisy, pcl_clean, noise_std, center, scale, name) in enumerate(train_dataloader):
 
             num_iter += 1
             n_itr = epoch * n_batches + idx
@@ -266,9 +275,11 @@ def run_net(args, config, train_writer=None, val_writer=None):
             data_time.update(time.time() - batch_start_time)
             pcl_noisy = pcl_noisy.cuda()
             pcl_clean = pcl_clean.cuda()
+            noise_std_t = noise_std.cuda() if noise_std is not None else None
 
             loss1 = base_model(pcl_noisy, pcl_clean, 'train', name,
-                               epoch=epoch, max_epoch=config.max_epoch)
+                               epoch=epoch, max_epoch=config.max_epoch,
+                               noise_std=noise_std_t)
             _loss = loss1 #用于去噪，下游任务的损失和生成任务的损失是一样的
 
             # loss, acc = base_model.module.get_loss_acc(ret, label)
@@ -386,14 +397,15 @@ def validate(base_model, test_dataloader, epoch, val_writer, args, config, logge
     total_p2m = 0.0
 
     with torch.no_grad():
-        for idx, (pcl_noisy, pcl_clean, center, scale, name) in enumerate(test_dataloader):
+        for idx, (pcl_noisy, pcl_clean, noise_std, center, scale, name) in enumerate(test_dataloader):
             pcl_noisy = pcl_noisy.cuda()
             pcl_clean = pcl_clean.cuda()
+            noise_std_t = noise_std.cuda() if noise_std is not None else None
             center_t = center[0].to(pcl_noisy.device)
             scale_t = scale[0].to(pcl_noisy.device)
 
-            # 模型输出在归一化空间
-            denoised_10k_norm = base_model(pcl_noisy, pcl_clean, 'val', name)
+            # 模型输出在归一化空间（单步 Tweedie 去噪）
+            denoised_10k_norm = base_model(pcl_noisy, pcl_clean, 'val', name, noise_std=noise_std_t)
 
             # 归一化空间 CD（与训练 loss 一致）
             batch_cd_10k = ChamferDistanceL2().cuda()(denoised_10k_norm, pcl_clean) * 1e4
@@ -436,15 +448,16 @@ def validate_vote(base_model, test_dataloader, epoch, val_writer, args, config, 
     npoints = config.npoints
 
     with torch.no_grad():
-        for idx, (pcl_noisy, pcl_clean, center, scale, name) in enumerate(test_dataloader):
+        for idx, (pcl_noisy, pcl_clean, noise_std, center, scale, name) in enumerate(test_dataloader):
             pcl_noisy = pcl_noisy.cuda()
             pcl_clean = pcl_clean.cuda()
+            noise_std_t = noise_std.cuda() if noise_std is not None else None
             center_t = center[0].to(pcl_noisy.device)
             scale_t = scale[0].to(pcl_noisy.device)
 
             local_cd = []
             for _ in range(times):
-                denoised = base_model(pcl_noisy, pcl_clean, 'val', name)
+                denoised = base_model(pcl_noisy, pcl_clean, 'val', name, noise_std=noise_std_t)
                 denoised_filtered = sor_filter(denoised[0])
                 denoised = denoised_filtered.unsqueeze(0).to(pcl_noisy.device)
                 denoised_world = denoised * scale_t + center_t
@@ -505,7 +518,7 @@ def test(base_model, test_dataloader, args, config, logger=None):
 
     with torch.no_grad():
         vote_times = 5
-        for idx, (pcl_noisy, pcl_clean, center, scale, name) in enumerate(test_dataloader):
+        for idx, (pcl_noisy, pcl_clean, noise_std, center, scale, name) in enumerate(test_dataloader):
             save_path = 'test_test_result_1'
             save_path2 = 'visualiza-result10k-1'
             save_path3 = 'finetune_scoredenoise_L'
@@ -527,6 +540,7 @@ def test(base_model, test_dataloader, args, config, logger=None):
 
             pcl_noisy = pcl_noisy.cuda()
             pcl_clean = pcl_clean.cuda()
+            noise_std_t = noise_std.cuda() if noise_std is not None else None
             center_gpu = center_t.to(pcl_noisy.device)
             scale_gpu = scale_t.to(pcl_noisy.device)
 
@@ -541,7 +555,7 @@ def test(base_model, test_dataloader, args, config, logger=None):
             best_p2m = None
             best_denoised = None
             for _ in range(vote_times):
-                denoised_10k = base_model(pcl_noisy, pcl_clean, 'val', name)
+                denoised_10k = base_model(pcl_noisy, pcl_clean, 'val', name, noise_std=noise_std_t)
                 denoised_filtered = sor_filter(denoised_10k[0])
                 denoised_10k = denoised_filtered.unsqueeze(0).to(denoised_10k.device)
                 denoised_world = denoised_10k * scale_gpu + center_gpu
@@ -642,15 +656,16 @@ def test_vote(base_model, test_dataloader, epoch, val_writer, args, config, logg
     cd_list_10k = []
 
     with torch.no_grad():
-        for idx, (pcl_noisy, pcl_clean, center, scale, name) in enumerate(test_dataloader):
+        for idx, (pcl_noisy, pcl_clean, noise_std, center, scale, name) in enumerate(test_dataloader):
             pcl_noisy = pcl_noisy.cuda()
             pcl_clean = pcl_clean.cuda()
+            noise_std_t = noise_std.cuda() if noise_std is not None else None
             center_t = center[0].to(pcl_noisy.device)
             scale_t = scale[0].to(pcl_noisy.device)
             local_cd = []
             local_p2m = []
             for kk in range(times):
-                denoised_10k = base_model(pcl_noisy, pcl_clean, 'val', name)
+                denoised_10k = base_model(pcl_noisy, pcl_clean, 'val', name, noise_std=noise_std_t)
 
                 denoised_filtered = sor_filter(denoised_10k[0])
                 denoised_10k = denoised_filtered.unsqueeze(0).to(denoised_10k.device)

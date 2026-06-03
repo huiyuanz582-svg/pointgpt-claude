@@ -351,6 +351,7 @@ def denoise_collate_fn_test(batch):
     name_list = []
     center_list = []
     scale_list = []
+    noise_std_list = []
 
     for item in batch:
         assert "pcl_clean" in item
@@ -362,11 +363,18 @@ def denoise_collate_fn_test(batch):
         name_list.append(item["name"])
         center_list.append(item["center"])
         scale_list.append(item["scale"])
+        noise_std_list.append(item.get('noise_std', None))
 
     noisy = torch.stack(noisy_list, dim=0).float()
     clean = torch.stack(clean_list, dim=0).float()
 
-    return noisy, clean, center_list, scale_list, name_list
+    # noise_std: train/val 走 transform 一定有；test 走 PairedEvalDataset 没有，置 None 由模型 fallback
+    if all(s is None for s in noise_std_list):
+        noise_std = None
+    else:
+        noise_std = torch.tensor(noise_std_list, dtype=torch.float32)
+
+    return noisy, clean, noise_std, center_list, scale_list, name_list
     
 def global_sample(pcl, target_n=10000, mode='fps'):
     """
@@ -542,7 +550,7 @@ class PairedPatchDataset(Dataset):
             }
             if self.transform is not None:
                 data = self.transform(data)
-                data.pop('noise_std', None)
+                # 注意：score-based 训练需要 noise_std 透传到模型，所以不再 pop
 
             # 训练阶段：随机种子点 + KNN 切固定大小 patch，让不同分辨率样本可以同 batch
             if self.flag == 'train':

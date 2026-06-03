@@ -88,6 +88,41 @@ def project_patch_predictions_weighted(
     return full_pc
 
 
+def project_patch_scores_weighted(
+    pred_patch,   # [B, G, M, 3]  per-patch-point 的 score 向量
+    patch_idx,    # [B, G, M]    每个 patch 内点的全局 index
+    patch_xyz,    # [B, G, M, 3] patch 局部坐标（仅用于距离权重）
+    num_points,
+    sigma=None,
+):
+    """
+    把每个 patch 内每点的 score 通过 Gaussian 距离加权融合回全局每点 score。
+    与 project_patch_predictions_weighted 的关键区别：score 是方向向量，融合时不加 center；
+    未覆盖点的 score 置 0（即不被推动），符合 score-based 框架的"边界点不动"语义。
+    """
+    B, G, M, _ = pred_patch.shape
+    device = pred_patch.device
+
+    if sigma is None:
+        sigma = 0.05 * (10000 / num_points) ** 0.5
+
+    dist = torch.norm(patch_xyz, dim=-1, keepdim=True)  # [B, G, M, 1]
+    weight = torch.exp(- dist ** 2 / (2 * sigma ** 2))
+
+    full_score = torch.zeros(B, num_points, 3, device=device)
+    weight_sum = torch.zeros(B, num_points, 1, device=device)
+
+    for b in range(B):
+        idx = patch_idx[b].reshape(-1)
+        pts = pred_patch[b].reshape(-1, 3)
+        w = weight[b].reshape(-1, 1)
+        full_score[b].index_add_(0, idx, pts * w)
+        weight_sum[b].index_add_(0, idx, w)
+
+    full_score = full_score / torch.clamp(weight_sum, min=1e-6)
+    return full_score
+
+
 
     return pc, center, scale
 
@@ -732,8 +767,13 @@ class PointTransformer(nn.Module):
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
     
-    def forward(self, noisy_pts, clean_pts, type='val', name='', epoch=0, max_epoch=None):
-
+    def forward(self, noisy_pts, clean_pts=None, type='val', name='', epoch=0, max_epoch=None, noise_std=None):
+        """
+        Score-based 去噪框架：
+        - generator 输出被解释为每点的 score (∇log p_σ(x))
+        - 训练：σ²-加权 denoising score matching (Vincent 2011)
+        - 推理：单步 Tweedie x̂ = x + σ²·score（Step 3 会换成 Langevin 多步）
+        """
         neighborhood_noisy, center_noisy, patch_idx = self.group_divider(noisy_pts)
         group_input_tokens = self.encoder(neighborhood_noisy)  # B G C
 
@@ -752,44 +792,43 @@ class PointTransformer(nn.Module):
 
         x = group_input_tokens
 
-        # 去噪任务：encoder/generator 都用全 attention（去掉因果 mask）
-        # 因果 mask 是 PointGPT 预训练自回归生成的产物；去噪并不需要"顺序生成"，全 attention 让每个 patch 都能看到全局上下文
+        # 全 attention：去噪不需要因果约束（去掉了预训练的 causal mask）
         encoded_features = self.blocks(x, pos, attn_mask=None, classify=False)
-        # blocks 会在序列前拼一个 sos token，这里移除该 token，保留每个 patch 一一对应的特征
-        encoded_features = encoded_features[:, 1:, :]
+        encoded_features = encoded_features[:, 1:, :]   # 去掉 sos
 
         generated_delta = self.generator_blocks(
             encoded_features, pos_relative, attn_mask=None)
         generated_delta = generated_delta.view(
             B, self.num_group, self.group_size, 3
         )
-        # 去噪头改为残差预测：pred = noisy_patch + delta
-        generated_points = neighborhood_noisy + generated_delta
 
-        # 将 patch 内预测投影回完整点云，未覆盖区域 fallback 到 noisy（避免空洞）
-        generated_global = project_patch_predictions_weighted(
-            generated_points,
-            center_noisy,
+        # generator 输出 = score 向量（不是坐标），融合时不加 center
+        pred_score_global = project_patch_scores_weighted(
+            generated_delta,
             patch_idx,
             neighborhood_noisy,
-            num_points=clean_pts.shape[1],
-            fallback_points=noisy_pts,
+            num_points=noisy_pts.shape[1],
         )
 
         if type == 'train':
-            # 训练输入已在统一归一化坐标系，直接计算重建损失
-            cd = self.loss_func_p2(generated_global, clean_pts)
-            sample_n = min(10000, clean_pts.shape[1])
-            clean_pts_s = fps_sample(clean_pts, sample_n)
-            generated_global_s = fps_sample(generated_global, sample_n)
-            emd = earth_mover_distance()(generated_global_s, clean_pts_s)
-            # 去掉 *1e4：配合默认 lr 与 grad_clip 更稳；监控指标在 validate 端再做显示缩放
-            loss = 3 * cd + 10 * emd
+            assert noise_std is not None, 'score-based training requires noise_std for DSM loss'
+            assert clean_pts is not None, 'training requires clean_pts'
+            sigma = noise_std.view(-1, 1, 1).to(noisy_pts.device)   # [B, 1, 1]
+            # DSM target: ∇log p_σ(x_noisy) ≈ (x_clean - x_noisy) / σ²
+            target_score = (clean_pts - noisy_pts) / (sigma ** 2)
+            # σ²-加权（Vincent 2011 weighting λ(σ)=σ²）：跨 σ 量级保持一致
+            loss = 0.5 * (sigma ** 2 * (pred_score_global - target_score) ** 2).sum(dim=-1).mean()
             return loss
 
-        elif type == 'val':
-            return generated_global
         else:
-            return generated_global
+            # Val / test: 单步 Tweedie x̂ = x + σ²·score
+            # Step 3 会在 runner 里实现 Langevin 多步替代
+            if noise_std is None:
+                # test 路径（PairedEvalDataset）没有 noise_std，用 PUNet 标称噪声 0.01
+                sigma = torch.tensor(0.01, device=noisy_pts.device).view(1, 1, 1)
+            else:
+                sigma = noise_std.view(-1, 1, 1).to(noisy_pts.device)
+            denoised = noisy_pts + (sigma ** 2) * pred_score_global
+            return denoised
 
 
