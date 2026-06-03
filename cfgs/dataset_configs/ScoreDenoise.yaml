@@ -13,3 +13,6 @@ NUM_PATCHES: 1
 # TRAIN_BATCH_SIZE 会被主配置里的 total_bs 覆盖（tools/builder.py 里同步）
 TRAIN_BATCH_SIZE: 32
 NUM_WORKERS: 4
+# 训练时每张点云的过采样倍数（每 epoch 用同一张点云切多个不同 patch）
+# 原始 120 张 / batch 32 = 3 step/epoch，远远不够；50× 后约 187 step/epoch
+TRAIN_OVERSAMPLE: 50

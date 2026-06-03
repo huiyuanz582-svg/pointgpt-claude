@@ -500,14 +500,15 @@ def voxel_then_fps_to_fixed(pcl, target_n=10000, max_iter=8):
 # 从点云中切出小 patch，并添加噪声，生成训练样本
 class PairedPatchDataset(Dataset):
 
-    def __init__(self, datasets, patch_ratio, on_the_fly=True,patch_size=1000, num_patches=1000, noise_min=0, noise_max=0,transform=None,flag='train'):
+    def __init__(self, datasets, patch_ratio, on_the_fly=True, patch_size=1000, num_patches=1000,
+                 noise_min=0, noise_max=0, transform=None, flag='train', oversample_factor=1):
         super().__init__()
         self.datasets = datasets
-        self.all_data = [] #长度120，包含了10k，30k，50k的数据
+        self.all_data = []  # 长度 ~120，包含了 10k/30k/50k 三个分辨率的所有干净点云
         for dset in datasets:
             for i in range(len(dset)):
                 self.all_data.append(dset[i])
-        
+
         self.len_datasets = len(self.all_data)
         self.patch_ratio = patch_ratio
         self.patch_size = patch_size
@@ -517,7 +518,10 @@ class PairedPatchDataset(Dataset):
         self.noise_min = noise_min
         self.noise_max = noise_max
         self.patches = []
-        self.flag=flag
+        self.flag = flag
+        # 训练时给每张点云重复采样 oversample_factor 次（每次随机 seed + 随机 σ），
+        # 增加每 epoch 的优化步数；val/test 走 flag != 'train' 路径，oversample 应保持 1
+        self.oversample_factor = oversample_factor if flag == 'train' else 1
         # print(self.len_datasets * self.num_patches,'+++++++++++++++++++++++++++++++++++++++++++++') 40
         # Initialize
         if not on_the_fly:
@@ -538,12 +542,13 @@ class PairedPatchDataset(Dataset):
                     self.patches.append((pat_noisy[i], pat_clean[i], ))
 
     def __len__(self):
-        return len(self.all_data)
+        return len(self.all_data) * self.oversample_factor
 
     def __getitem__(self, idx):
         # all_data 是 10k/30k/50k 三个分辨率拼起来的所有干净点云
+        # oversample 时同一个 pcl 会被采样 oversample_factor 次，每次随机种子点 + 随机 σ
         if self.on_the_fly:
-            pcl_data = self.all_data[idx]
+            pcl_data = self.all_data[idx % len(self.all_data)]
             data = {
                 'pcl_clean': pcl_data['pcl_clean'].clone(),
                 'name': pcl_data['name'],
@@ -594,6 +599,8 @@ class ScoreDenoise(pl.LightningDataModule):
         self.num_workers = config.NUM_WORKERS
         self.val_noise = config.VAL_NOISE
         self.aug_rotate = config.AUG_ROTATE
+        # 训练过采样倍数：每张点云每 epoch 切 oversample 次随机 patch（不同种子+不同σ）
+        self.train_oversample = getattr(config, 'TRAIN_OVERSAMPLE', 1)
         self.args = args
     
 # 训练数据加载函数 划分成小点云块 添加噪声、旋转、缩放
@@ -618,12 +625,15 @@ class ScoreDenoise(pl.LightningDataModule):
         # print(pc_datasets[2][39]['pcl_clean'].shape,'pc_datasets---------------------------------------------------')
         # return
         
-        # 定义噪声添加变换
+        # Score-based 训练的噪声模型：只用 AddNoise (纯高斯)
+        # 不再用 NoisyJitter / NoisyPointDropout —— 它们违反 DSM 的"noisy = clean + N(0,σ²)"假设：
+        #   * NoisyJitter 引入额外 σ_extra 噪声，σ²-加权 target 失配
+        #   * NoisyPointDropout 把 3% 的 noisy 点全部替换成 noisy[0]，
+        #     这些点的 target_score = (clean[i] - noisy[0])/σ² 量级可达 1e4，
+        #     单点 loss 贡献 ~ σ²·target² ~ 1e5，主导整个 batch loss
         noise_tran = Compose([
             NormalizeUnitSphere(),
             AddNoise(self.noise_min, self.noise_max),
-            NoisyJitter(sigma=0.002, clip=0.01),
-            NoisyPointDropout(max_dropout_ratio=0.03),
         ])
         # 构建成对 patch 数据集
             # PairedPatchDataset 会把点云随机分割成多个 patch；
@@ -631,7 +641,11 @@ class ScoreDenoise(pl.LightningDataModule):
             # 每次取 patch → 输出 (pcl_clean, pcl_noisy) 成对样本；
             # 传入的 transform (AddNoise) 控制噪声生成。
         # train_dset包含120个索引，0-39是10k，40-79是30k，80-119是50k
-        train_dset = PairedPatchDataset(datasets=pc_datasets,patch_size=self.patch_size, num_patches=self.num_patches, patch_ratio=1.0, on_the_fly=True,noise_min=self.noise_min, noise_max=self.noise_max,transform=noise_tran)
+        train_dset = PairedPatchDataset(
+            datasets=pc_datasets, patch_size=self.patch_size, num_patches=self.num_patches,
+            patch_ratio=1.0, on_the_fly=True, noise_min=self.noise_min, noise_max=self.noise_max,
+            transform=noise_tran, flag='train', oversample_factor=self.train_oversample,
+        )
         # print(train_dset[0]['pcl_noisy'].shape,train_dset[0]['pcl_clean'].shape,'----------------------------')
         # return
         if self.args.distributed:

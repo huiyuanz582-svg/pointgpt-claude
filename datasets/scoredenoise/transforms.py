@@ -438,11 +438,11 @@ class AddDiscreteNoise(object):
 
 
 def standard_train_transforms(noise_std_min, noise_std_max, scale_d=0.2, rotate=True):
+    # Score-based 噪声模型：只用 NormalizeUnitSphere + AddNoise
+    # NoisyJitter / NoisyPointDropout 已移除（违反 DSM 假设，详见 ScoreDenoiseDataset.train_dataloader 注释）
     transforms = [
         NormalizeUnitSphere(),
         AddNoise(noise_std_min=noise_std_min, noise_std_max=noise_std_max),
-        NoisyJitter(sigma=0.002, clip=0.01),
-        NoisyPointDropout(max_dropout_ratio=0.03),
         # RandomScale([1.0-scale_d, 1.0+scale_d]),
     ]
     if rotate:
