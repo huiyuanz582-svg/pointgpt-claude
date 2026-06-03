@@ -71,6 +71,25 @@ YAML loaded via `utils/config.py:cfg_from_yaml_file` into `EasyDict`. Supports r
 
 `models/GPT.py` defines `GPT_extractor` / `GPT_generator` used inside `PointGPT.py`. `models/z_order.py` provides Morton-code ordering for the auto-regressive prediction order.
 
+### Score-based output semantics (current state)
+
+The model now estimates **score fields** (∇log p_σ(x)) rather than residuals. Key points:
+
+- `PointTransformer.forward` interprets the `[B, G, M, 3]` generator output as score vectors, not coordinate offsets.
+- `project_patch_scores_weighted` (`models/PointGPT.py:91`) aggregates per-patch scores back to global point cloud — **does not add the patch center** (unlike `project_patch_predictions_weighted`), because scores are direction vectors.
+- Training loss: DSM — `0.5 * mean(σ² * (pred_score - target_score)²)` where `target_score = (clean - noisy) / σ²`.
+- Inference (val/test): single-step Tweedie `x̂ = x + σ²·score`. **Step 3 (Langevin multi-step) is not yet implemented** — see `models/PointGPT.py:825` comment.
+- The `increase_dim` output head is re-initialized after checkpoint load (`std=0.01` weights, zero bias) to avoid being poisoned by the pre-trained generative head.
+- Encoder is **not frozen** during fine-tuning (score estimation requires encoder adaptation).
+
+### Pending work (Step 3)
+
+Langevin multi-step inference needs to be wired into `tools/runner_finetune.py` once the DSM training loss shows convergence. Tunable hyperparameters: `step_size` (≈0.2), `decay` (≈0.95), `num_steps` (10–30). These should be calibrated against actual val-CD curves before committing values.
+
+## Other datasets
+
+`datasets/DMRSetDataset.py` is a separate dataset loader for the DMRDenoise benchmark — it is **not currently wired** into the active training pipeline (which uses `ScoreDenoiseDataset.py`). It exists for potential future evaluation on the DMR set.
+
 ## Dependencies that pip alone does not install
 
 `requirements.txt` is incomplete. The fine-tune path additionally requires:
@@ -98,6 +117,10 @@ If `extensions/` is missing it has to be re-pulled from upstream PointGPT — it
 - `tools/runner_finetune.py:DenoiseMetrics.better_than` ranks checkpoints by `cd + 0.3 * p2m`. The `0.3` weight is calibrated against the empirical CD ≈ 1.7 vs P2M ≈ 5–7 scale gap — adjust together if you re-scale either term.
 - `compute_mesh_normals_for_pcl` caches results in the module-level `_mesh_normal_cache` dict; clearing it requires restarting the process or manually `del`-ing the entry.
 - `check_memory_and_exit` (`tools/runner_finetune.py:152`) will save `ckpt-last` and `sys.exit(0)` if GPU memory > 80% or CPU memory > 85% — looks like a "graceful OOM" rather than a bug.
+
+## Session changelog
+
+`CHANGES.md` (not gitignored) records a running human-readable log of what each Claude session changed and why — check it first when re-orienting after a gap. It complements commit messages with design rationale and explicit "what's next" notes.
 
 ## Conventions worth keeping
 
