@@ -149,6 +149,57 @@ def sor_filter(pts_tensor, nb_neighbors=20, std_ratio=2.0):
     return filtered
 
 
+@torch.no_grad()
+def patch_based_denoise(base_model, pcl_noisy, noise_std_t, patch_size=1024,
+                        seed_ratio=3, patch_batch=16):
+    """
+    完整点云的 patch-based 推理：把 N 点云切成覆盖全部点的重叠 1024-patch，
+    逐 patch 去噪后按覆盖次数平均拼回完整点云。
+
+    - pcl_noisy:   [N, 3]，归一化空间的完整噪声点云
+    - noise_std_t: [1] 或标量，该点云的噪声水平 σ
+    - 与训练一致：每个 patch 是 1024 点，喂给 model 后内部 group_divider 覆盖 200%
+    - seed_ratio:  FPS 种子数 = seed_ratio * N / patch_size，控制重叠/覆盖冗余
+
+    返回 [N, 3] 去噪后完整点云。
+    """
+    device = pcl_noisy.device
+    N = pcl_noisy.shape[0]
+    patch_size = min(patch_size, N)
+
+    # FPS 选种子点，数量足够让 patch 并集覆盖所有点
+    num_seeds = max(1, int(seed_ratio * N / patch_size))
+    seeds = misc.fps(pcl_noisy.unsqueeze(0), num_seeds)[0]          # [S, 3]
+
+    # 每个种子 KNN 取 patch_size 个点（用 noisy 空间距离，与训练切 patch 一致）
+    dist = torch.cdist(seeds, pcl_noisy)                            # [S, N]
+    patch_idx = dist.topk(patch_size, dim=1, largest=False).indices  # [S, patch_size]
+    patches = pcl_noisy[patch_idx]                                  # [S, patch_size, 3]
+
+    sigma = noise_std_t.view(-1)[0] if torch.is_tensor(noise_std_t) else float(noise_std_t)
+
+    # 分批喂模型去噪
+    denoised_patches = []
+    for i in range(0, patches.shape[0], patch_batch):
+        pb = patches[i:i + patch_batch]                            # [b, patch_size, 3]
+        ns = torch.full((pb.shape[0],), float(sigma), device=device)
+        out = base_model(pb, None, 'val', '', noise_std=ns)        # [b, patch_size, 3]
+        denoised_patches.append(out)
+    denoised_patches = torch.cat(denoised_patches, dim=0)          # [S, patch_size, 3]
+
+    # 按覆盖次数平均拼回完整点云
+    accum = torch.zeros(N, 3, device=device)
+    count = torch.zeros(N, 1, device=device)
+    flat_idx = patch_idx.reshape(-1)                               # [S*patch_size]
+    accum.index_add_(0, flat_idx, denoised_patches.reshape(-1, 3))
+    count.index_add_(0, flat_idx, torch.ones(flat_idx.shape[0], 1, device=device))
+    # 未被任何 patch 覆盖的点回退为原始 noisy（理论上 seed_ratio>=1 时不会发生）
+    uncovered = (count < 0.5).squeeze(-1)
+    denoised = accum / count.clamp(min=1.0)
+    denoised[uncovered] = pcl_noisy[uncovered]
+    return denoised
+
+
 def check_memory_and_exit(base_model, optimizer, epoch, metrics, best_metrics, args, logger,
                           threshold_gpu=0.80, threshold_cpu=85.0):
     """检查 GPU 显存和 CPU 内存，超阈值时保存检查点并主动退出，防止服务器崩溃"""
@@ -584,7 +635,9 @@ def test(base_model, test_dataloader, args, config, logger=None):
             best_p2m = None
             best_denoised = None
             for _ in range(vote_times):
-                denoised_10k = base_model(pcl_noisy, pcl_clean, 'val', name, noise_std=noise_std_t)
+                # patch-based 推理：完整点云切 1024-patch 逐个去噪再拼回，覆盖全部点
+                denoised_full = patch_based_denoise(base_model, pcl_noisy[0], noise_std_t)  # [N, 3]
+                denoised_10k = denoised_full.unsqueeze(0)
                 denoised_filtered = sor_filter(denoised_10k[0])
                 denoised_10k = denoised_filtered.unsqueeze(0).to(denoised_10k.device)
                 denoised_world = denoised_10k * scale_gpu + center_gpu
