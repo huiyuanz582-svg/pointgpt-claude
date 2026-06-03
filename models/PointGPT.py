@@ -769,10 +769,10 @@ class PointTransformer(nn.Module):
     
     def forward(self, noisy_pts, clean_pts=None, type='val', name='', epoch=0, max_epoch=None, noise_std=None):
         """
-        Score-based 去噪框架：
-        - generator 输出被解释为每点的 score (∇log p_σ(x))
-        - 训练：σ²-加权 denoising score matching (Vincent 2011)
-        - 推理：单步 Tweedie x̂ = x + σ²·score（Step 3 会换成 Langevin 多步）
+        ε-prediction 去噪框架（等价于 DDPM ε-parameterization）：
+        - generator 输出 ε = (clean - noisy) / σ，量级 O(1)，N(0,1) 分布
+        - 训练：MSE(pred_ε, target_ε)，无 σ 加权，梯度信号不被压缩
+        - 推理：x̂ = x + σ · pred_ε（Step 3 可换成 Langevin 多步）
         """
         neighborhood_noisy, center_noisy, patch_idx = self.group_divider(noisy_pts)
         group_input_tokens = self.encoder(neighborhood_noisy)  # B G C
@@ -811,24 +811,22 @@ class PointTransformer(nn.Module):
         )
 
         if type == 'train':
-            assert noise_std is not None, 'score-based training requires noise_std for DSM loss'
+            assert noise_std is not None, 'ε-prediction training requires noise_std'
             assert clean_pts is not None, 'training requires clean_pts'
             sigma = noise_std.view(-1, 1, 1).to(noisy_pts.device)   # [B, 1, 1]
-            # DSM target: ∇log p_σ(x_noisy) ≈ (x_clean - x_noisy) / σ²
-            target_score = (clean_pts - noisy_pts) / (sigma ** 2)
-            # σ²-加权（Vincent 2011 weighting λ(σ)=σ²）：跨 σ 量级保持一致
-            loss = 0.5 * (sigma ** 2 * (pred_score_global - target_score) ** 2).sum(dim=-1).mean()
+            # ε-target: (clean - noisy) / σ，量级 O(1)，避免 DSM σ²-加权把梯度压成零
+            target_eps = (clean_pts - noisy_pts) / sigma
+            loss = ((pred_score_global - target_eps) ** 2).sum(dim=-1).mean()
             return loss
 
         else:
-            # Val / test: 单步 Tweedie x̂ = x + σ²·score
+            # Val / test: x̂ = x + σ · pred_ε
             # Step 3 会在 runner 里实现 Langevin 多步替代
-            if noise_std is None:
-                # test 路径（PairedEvalDataset）没有 noise_std，用 PUNet 标称噪声 0.01
-                sigma = torch.tensor(0.01, device=noisy_pts.device).view(1, 1, 1)
-            else:
-                sigma = noise_std.view(-1, 1, 1).to(noisy_pts.device)
-            denoised = noisy_pts + (sigma ** 2) * pred_score_global
+            assert noise_std is not None, (
+                'val/test requires noise_std; runner 应从 config.TEST_NOISE 填充'
+            )
+            sigma = noise_std.view(-1, 1, 1).to(noisy_pts.device)
+            denoised = noisy_pts + sigma * pred_score_global
             return denoised
 
 

@@ -3,6 +3,9 @@ ROOT: data/ScoreDenoise
 NOISE_MIN: 0.005
 NOISE_MAX: 0.020
 VAL_NOISE: 0.010
+# TEST_NOISE: val/test 路径 noise_std 的 fallback（PairedEvalDataset 不含 noise_std 字段）
+# 跑 3% noise 测试时改为 0.030
+TEST_NOISE: 0.010
 AUG_ROTATE: True
 DATASET: PUNet
 RESOLUTIONS: ['10000_poisson','30000_poisson','50000_poisson']

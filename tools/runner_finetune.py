@@ -275,7 +275,11 @@ def run_net(args, config, train_writer=None, val_writer=None):
             data_time.update(time.time() - batch_start_time)
             pcl_noisy = pcl_noisy.cuda()
             pcl_clean = pcl_clean.cuda()
-            noise_std_t = noise_std.cuda() if noise_std is not None else None
+            if noise_std is not None:
+                noise_std_t = noise_std.cuda()
+            else:
+                # 训练时 PairedPatchDataset 始终提供 noise_std，走到这里是 bug
+                raise RuntimeError('training noise_std is None — AddNoise transform 是否被意外移除？')
 
             loss1 = base_model(pcl_noisy, pcl_clean, 'train', name,
                                epoch=epoch, max_epoch=config.max_epoch,
@@ -400,7 +404,14 @@ def validate(base_model, test_dataloader, epoch, val_writer, args, config, logge
         for idx, (pcl_noisy, pcl_clean, noise_std, center, scale, name) in enumerate(test_dataloader):
             pcl_noisy = pcl_noisy.cuda()
             pcl_clean = pcl_clean.cuda()
-            noise_std_t = noise_std.cuda() if noise_std is not None else None
+            if noise_std is not None:
+                noise_std_t = noise_std.cuda()
+            else:
+                # PairedEvalDataset 不含 noise_std；从 config.TEST_NOISE fallback
+                _test_sigma = getattr(config.dataset.test._base_, 'TEST_NOISE', 0.01)
+                noise_std_t = torch.full(
+                    (pcl_noisy.shape[0],), _test_sigma, dtype=torch.float32
+                ).cuda()
             center_t = center[0].to(pcl_noisy.device)
             scale_t = scale[0].to(pcl_noisy.device)
 
@@ -451,7 +462,14 @@ def validate_vote(base_model, test_dataloader, epoch, val_writer, args, config, 
         for idx, (pcl_noisy, pcl_clean, noise_std, center, scale, name) in enumerate(test_dataloader):
             pcl_noisy = pcl_noisy.cuda()
             pcl_clean = pcl_clean.cuda()
-            noise_std_t = noise_std.cuda() if noise_std is not None else None
+            if noise_std is not None:
+                noise_std_t = noise_std.cuda()
+            else:
+                # PairedEvalDataset 不含 noise_std；从 config.TEST_NOISE fallback
+                _test_sigma = getattr(config.dataset.test._base_, 'TEST_NOISE', 0.01)
+                noise_std_t = torch.full(
+                    (pcl_noisy.shape[0],), _test_sigma, dtype=torch.float32
+                ).cuda()
             center_t = center[0].to(pcl_noisy.device)
             scale_t = scale[0].to(pcl_noisy.device)
 
@@ -540,7 +558,14 @@ def test(base_model, test_dataloader, args, config, logger=None):
 
             pcl_noisy = pcl_noisy.cuda()
             pcl_clean = pcl_clean.cuda()
-            noise_std_t = noise_std.cuda() if noise_std is not None else None
+            if noise_std is not None:
+                noise_std_t = noise_std.cuda()
+            else:
+                # PairedEvalDataset 不含 noise_std；从 config.TEST_NOISE fallback
+                _test_sigma = getattr(config.dataset.test._base_, 'TEST_NOISE', 0.01)
+                noise_std_t = torch.full(
+                    (pcl_noisy.shape[0],), _test_sigma, dtype=torch.float32
+                ).cuda()
             center_gpu = center_t.to(pcl_noisy.device)
             scale_gpu = scale_t.to(pcl_noisy.device)
 
@@ -659,7 +684,14 @@ def test_vote(base_model, test_dataloader, epoch, val_writer, args, config, logg
         for idx, (pcl_noisy, pcl_clean, noise_std, center, scale, name) in enumerate(test_dataloader):
             pcl_noisy = pcl_noisy.cuda()
             pcl_clean = pcl_clean.cuda()
-            noise_std_t = noise_std.cuda() if noise_std is not None else None
+            if noise_std is not None:
+                noise_std_t = noise_std.cuda()
+            else:
+                # PairedEvalDataset 不含 noise_std；从 config.TEST_NOISE fallback
+                _test_sigma = getattr(config.dataset.test._base_, 'TEST_NOISE', 0.01)
+                noise_std_t = torch.full(
+                    (pcl_noisy.shape[0],), _test_sigma, dtype=torch.float32
+                ).cuda()
             center_t = center[0].to(pcl_noisy.device)
             scale_t = scale[0].to(pcl_noisy.device)
             local_cd = []
