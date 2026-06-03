@@ -48,12 +48,13 @@ def point_mesh_bidir_distance_single_unit_sphere(pcl, verts, faces):
     meshes = pytorch3d.structures.Meshes([verts], [faces])
     return pytorch3d.loss.point_mesh_face_distance(meshes, pcls)
 
-def compute_p2m(pred_points, name,type):
+_MESH_ROOT = os.environ.get(
+    'PUNET_MESH_ROOT', 'data/ScoreDenoise/PUNet/meshes')
+
+def compute_p2m(pred_points, name, type):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    if type == 'train':
-        off_path = os.path.join('/home/sapi/zhy/point-gpt-denoise-1024/data/ScoreDenoise/PUNet/meshes/train', name + ".off")
-    else:
-        off_path = os.path.join('/home/sapi/zhy/point-gpt-denoise-1024/data/ScoreDenoise/PUNet/meshes/test', name + ".off")
+    split = 'train' if type == 'train' else 'test'
+    off_path = os.path.join(_MESH_ROOT, split, name + ".off")
     mesh = trimesh.load(off_path)
     verts = torch.from_numpy(mesh.vertices.astype(np.float32)).to(device)
     faces = torch.from_numpy(mesh.faces.astype(np.int64)).to(device)

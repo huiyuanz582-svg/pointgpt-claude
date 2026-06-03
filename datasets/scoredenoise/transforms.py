@@ -34,12 +34,8 @@ class NormalizeUnitSphere(object):
         assert 'pcl_noisy' not in data, 'Point clouds must be normalized before applying noise perturbation.'
         pcl_clean_norm, center, scale = self.normalize(data['pcl_clean'])
         data['pcl_clean'] = pcl_clean_norm
-        if 'pcl_clean_50k' in data:
-            pcl_clean_50k_norm, _, _ = self.normalize(data['pcl_clean_50k'], center=center, scale=scale)
-            data['pcl_clean_50k'] = pcl_clean_50k_norm
         data['center'] = center
         data['scale'] = scale
-        
         return data
 
 # 各向同性高斯噪声 常见的白噪声模型
@@ -310,13 +306,7 @@ class AddNoise(object):
         # 随机噪声标准差
         noise_std = random.uniform(self.noise_std_min, self.noise_std_max)
         pcl_clean = data['pcl_clean'].float().contiguous()
-        
-        if 'pcl_clean_50k' in data:
-            pcl_clean_50k = data['pcl_clean_50k'].float().contiguous()
-            noise_50k = torch.randn_like(pcl_clean_50k) * noise_std
-            data['pcl_noisy_50k']=pcl_clean_50k + noise_50k
 
-        # 检查是否为空
         if pcl_clean.numel() == 0:
             raise ValueError("pcl_clean is empty!")
 
@@ -342,10 +332,6 @@ class NoisyJitter(object):
         jitter = torch.randn_like(data['pcl_noisy']) * self.sigma
         jitter = torch.clamp(jitter, -self.clip, self.clip)
         data['pcl_noisy'] = data['pcl_noisy'] + jitter
-        if 'pcl_noisy_50k' in data:
-            jitter_50k = torch.randn_like(data['pcl_noisy_50k']) * self.sigma
-            jitter_50k = torch.clamp(jitter_50k, -self.clip, self.clip)
-            data['pcl_noisy_50k'] = data['pcl_noisy_50k'] + jitter_50k
         return data
 
 

@@ -18,15 +18,16 @@ from datasets.ScoreDenoiseDataset import ScoreDenoise
 
 
 def dataset_builder(args, config):
+    # main.py 把 total_bs 写到 config.others.bs，传到 _base_.TRAIN_BATCH_SIZE 才能真正生效
+    if 'bs' in config.others:
+        config._base_.TRAIN_BATCH_SIZE = config.others.bs
     if config.others.subset == 'train':
-        # num_points = random.choice([10000, 30000, 50000])
-        sampler,dataloader = ScoreDenoise(args,config._base_).train_dataloader()
+        sampler, dataloader = ScoreDenoise(args, config._base_).train_dataloader()
     elif config.others.subset == 'val':
-        sampler,dataloader = ScoreDenoise(args,config._base_).val_dataloader()
+        sampler, dataloader = ScoreDenoise(args, config._base_).val_dataloader()
     else:
-        sampler,dataloader = ScoreDenoise(args,config._base_).test_dataloader()
-        
-    return sampler,dataloader
+        sampler, dataloader = ScoreDenoise(args, config._base_).test_dataloader()
+    return sampler, dataloader
 
 
 def model_builder(config):

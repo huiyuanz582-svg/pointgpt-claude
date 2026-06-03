@@ -732,12 +732,11 @@ class PointTransformer(nn.Module):
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
     
-    def forward(self, noisy_pts, clean_pts, pcl_clean_50k, type='val', name='', epoch=0, max_epoch=None):
-        
-        neighborhood_noisy, center_noisy,patch_idx = self.group_divider(noisy_pts)
-        group_input_tokens = self.encoder(neighborhood_noisy)  # B G N
+    def forward(self, noisy_pts, clean_pts, type='val', name='', epoch=0, max_epoch=None):
 
-       
+        neighborhood_noisy, center_noisy, patch_idx = self.group_divider(noisy_pts)
+        group_input_tokens = self.encoder(neighborhood_noisy)  # B G C
+
         B, L, _ = group_input_tokens.shape
 
         pos = self.pos_embed(center_noisy)
@@ -751,39 +750,24 @@ class PointTransformer(nn.Module):
             [center_noisy[:, 0, :].unsqueeze(1), relative_direction], dim=1)
         pos_relative = self.pos_embed(position)
 
-        
         x = group_input_tokens
 
-        
-# 构造注意力 mask
-        attn_mask = torch.full(
-            (L+1, L+1), -float("Inf"), device=group_input_tokens.device, dtype=group_input_tokens.dtype
-        ).to(torch.bool)
-
-        attn_mask = torch.triu(attn_mask, diagonal=1)
-
-
-        encoded_features = self.blocks(x, pos, attn_mask, classify=False)
+        # 去噪任务：encoder/generator 都用全 attention（去掉因果 mask）
+        # 因果 mask 是 PointGPT 预训练自回归生成的产物；去噪并不需要"顺序生成"，全 attention 让每个 patch 都能看到全局上下文
+        encoded_features = self.blocks(x, pos, attn_mask=None, classify=False)
         # blocks 会在序列前拼一个 sos token，这里移除该 token，保留每个 patch 一一对应的特征
         encoded_features = encoded_features[:, 1:, :]
-# 为 generator 再构造 mask
-        attn_mask = torch.full(
-            (L, L), -float("Inf"), device=group_input_tokens.device, dtype=group_input_tokens.dtype
-        ).to(torch.bool)
-
-        attn_mask = torch.triu(attn_mask, diagonal=1)
 
         generated_delta = self.generator_blocks(
-            encoded_features, pos_relative, attn_mask)
+            encoded_features, pos_relative, attn_mask=None)
         generated_delta = generated_delta.view(
             B, self.num_group, self.group_size, 3
         )
         # 去噪头改为残差预测：pred = noisy_patch + delta
         generated_points = neighborhood_noisy + generated_delta
-        
-        # print(generated_points,'generated_points----------------------------------')
-        # 原始坐标系下去噪后的点 模型去噪后的点是1563*32>10000 30000 50000,所以根据输入的分辨率在这里采样相同的点数
-        generated_global =  project_patch_predictions_weighted(
+
+        # 将 patch 内预测投影回完整点云，未覆盖区域 fallback 到 noisy（避免空洞）
+        generated_global = project_patch_predictions_weighted(
             generated_points,
             center_noisy,
             patch_idx,
@@ -791,25 +775,21 @@ class PointTransformer(nn.Module):
             num_points=clean_pts.shape[1],
             fallback_points=noisy_pts,
         )
-        # print(generated_global.shape,'------------------------------------')
-        # return
 
-        # 原始pointgpt去噪
         if type == 'train':
             # 训练输入已在统一归一化坐标系，直接计算重建损失
             cd = self.loss_func_p2(generated_global, clean_pts)
-            sample_n = min(10000, clean_pts.shape[1])  # 不超过实际点数，10k样本不变，30k/50k也用10k（速度优先）
+            sample_n = min(10000, clean_pts.shape[1])
             clean_pts_s = fps_sample(clean_pts, sample_n)
             generated_global_s = fps_sample(generated_global, sample_n)
             emd = earth_mover_distance()(generated_global_s, clean_pts_s)
-            loss = (3*cd + 10 * emd ) * 1e4
-            
+            # 去掉 *1e4：配合默认 lr 与 grad_clip 更稳；监控指标在 validate 端再做显示缩放
+            loss = 3 * cd + 10 * emd
             return loss
 
         elif type == 'val':
             return generated_global
-        else :
-            # return self.loss_func_p2(clean_pts, generated_global) * 1e4,generated_global 
+        else:
             return generated_global
 
 

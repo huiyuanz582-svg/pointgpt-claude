@@ -185,8 +185,6 @@ class PairedEvalDataset(Dataset):
         return {
             'pcl_noisy': pcl_noisy_norm,
             'pcl_clean': pcl_clean_norm,
-            'pcl_noisy_50k': pcl_noisy_norm,
-            'pcl_clean_50k': pcl_clean_norm,
             'center': center,
             'scale': scale,
             'name': name
@@ -351,36 +349,24 @@ def denoise_collate_fn_test(batch):
     noisy_list = []
     clean_list = []
     name_list = []
-    pcl_clean_50k_list = []
-    pcl_noisy_50k_list = []
     center_list = []
-    scale_list=[]
+    scale_list = []
 
     for item in batch:
         assert "pcl_clean" in item
         assert "pcl_noisy" in item
-
         assert item["pcl_clean"].shape == item["pcl_noisy"].shape
 
         noisy_list.append(item["pcl_noisy"])
         clean_list.append(item["pcl_clean"])
         name_list.append(item["name"])
-        if "pcl_clean_50k" in item:
-            pcl_clean_50k_list.append(item["pcl_clean_50k"])
-        if "pcl_noisy_50k" in item:
-            pcl_noisy_50k_list.append(item["pcl_noisy_50k"])
         center_list.append(item["center"])
         scale_list.append(item["scale"])
 
-
     noisy = torch.stack(noisy_list, dim=0).float()
     clean = torch.stack(clean_list, dim=0).float()
-    
-    noisy_50k = torch.stack(pcl_noisy_50k_list, dim=0).float()
-    
-    clean_50k = torch.stack(pcl_clean_50k_list, dim=0).float()
 
-    return noisy, clean,noisy_50k,clean_50k,center_list,scale_list,name_list
+    return noisy, clean, center_list, scale_list, name_list
     
 def global_sample(pcl, target_n=10000, mode='fps'):
     """
@@ -545,26 +531,33 @@ class PairedPatchDataset(Dataset):
 
     def __len__(self):
         return len(self.all_data)
+
     def __getitem__(self, idx):
-        # self.datasets是一个数组包含三个对象，对象分别是'10000_poisson', '30000_poisson', '50000_poisson'里的数据
-        # random.choice(self.datasets)是在self.datasets数组中随机选取一个对象，即选中'10000_poisson', '30000_poisson', '50000_poisson'里的一组数据
-        # pcl_dset[1 % len(pcl_dset)]是选取数组里的第一个打印
+        # all_data 是 10k/30k/50k 三个分辨率拼起来的所有干净点云
         if self.on_the_fly:
             pcl_data = self.all_data[idx]
             data = {
-                'pcl_clean': pcl_data['pcl_clean'],
-                'name':pcl_data['name'],
+                'pcl_clean': pcl_data['pcl_clean'].clone(),
+                'name': pcl_data['name'],
             }
-            data['pcl_clean_50k']=pcl_data['pcl_clean']
-
-            # print("Before transform:---------------------------", data.keys())  # 打印 transform 前的数据键
             if self.transform is not None:
                 data = self.transform(data)
-                del data['noise_std']
-            # print("After transform:--------------------------------", data.keys())  # 打印 transform 后的数据键
+                data.pop('noise_std', None)
+
+            # 训练阶段：随机种子点 + KNN 切固定大小 patch，让不同分辨率样本可以同 batch
+            if self.flag == 'train':
+                N = data['pcl_clean'].shape[0]
+                patch_size = min(self.patch_size, N)
+                seed = torch.randint(0, N, (1,)).item()
+                seed_pnt = data['pcl_noisy'][seed:seed + 1]               # [1, 3]
+                dist = ((data['pcl_noisy'] - seed_pnt) ** 2).sum(dim=-1)  # [N]
+                # 用 noisy 空间的 KNN（推理时一致），同步索引保证 clean/noisy 点对齐
+                idx_knn = dist.topk(patch_size, largest=False).indices
+                data['pcl_clean'] = data['pcl_clean'][idx_knn]
+                data['pcl_noisy'] = data['pcl_noisy'][idx_knn]
         else:
             data = {
-                'pcl_noisy': self.patches[idx][0].clone(), 
+                'pcl_noisy': self.patches[idx][0].clone(),
                 'pcl_clean': self.patches[idx][1].clone(),
             }
         return data

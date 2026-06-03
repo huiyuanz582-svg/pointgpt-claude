@@ -30,24 +30,21 @@ dataset:
 model:
   {
     NAME: PointTransformer,
-    cls_dim: 15,  #分类任务类别数，去噪任务可设为任意值
+    cls_dim: 15,  # 去噪任务用不到，但 PointTransformer 构造时仍要读这个字段
     trans_dim: 384,
     depth: 12,
     drop_path_rate: 0.1,
     num_heads: 6,
     group_size: 32,
-    num_group: 2048, #10k
-    # num_group_10k: 315, #10k
-    # num_group_30k: 938, #10k
-    # num_group_50k: 1575, #50k
+    num_group: 64,            # 跟 PointGPT-S pretrain 一致，复用预训练 encoder/generator 权重
     encoder_dims: 384,
     decoder_depth: 4,
-    loss: cdl12,      # 常用去噪损失（Chamfer Distance L2）
-    weight_center: 1.0,          # 可调的重建权重
+    loss: cdl12,
+    weight_center: 1.0,
   }
 
-npoints: 2048                 # 每个点云的采样点数
-total_bs: 32                     # 总批次大小
+npoints: 1024                # 跟 dataset_configs/ScoreDenoise.yaml 里的 PATCH_SIZE 对齐
+total_bs: 32                 # 实际生效（覆盖 dataset_configs 里的 TRAIN_BATCH_SIZE）
 step_per_update: 1
 max_epoch: 120
 grad_norm_clip: 10

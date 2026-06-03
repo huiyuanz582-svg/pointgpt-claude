@@ -258,52 +258,17 @@ def run_net(args, config, train_writer=None, val_writer=None):
         npoints = config.npoints #2048
        
 
-        for idx, (pcl_noisy, pcl_clean,pcl_noisy_50k,pcl_clean_50k,center,scale,name) in enumerate(train_dataloader):
-            
+        for idx, (pcl_noisy, pcl_clean, center, scale, name) in enumerate(train_dataloader):
 
             num_iter += 1
             n_itr = epoch * n_batches + idx
 
             data_time.update(time.time() - batch_start_time)
-            # 10k原始坐标系
             pcl_noisy = pcl_noisy.cuda()
             pcl_clean = pcl_clean.cuda()
-            pcl_clean_50k = pcl_clean_50k.cuda()
-            # 输入点云分为小patch
-            # pcl_noisy = pcl_noisy[0].cuda()
-            # pcl_clean = pcl_clean[0].cuda()
-            # print(idx,pcl_clean.shape,pcl_noisy.shape, name,'=================train dataloader output shape===================')
-            
 
-            if npoints == 1024:
-                point_all = 1200
-            elif npoints == 2048:
-                point_all = 2400
-            elif npoints == 4096:
-                point_all = 4800
-            elif npoints == 8192:
-                point_all = 8192
-            else:
-                raise NotImplementedError()
-
-            if pcl_noisy.size(1) < point_all:
-                point_all = pcl_noisy.size(1)
-
-            
-# 在这里执行pointgpt的forward
-            # 构建真值法向 [B, N, 3]（仅当模型支持时）
-            try:
-                clean_normals_list = []
-                for b, n in enumerate(name):
-                    nrm = compute_mesh_normals_for_pcl(pcl_clean[b], n, split='train')
-                    clean_normals_list.append(nrm)
-                clean_normals = torch.stack(clean_normals_list, dim=0)  # [B, N, 3]
-            except Exception:
-                clean_normals = None
-
-            loss1 = base_model(pcl_noisy, pcl_clean, pcl_clean_50k, 'train', name,
-                               epoch=epoch, max_epoch=config.max_epoch,
-                               clean_normals=clean_normals)
+            loss1 = base_model(pcl_noisy, pcl_clean, 'train', name,
+                               epoch=epoch, max_epoch=config.max_epoch)
             _loss = loss1 #用于去噪，下游任务的损失和生成任务的损失是一样的
 
             # loss, acc = base_model.module.get_loss_acc(ret, label)
@@ -421,53 +386,34 @@ def validate(base_model, test_dataloader, epoch, val_writer, args, config, logge
     total_p2m = 0.0
 
     with torch.no_grad():
-        for idx, (pcl_noisy, pcl_clean,pcl_noisy_50k,pcl_clean_50k,center,scale,name) in enumerate(test_dataloader):
+        for idx, (pcl_noisy, pcl_clean, center, scale, name) in enumerate(test_dataloader):
             pcl_noisy = pcl_noisy.cuda()
             pcl_clean = pcl_clean.cuda()
-            pcl_clean_50k=pcl_clean_50k.cuda()
             center_t = center[0].to(pcl_noisy.device)
             scale_t = scale[0].to(pcl_noisy.device)
-            # pcl_noisy_50k=pcl_noisy_50k.cuda()
-            
-            
-            
-            if npoints == 1024:
-                point_all = 1200
-            elif npoints == 2048:
-                point_all = 2400
-            elif npoints == 4096:
-                point_all = 4800
-            elif npoints == 8192:
-                point_all = 8192
-            else:
-                raise NotImplementedError()
 
-            if pcl_noisy.size(1) < point_all:
-                point_all = pcl_noisy.size(1)
+            # 模型输出在归一化空间
+            denoised_10k_norm = base_model(pcl_noisy, pcl_clean, 'val', name)
 
-            
-            # ✅ 修复: 模型输出已在归一化空间,直接使用
-            denoised_10k_norm = base_model(pcl_noisy,pcl_clean,pcl_clean_50k,'val',name)
+            # 归一化空间 CD（与训练 loss 一致）
+            batch_cd_10k = ChamferDistanceL2().cuda()(denoised_10k_norm, pcl_clean) * 1e4
 
-            # ✅ 先计算归一化空间的CD(与训练loss一致)
-            batch_cd_10k = ChamferDistanceL2().cuda()(denoised_10k_norm, pcl_clean)* 1e4
-
-            # ✅ 反归一化到世界坐标系计算P2M
+            # 反归一化到世界坐标系算 P2M
             denoised_world = denoised_10k_norm * scale_t + center_t
             p2m_loss = compute_p2m(denoised_world[0], name[0], 'test') * 1e4
-
 
             total_cd_10k += batch_cd_10k
             total_p2m += p2m_loss
             total_batches += 1
 
     if args.distributed:
-        total_cd = dist_utils.gather_tensor(torch.tensor(total_cd).cuda(), args)
+        # 用真正参与累加的 total_cd_10k / total_p2m
+        total_cd_10k = dist_utils.gather_tensor(total_cd_10k.cuda() if torch.is_tensor(total_cd_10k) else torch.tensor(total_cd_10k).cuda(), args)
+        total_p2m = dist_utils.gather_tensor(total_p2m.cuda() if torch.is_tensor(total_p2m) else torch.tensor(total_p2m).cuda(), args)
         total_batches = dist_utils.gather_tensor(torch.tensor(total_batches).cuda(), args)
         if args.local_rank != 0:
             return None
 
-    
     avg_cd = total_cd_10k / total_batches
     avg_p2m = total_p2m / total_batches
 
@@ -490,16 +436,15 @@ def validate_vote(base_model, test_dataloader, epoch, val_writer, args, config, 
     npoints = config.npoints
 
     with torch.no_grad():
-        for idx, (pcl_noisy, pcl_clean, pcl_noisy_50k, pcl_clean_50k, center, scale, name) in enumerate(test_dataloader):
+        for idx, (pcl_noisy, pcl_clean, center, scale, name) in enumerate(test_dataloader):
             pcl_noisy = pcl_noisy.cuda()
             pcl_clean = pcl_clean.cuda()
-            pcl_clean_50k = pcl_clean_50k.cuda()
             center_t = center[0].to(pcl_noisy.device)
             scale_t = scale[0].to(pcl_noisy.device)
 
             local_cd = []
             for _ in range(times):
-                denoised = base_model(pcl_noisy, pcl_clean, pcl_clean_50k, 'val', name)
+                denoised = base_model(pcl_noisy, pcl_clean, 'val', name)
                 denoised_filtered = sor_filter(denoised[0])
                 denoised = denoised_filtered.unsqueeze(0).to(pcl_noisy.device)
                 denoised_world = denoised * scale_t + center_t
@@ -560,29 +505,28 @@ def test(base_model, test_dataloader, args, config, logger=None):
 
     with torch.no_grad():
         vote_times = 5
-        for idx, (pcl_noisy, pcl_clean,pcl_noisy_50k,pcl_clean_50k,center,scale,name) in enumerate(test_dataloader):
+        for idx, (pcl_noisy, pcl_clean, center, scale, name) in enumerate(test_dataloader):
             save_path = 'test_test_result_1'
-            save_path2= 'visualiza-result10k-1'
+            save_path2 = 'visualiza-result10k-1'
             save_path3 = 'finetune_scoredenoise_L'
-            PointGPTtype='PointGPT-Change'
+            PointGPTtype = 'PointGPT-Change'
             center_t = center[0]
             scale_t = scale[0]
 
             pcl_noisy_world = pcl_noisy * scale_t + center_t
             pcl_clean_world = pcl_clean * scale_t + center_t
 
-            # 保存50k原始坐标系噪声点 test_test_result_1要修改
+            # 保存噪声点（原始坐标系）
             filename_noisy = f'experiments/{save_path3}/{PointGPTtype}/{save_path}/{save_path2}/noisy-result/txt/{name[0]}.xyz'
+            os.makedirs(os.path.dirname(filename_noisy), exist_ok=True)
             np.savetxt(filename_noisy, pcl_noisy_world[0].cpu().numpy(), fmt='%.8f')
-            # 保存50k原始坐标系干净点
+            # 保存干净点（原始坐标系）
             filename_clean = f'experiments/{save_path3}/{PointGPTtype}/{save_path}/{save_path2}/clean-result/txt/{name[0]}.xyz'
+            os.makedirs(os.path.dirname(filename_clean), exist_ok=True)
             np.savetxt(filename_clean, pcl_clean_world[0].cpu().numpy(), fmt='%.8f')
-            
-            
+
             pcl_noisy = pcl_noisy.cuda()
             pcl_clean = pcl_clean.cuda()
-            pcl_clean_50k = pcl_clean_50k.cuda()
-            pcl_noisy_50k = pcl_noisy_50k.cuda()
             center_gpu = center_t.to(pcl_noisy.device)
             scale_gpu = scale_t.to(pcl_noisy.device)
 
@@ -597,7 +541,7 @@ def test(base_model, test_dataloader, args, config, logger=None):
             best_p2m = None
             best_denoised = None
             for _ in range(vote_times):
-                denoised_10k = base_model(pcl_noisy, pcl_clean, pcl_clean_50k, 'val', name)
+                denoised_10k = base_model(pcl_noisy, pcl_clean, 'val', name)
                 denoised_filtered = sor_filter(denoised_10k[0])
                 denoised_10k = denoised_filtered.unsqueeze(0).to(denoised_10k.device)
                 denoised_world = denoised_10k * scale_gpu + center_gpu
@@ -640,6 +584,7 @@ def test(base_model, test_dataloader, args, config, logger=None):
             pcd_noisy.points = o3d.utility.Vector3dVector(P_ny)
             pcd_noisy.colors = o3d.utility.Vector3dVector(colors_noisy)
             output_ply_noisy = f"experiments/{save_path3}/{PointGPTtype}/{save_path}/{save_path2}/noisy-result/blue_yellow/{name[0]}.ply"
+            os.makedirs(os.path.dirname(output_ply_noisy), exist_ok=True)
             o3d.io.write_point_cloud(output_ply_noisy, pcd_noisy)
             print("Saved colored PLY:", output_ply_noisy)
         # 去噪后效果------------------------------------------------------------------
@@ -660,12 +605,14 @@ def test(base_model, test_dataloader, args, config, logger=None):
             pcd_denoise.points = o3d.utility.Vector3dVector(denoised_10k[0].cpu().numpy())
             pcd_denoise.colors = o3d.utility.Vector3dVector(colors_denoise)
             output_ply_denoise = f"experiments/{save_path3}/{PointGPTtype}/{save_path}/{save_path2}/denoise-result/blue_yellow/{name[0]}.ply"
+            os.makedirs(os.path.dirname(output_ply_denoise), exist_ok=True)
             o3d.io.write_point_cloud(output_ply_denoise, pcd_denoise)
             print("Saved colored PLY:", output_ply_denoise)
 # 可视化去噪效果--------------------------------------------------------------------------------------------
 
             # 保存去噪后的点
             filename = f'experiments/{save_path3}/{PointGPTtype}/{save_path}/{save_path2}/denoise-result/txt/{name[0]}.xyz'
+            os.makedirs(os.path.dirname(filename), exist_ok=True)
             np.savetxt(filename, denoised_10k[0].cpu().numpy(), fmt='%.8f')
             # print(pcl_denoised_original,pcl_denoised_original.shape,'point-------------------------------')
             total_cd += batch_cd
@@ -695,19 +642,15 @@ def test_vote(base_model, test_dataloader, epoch, val_writer, args, config, logg
     cd_list_10k = []
 
     with torch.no_grad():
-        for idx, (pcl_noisy, pcl_clean,pcl_noisy_50k,pcl_clean_50k,center,scale,name) in enumerate(test_dataloader):
+        for idx, (pcl_noisy, pcl_clean, center, scale, name) in enumerate(test_dataloader):
             pcl_noisy = pcl_noisy.cuda()
             pcl_clean = pcl_clean.cuda()
-            pcl_clean_50k = pcl_clean_50k.cuda()
-            pcl_noisy_50k = pcl_noisy_50k.cuda()
             center_t = center[0].to(pcl_noisy.device)
             scale_t = scale[0].to(pcl_noisy.device)
             local_cd = []
             local_p2m = []
             for kk in range(times):
-            
-                
-                denoised_10k = base_model(pcl_noisy,pcl_clean,pcl_clean_50k,'val',name)
+                denoised_10k = base_model(pcl_noisy, pcl_clean, 'val', name)
 
                 denoised_filtered = sor_filter(denoised_10k[0])
                 denoised_10k = denoised_filtered.unsqueeze(0).to(denoised_10k.device)

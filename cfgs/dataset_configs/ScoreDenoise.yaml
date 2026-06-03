@@ -4,14 +4,12 @@ NOISE_MIN: 0.005
 NOISE_MAX: 0.020
 VAL_NOISE: 0.010
 AUG_ROTATE: True
-# DATASET: examples 
 DATASET: PUNet
-# RESOLUTIONS: ['50000_poisson']
 RESOLUTIONS: ['10000_poisson','30000_poisson','50000_poisson']
-# RESOLUTIONS_10k: ['10000_poisson']
-# RESOLUTIONS_30k: ['30000_poisson']
-# RESOLUTIONS_50;: ['50000_poisson']
-PATCH_SIZE: 10000
+# 每个训练样本：从 10k/30k/50k 任一干净点云中随机种子点 + KNN 取固定大小 patch
+# 1024 与 PointGPT-S pretrain 的 npoints 对齐；让 num_group=64, group_size=32 复用预训练
+PATCH_SIZE: 1024
 NUM_PATCHES: 1
-TRAIN_BATCH_SIZE: 1
-NUM_WORKERS: 0
+# TRAIN_BATCH_SIZE 会被主配置里的 total_bs 覆盖（tools/builder.py 里同步）
+TRAIN_BATCH_SIZE: 32
+NUM_WORKERS: 4
