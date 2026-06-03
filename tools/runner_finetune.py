@@ -466,10 +466,7 @@ def validate(base_model, test_dataloader, epoch, val_writer, args, config, logge
                 noise_std_t = torch.full(
                     (pcl_noisy.shape[0],), _test_sigma, dtype=torch.float32
                 ).cuda()
-            center_t = center[0].to(pcl_noisy.device)
-            scale_t = scale[0].to(pcl_noisy.device)
-
-            # 模型输出在归一化空间（单步去噪）
+            # val 用 1024-point patch（dataloader flag='train'），base_model 直接去噪，覆盖 200%
             denoised = base_model(pcl_noisy, pcl_clean, 'val', name, noise_std=noise_std_t)
 
             # 归一化空间 CD
@@ -478,25 +475,21 @@ def validate(base_model, test_dataloader, epoch, val_writer, args, config, logge
             batch_cd_noisy = ChamferDistanceL2().cuda()(pcl_noisy, pcl_clean) * 1e4
             total_cd_noisy_baseline = total_cd_noisy_baseline + batch_cd_noisy
 
-            # val 用 1024-point patch，P2M 需要世界坐标系+完整点云，跳过
+            # val 阶段只用 CD 监控（patch 无法对齐完整 mesh）；P2M 留到最终 test
             total_cd_10k += batch_cd
-            total_p2m += 0.0
             total_batches += 1
 
     if args.distributed:
-        # 用真正参与累加的 total_cd_10k / total_p2m
         total_cd_10k = dist_utils.gather_tensor(total_cd_10k.cuda() if torch.is_tensor(total_cd_10k) else torch.tensor(total_cd_10k).cuda(), args)
-        total_p2m = dist_utils.gather_tensor(total_p2m.cuda() if torch.is_tensor(total_p2m) else torch.tensor(total_p2m).cuda(), args)
         total_batches = dist_utils.gather_tensor(torch.tensor(total_batches).cuda(), args)
         if args.local_rank != 0:
             return None
 
     avg_cd = total_cd_10k / total_batches
-    avg_p2m = total_p2m / total_batches
     avg_cd_noisy = total_cd_noisy_baseline / total_batches
 
-    print_log('[Validation] EPOCH: %d  Chamfer Distance = %.6f  P2M = %.6f  (Noisy baseline CD = %.6f, delta = %.6f)' %
-        (epoch, avg_cd, avg_p2m, avg_cd_noisy, avg_cd_noisy - avg_cd), logger=logger)
+    print_log('[Validation] EPOCH: %d  Chamfer Distance = %.6f  (Noisy baseline CD = %.6f, delta = %.6f)' %
+        (epoch, avg_cd, avg_cd_noisy, avg_cd_noisy - avg_cd), logger=logger)
 
     if args.distributed:
         torch.cuda.synchronize()
@@ -504,7 +497,8 @@ def validate(base_model, test_dataloader, epoch, val_writer, args, config, logge
     if val_writer is not None:
         val_writer.add_scalar('Metric/CD', avg_cd, epoch)
 
-    return DenoiseMetrics(avg_cd, avg_p2m)
+    # val 只用 CD 排 checkpoint（P2M 置 0，better_than 退化为按 CD 比较）
+    return DenoiseMetrics(avg_cd, 0.0)
 
 def validate_vote(base_model, test_dataloader, epoch, val_writer, args, config, logger=None, times=10):
     print_log(f"[VALIDATION_VOTE] epoch {epoch}", logger=logger)
