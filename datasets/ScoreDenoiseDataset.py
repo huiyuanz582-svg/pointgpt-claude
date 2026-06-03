@@ -657,7 +657,9 @@ class ScoreDenoise(pl.LightningDataModule):
             dataloader = DataLoader(train_dset, batch_size=self.train_batch_size,shuffle=True, num_workers=self.num_workers,drop_last=True,collate_fn=denoise_collate_fn_test)
 
         return sampler,dataloader
-# 验证数据加载函数 固定噪声水平、不旋转、不缩放、不切割成小点云块，将整个点云数据输入模型测试，方便计算性能指标
+# 验证数据加载函数：用和训练一致的 1024-point patch（flag='train'）
+# 原来用 flag='test' 返回完整 10k 点云，但 group_divider 只覆盖其中 20%（64×32/10000），
+# 80% 的点 ε=0 不动，导致 val CD 永远接近 noisy baseline，无法反映模型真实去噪能力。
     def val_dataloader(self):
         val_split = 'val'
         val_dir = os.path.join(self.root, self.dataset, 'pointclouds', val_split)
@@ -669,24 +671,18 @@ class ScoreDenoise(pl.LightningDataModule):
             PointCloudDataset(root=self.root, dataset=self.dataset, split=val_split, resolution=resl)
             for resl in ['10000_poisson']
         ]
-        # print(val_dset[0][19],'pc_datasets---------------------------------------------------')
-        # return
         transform = standard_train_transforms(noise_std_min=self.val_noise, noise_std_max=self.val_noise, rotate=False, scale_d=0.0)
-        # val_dset = PointCloudDataset(root=self.root, dataset=self.dataset, split='test', resolution='50000_poisson')
-        val_dset = PairedPatchDataset(datasets=val_dset,patch_size=self.patch_size, num_patches=self.num_patches, patch_ratio=1.0, on_the_fly=True,noise_min=self.noise_min, noise_max=self.noise_max,transform=transform,flag='test')
-        
-        # print(val_dset[0],'=======================================val_test')
-        # return
+        # flag='train'：切 1024-point patch，与训练 coverage 一致（group_divider 覆盖 200% vs 原来 20%）
+        val_dset = PairedPatchDataset(datasets=val_dset, patch_size=self.patch_size, num_patches=self.num_patches, patch_ratio=1.0, on_the_fly=True, noise_min=self.val_noise, noise_max=self.val_noise, transform=transform, flag='train')
+
         if self.args.distributed:
             sampler = torch.utils.data.distributed.DistributedSampler(
                 val_dset, shuffle=False)
-            dataloader = DataLoader(val_dset, batch_size=1, num_workers=self.num_workers,drop_last=False,collate_fn=denoise_collate_fn_test,worker_init_fn=worker_init_fn,sampler=sampler)
+            dataloader = DataLoader(val_dset, batch_size=1, num_workers=self.num_workers, drop_last=False, collate_fn=denoise_collate_fn_test, worker_init_fn=worker_init_fn, sampler=sampler)
         else:
-            # val_dset = PairedPatchDataset(datasets=val_dset, patch_ratio=1.0, on_the_fly=True,noise_min=self.val_noise, noise_max=self.val_noise)
             sampler = None
-            dataloader = DataLoader(val_dset, batch_size=1, shuffle=False, num_workers=self.num_workers, drop_last=False,collate_fn=denoise_collate_fn_test)
-            # dataloader = DataLoader(val_dset, batch_size=self.train_batch_size, shuffle=False, num_workers=self.num_workers, drop_last=False,collate_fn=denoise_collate_fn)
-        return sampler,dataloader
+            dataloader = DataLoader(val_dset, batch_size=1, shuffle=False, num_workers=self.num_workers, drop_last=False, collate_fn=denoise_collate_fn_test)
+        return sampler, dataloader
     def test_dataloader(self):
         clean_dset = PointCloudDataset(
             root=self.root, dataset='PUNet', split='test', resolution='10000_poisson'

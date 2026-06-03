@@ -419,20 +419,17 @@ def validate(base_model, test_dataloader, epoch, val_writer, args, config, logge
             scale_t = scale[0].to(pcl_noisy.device)
 
             # 模型输出在归一化空间（单步去噪）
-            denoised_10k_norm = base_model(pcl_noisy, pcl_clean, 'val', name, noise_std=noise_std_t)
+            denoised = base_model(pcl_noisy, pcl_clean, 'val', name, noise_std=noise_std_t)
 
             # 归一化空间 CD
-            batch_cd_10k = ChamferDistanceL2().cuda()(denoised_10k_norm, pcl_clean) * 1e4
-            # noisy baseline：输入直接当输出，CD 应比 denoised 大；用于判断模型是否真的在降噪
+            batch_cd = ChamferDistanceL2().cuda()(denoised, pcl_clean) * 1e4
+            # noisy baseline CD（参考：去噪前 vs 去噪后）
             batch_cd_noisy = ChamferDistanceL2().cuda()(pcl_noisy, pcl_clean) * 1e4
-            total_cd_noisy_baseline = total_cd_noisy_baseline + batch_cd_noisy if idx > 0 else batch_cd_noisy
+            total_cd_noisy_baseline = total_cd_noisy_baseline + batch_cd_noisy
 
-            # 反归一化到世界坐标系算 P2M
-            denoised_world = denoised_10k_norm * scale_t + center_t
-            p2m_loss = compute_p2m(denoised_world[0], name[0], 'test') * 1e4
-
-            total_cd_10k += batch_cd_10k
-            total_p2m += p2m_loss
+            # val 用 1024-point patch，P2M 需要世界坐标系+完整点云，跳过
+            total_cd_10k += batch_cd
+            total_p2m += 0.0
             total_batches += 1
 
     if args.distributed:
