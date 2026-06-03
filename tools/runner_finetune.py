@@ -399,6 +399,7 @@ def validate(base_model, test_dataloader, epoch, val_writer, args, config, logge
     total_cd_10k = 0.0
     total_batches = 0
     total_p2m = 0.0
+    total_cd_noisy_baseline = 0.0
 
     with torch.no_grad():
         for idx, (pcl_noisy, pcl_clean, noise_std, center, scale, name) in enumerate(test_dataloader):
@@ -415,11 +416,14 @@ def validate(base_model, test_dataloader, epoch, val_writer, args, config, logge
             center_t = center[0].to(pcl_noisy.device)
             scale_t = scale[0].to(pcl_noisy.device)
 
-            # 模型输出在归一化空间（单步 Tweedie 去噪）
+            # 模型输出在归一化空间（单步去噪）
             denoised_10k_norm = base_model(pcl_noisy, pcl_clean, 'val', name, noise_std=noise_std_t)
 
-            # 归一化空间 CD（与训练 loss 一致）
+            # 归一化空间 CD
             batch_cd_10k = ChamferDistanceL2().cuda()(denoised_10k_norm, pcl_clean) * 1e4
+            # noisy baseline：输入直接当输出，CD 应比 denoised 大；用于判断模型是否真的在降噪
+            batch_cd_noisy = ChamferDistanceL2().cuda()(pcl_noisy, pcl_clean) * 1e4
+            total_cd_noisy_baseline = total_cd_noisy_baseline + batch_cd_noisy if idx > 0 else batch_cd_noisy
 
             # 反归一化到世界坐标系算 P2M
             denoised_world = denoised_10k_norm * scale_t + center_t
@@ -439,9 +443,10 @@ def validate(base_model, test_dataloader, epoch, val_writer, args, config, logge
 
     avg_cd = total_cd_10k / total_batches
     avg_p2m = total_p2m / total_batches
+    avg_cd_noisy = total_cd_noisy_baseline / total_batches
 
-    print_log('[Validation] EPOCH: %d  Chamfer Distance = %.6f  P2M = %.6f' %
-        (epoch, avg_cd, avg_p2m), logger=logger)
+    print_log('[Validation] EPOCH: %d  Chamfer Distance = %.6f  P2M = %.6f  (Noisy baseline CD = %.6f, delta = %.6f)' %
+        (epoch, avg_cd, avg_p2m, avg_cd_noisy, avg_cd_noisy - avg_cd), logger=logger)
 
     if args.distributed:
         torch.cuda.synchronize()
