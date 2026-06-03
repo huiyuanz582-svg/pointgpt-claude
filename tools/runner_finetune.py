@@ -215,13 +215,15 @@ def run_net(args, config, train_writer=None, val_writer=None):
     if args.ckpts is not None:
         base_model.load_model_from_ckpt(args.ckpts)
         # Score-based 关键步骤：重新初始化 generator 输出头
-        # 预训练的输出头学的是"生成绝对坐标"，作为 score 估计起点会让 noisy + σ²·score 大幅漂移
-        # 小方差初始化让模型从"不动"起步，逐步学习 score 方向
+        # 预训练的输出头学的是"生成绝对坐标"，直接用会让 noisy + σ·ε 大幅漂移
+        # ε-prediction target 的每点 norm ≈ √3 ≈ 1.7（标准正态）；增益头经过 ln_f 后
+        # 输出幅度 ≈ std·√fan_in ≈ std·√384。std=0.1 → 起点 ≈ 2.0，与 target 量级对齐，
+        # 避免之前 std=0.01（起点 ≈ 0.2，仅 target 的 ~12%）导致点几乎不动、幅度学不上来。
         with torch.no_grad():
-            nn.init.normal_(base_model.generator_blocks.increase_dim[0].weight, std=0.01)
+            nn.init.normal_(base_model.generator_blocks.increase_dim[0].weight, std=0.1)
             if base_model.generator_blocks.increase_dim[0].bias is not None:
                 nn.init.zeros_(base_model.generator_blocks.increase_dim[0].bias)
-        print_log('[Score-based] Re-initialized generator output head for score prediction', logger=logger)
+        print_log('[ε-prediction] Re-initialized generator output head (std=0.1)', logger=logger)
     else:
         print_log('Training from scratch', logger=logger)
     
