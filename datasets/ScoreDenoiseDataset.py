@@ -601,6 +601,10 @@ class ScoreDenoise(pl.LightningDataModule):
         self.aug_rotate = config.AUG_ROTATE
         # 训练过采样倍数：每张点云每 epoch 切 oversample 次随机 patch（不同种子+不同σ）
         self.train_oversample = getattr(config, 'TRAIN_OVERSAMPLE', 1)
+        # 测试分辨率和带噪目录（从 ScoreDenoise.yaml 读，默认 10k/1%）
+        self.test_resolution = getattr(config, 'TEST_RESOLUTION', '10000_poisson')
+        self.test_noisy_dir  = getattr(config, 'TEST_NOISY_DIR',
+                                       f'PUNet_{self.test_resolution}_0.01')
         self.args = args
     
 # 训练数据加载函数 划分成小点云块 添加噪声、旋转、缩放
@@ -684,11 +688,14 @@ class ScoreDenoise(pl.LightningDataModule):
             dataloader = DataLoader(val_dset, batch_size=1, shuffle=False, num_workers=self.num_workers, drop_last=False, collate_fn=denoise_collate_fn_test)
         return sampler, dataloader
     def test_dataloader(self):
+        # 从 config 读分辨率和带噪目录，不想改代码时只改 ScoreDenoise.yaml
+        test_resolution = getattr(self, 'test_resolution', '10000_poisson')
+        test_noisy_dir_name = getattr(self, 'test_noisy_dir', f'PUNet_{test_resolution}_0.01')
         clean_dset = PointCloudDataset(
-            root=self.root, dataset='PUNet', split='test', resolution='10000_poisson'
+            root=self.root, dataset='PUNet', split='test', resolution=test_resolution
         )
         noisy_dir = os.path.join(
-            self.root, 'examples', 'pointclouds', 'test', 'PUNet_10000_poisson_0.01'
+            self.root, 'examples', 'pointclouds', 'test', test_noisy_dir_name
         )
         noisy_dset = PointCloudNoisyDataset(noisy_dir=noisy_dir)
         val_dset = PairedEvalDataset(clean_dataset=clean_dset, noisy_dataset=noisy_dset)

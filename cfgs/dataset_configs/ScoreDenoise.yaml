@@ -6,6 +6,9 @@ VAL_NOISE: 0.010
 # TEST_NOISE: val/test 路径 noise_std 的 fallback（PairedEvalDataset 不含 noise_std 字段）
 # 跑 3% noise 测试时改为 0.030
 TEST_NOISE: 0.010
+# 测试用分辨率和带噪目录名（改这里换 10k/50k 以及噪声水平，无需改代码）
+TEST_RESOLUTION: 10000_poisson
+TEST_NOISY_DIR: PUNet_10000_poisson_0.01
 AUG_ROTATE: True
 DATASET: PUNet
 RESOLUTIONS: ['10000_poisson','30000_poisson','50000_poisson']
