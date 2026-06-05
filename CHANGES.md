@@ -94,3 +94,69 @@ CUDA_VISIBLE_DEVICES=0 python main.py \
 - 回滚到 P0 修复前:`git revert 0ed32b1 6c30dc9`(留下 CLAUDE.md)
 - 回滚 score-based,保留 P0 修复:`git revert 0ed32b1`
 - 完全恢复 first commit:`git reset --hard 4ecff66`(注意:`--hard` 会丢失工作目录修改)
+
+---
+
+## Session: ε-prediction 修复 + Langevin 多步推理落地 (2026-06)
+
+### 背景：之前 DSM 训练 val CD 不动
+
+上版用 DSM(σ²-加权 score matching)，target_score 量级 ~100，σ² 加权把梯度压到 ~0.01/步，
+模型几乎不学(val CD delta ~0.002)。这次定位到**多个叠加根因**并逐一修复。
+
+### 改了什么(训练侧)
+
+1. **DSM → ε-prediction(DDPM 风格)**：generator 输出 `ε = (clean-noisy)/σ`，量级 O(1)，
+   训练用纯 MSE 无 σ 加权。`models/PointGPT.py:forward` 的 train/val 分支重写。
+   - 训练：`loss = mean(||pred_ε - target_ε||²)`
+   - 推理(单步)：`x̂ = x + σ·pred_ε`
+2. **lr 3e-5 → 1e-4**：之前学习率太小。
+3. **输出头 re-init std 0.01 → 0.1**：初始预测量级从 ~0.2 提到 ~2，跟 target ε~O(1) 匹配。
+4. **修复 train/val coverage 失配(关键)**：val 原来喂完整 10k 点云，group_divider 只覆盖
+   2048/10000≈20%，80% 点 ε=0 不动，val CD 永远≈noisy baseline。改成 val 也切 1024-patch
+   (`ScoreDenoiseDataset.py:val_dataloader` flag='train')，coverage 跟训练一致(200%)。
+
+### 改了什么(推理侧)
+
+5. **patch_based_denoise**(`runner_finetune.py:153`)：完整点云切重叠 1024-patch 逐个去噪
+   再按覆盖次数平均拼回，解决 test 也只覆盖 20% 的问题。
+6. **Langevin 多步退火推理(Step 3 完成)**：patch 内迭代
+   `x ← x + step_size·σ_t·ε; σ_t ← σ_t·decay`，`num_steps=1,step_size=1.0` 退化为单步 fallback。
+   超参从 `config.langevin` 读。
+7. **TEST_NOISE / TEST_RESOLUTION / TEST_NOISY_DIR** 改为从 yaml 读，测不同分辨率/噪声免改代码。
+
+### 训练结果(score_eps_v4, 120 epoch)
+
+- val CD(1024-patch): 3.76 → **3.28**(epoch 117 best)，delta 0.002 → 0.46，确认真在学。
+- loss 3.40 → 2.56 干净收敛，无过拟合。
+
+### 推理超参调优(10k/1%)
+
+| 配置 | CD | P2M |
+|---|---|---|
+| 单步 Tweedie | 3.11 | 1.16 |
+| Langevin 20步/0.2/0.95 | 2.687 | 0.920 |
+| Langevin 30步/0.2/0.95 | 2.617 | 0.893 |
+| **Langevin 30步/0.3/0.95(最优)** | **2.565** | 0.925 |
+| Langevin 30步/0.5/0.97 | 3.084 | 1.497(过冲发散) |
+
+**锁定最优**：`num_steps=30, step_size=0.3, decay=0.95`。step_size≥0.5 会过冲。
+
+### 完整 baseline(Langevin 30/0.3/0.95)
+
+| 数据集 | 噪声 | CD | P2M |
+|---|---|---|---|
+| 10k | 1% | 2.565 | 0.925 |
+| 10k | 2% | 4.536 | 2.403 |
+| 10k | 3% | 5.819 | 3.621 |
+| 50k | 1% | **0.762** | **0.473** |
+| 50k | 2% | 1.409 | 1.036 |
+| 50k | 3% | 2.005 | 1.532 |
+
+50k 全面优于 10k(点密度高→patch 内更平坦→ε 估计更准+重叠平均更稳)。
+注：3% 超出训练范围(NOISE_MAX=0.02)但泛化平稳。
+
+### 下一步(待做)
+
+多噪声级 score matching 重训以改善 10k/高噪声 —— **不扩大噪声范围**(保持
+NOISE_MIN=0.005, NOISE_MAX=0.020 以与其他方法公平对比)，只改 σ 采样策略和训练目标。
