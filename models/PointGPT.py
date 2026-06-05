@@ -816,8 +816,11 @@ class PointTransformer(nn.Module):
             sigma = noise_std.view(-1, 1, 1).to(noisy_pts.device)   # [B, 1, 1]
             # ε-target: (clean - noisy) / σ，量级 O(1)，避免 DSM σ²-加权把梯度压成零
             target_eps = (clean_pts - noisy_pts) / sigma
+            # 逐样本保留 ε-MSE，便于和 P2M loss 在 runner 端按样本组合（这里返回均值标量）
             loss = ((pred_score_global - target_eps) ** 2).sum(dim=-1).mean()
-            return loss
+            # 同时返回预测去噪点 x̂ = x + σ·ε（归一化空间），供 runner 计算可微 P2M loss
+            denoised = noisy_pts + sigma * pred_score_global
+            return loss, denoised
 
         else:
             # Val / test: x̂ = x + σ · pred_ε

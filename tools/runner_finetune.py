@@ -20,7 +20,7 @@ import os
 from extensions.chamfer_dist import ChamferDistanceL1,ChamferDistanceL2
 import pytorch3d
 import pytorch3d.loss
-from utils.p2m_loss import compute_p2m
+from utils.p2m_loss import compute_p2m, compute_p2m_train
 
 train_transforms = transforms.Compose(
     [
@@ -358,6 +358,10 @@ def run_net(args, config, train_writer=None, val_writer=None):
     # training
     base_model.zero_grad()
     mesh_surface_cache = {}
+    # P2M 训练 loss 权重（0 = 关闭，纯 ε-prediction）；从 config.p2m_weight 读
+    p2m_weight = float(getattr(config, 'p2m_weight', 0.0))
+    if p2m_weight > 0:
+        print_log(f'[Training] P2M loss 已启用，权重 = {p2m_weight}', logger=logger)
     for epoch in range(start_epoch, config.max_epoch + 1):
         if args.distributed:
             train_sampler.set_epoch(epoch)
@@ -369,6 +373,7 @@ def run_net(args, config, train_writer=None, val_writer=None):
         batch_time = AverageMeter()
         data_time = AverageMeter()
         losses = AverageMeter(['loss'])
+        p2m_meter = AverageMeter(['p2m'])
 
         num_iter = 0
         base_model.train()  # set model to training mode
@@ -390,10 +395,29 @@ def run_net(args, config, train_writer=None, val_writer=None):
                 # 训练时 PairedPatchDataset 始终提供 noise_std，走到这里是 bug
                 raise RuntimeError('training noise_std is None — AddNoise transform 是否被意外移除？')
 
-            loss1 = base_model(pcl_noisy, pcl_clean, 'train', name,
+            loss1, denoised_norm = base_model(pcl_noisy, pcl_clean, 'train', name,
                                epoch=epoch, max_epoch=config.max_epoch,
                                noise_std=noise_std_t)
-            _loss = loss1 #用于去噪，下游任务的损失和生成任务的损失是一样的
+            _loss = loss1.mean()  # ε-MSE 标量
+
+            # P2M 训练 loss（可微，单向 point→face）：把预测点还原到 mesh 世界坐标系再算
+            if p2m_weight > 0:
+                p2m_terms = []
+                B = denoised_norm.shape[0]
+                for b in range(B):
+                    try:
+                        c_b = center[b].to(denoised_norm.device).view(1, 3)
+                        s_b = scale[b].to(denoised_norm.device).view(1, 1)
+                        pred_world = denoised_norm[b] * s_b + c_b   # [N,3] 还原世界坐标
+                        p2m_b = compute_p2m_train(pred_world, name[b], split='train')
+                        p2m_terms.append(p2m_b)
+                    except Exception as e:
+                        if idx == 0 and b == 0:
+                            print_log(f'[P2M] 跳过 (mesh 缺失或 pytorch3d 问题): {e}', logger=logger)
+                if len(p2m_terms) > 0:
+                    p2m_loss = torch.stack(p2m_terms).mean() * 1e4  # 量级对齐 test 的 P2M
+                    _loss = _loss + p2m_weight * p2m_loss
+                    p2m_meter.update([p2m_loss.item()])
 
             # loss, acc = base_model.module.get_loss_acc(ret, label)
 
@@ -456,8 +480,9 @@ def run_net(args, config, train_writer=None, val_writer=None):
         if train_writer is not None:
             train_writer.add_scalar('Loss/Epoch/Loss', losses.avg(0), epoch)
 
-        print_log('[Training] EPOCH: %d EpochTime = %.3f (s) Losses = %s lr = %.6f' %
-                  (epoch,  epoch_end_time - epoch_start_time, ['%.4f' % l for l in losses.avg()], optimizer.param_groups[0]['lr']), logger=logger)
+        p2m_avg_str = (' P2M = %.4f' % p2m_meter.avg(0)) if (p2m_weight > 0 and p2m_meter.count(0) > 0) else ''
+        print_log('[Training] EPOCH: %d EpochTime = %.3f (s) Losses = %s%s lr = %.6f' %
+                  (epoch,  epoch_end_time - epoch_start_time, ['%.4f' % l for l in losses.avg()], p2m_avg_str, optimizer.param_groups[0]['lr']), logger=logger)
     
         if epoch % args.val_freq == 0 and epoch != 0:
             # Validate the current model

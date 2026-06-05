@@ -66,3 +66,54 @@ def compute_p2m(pred_points, name, type):
     )
 
     return loss
+
+
+# ============================================================================
+# 训练用 P2M loss（可微，单向 point→face）
+# ----------------------------------------------------------------------------
+# 训练时输入是 1024-point patch，bidir 的 face→point 方向在完整 mesh 上没意义
+# （绝大多数面远离小 patch），所以只用 point→face：每个预测点到最近 mesh 面的距离。
+# 用 pytorch3d 底层 point_face_distance，对预测点可微。
+# ============================================================================
+_train_mesh_cache = {}  # name -> (verts, faces) 缓存，避免每 batch 重复 trimesh.load
+
+
+def _load_mesh_cached(name, split, device):
+    key = (name, split)
+    if key not in _train_mesh_cache:
+        off_path = os.path.join(_MESH_ROOT, split, name + ".off")
+        mesh = trimesh.load(off_path)
+        verts = torch.from_numpy(mesh.vertices.astype(np.float32))
+        faces = torch.from_numpy(mesh.faces.astype(np.int64))
+        _train_mesh_cache[key] = (verts, faces)
+    verts, faces = _train_mesh_cache[key]
+    return verts.to(device), faces.to(device)
+
+
+def compute_p2m_train(pred_points_world, name, split='train'):
+    """
+    可微 P2M 训练 loss（单向 point→face，均方距离）。
+
+    Args:
+        pred_points_world: [N, 3]，预测去噪点（mesh 世界坐标系，与 .off 顶点同坐标）
+        name:  点云名（对应 meshes/<split>/<name>.off）
+        split: 'train'
+    Returns:
+        标量：均方 point→face 距离（已在 mesh 单位球归一化空间内，量级与 test 的 P2M 可比）
+    """
+    from pytorch3d.loss.point_mesh_distance import point_face_distance
+
+    device = pred_points_world.device
+    verts, faces = _load_mesh_cached(name, split, device)
+
+    # 把 mesh 顶点归一化到单位球，并对预测点施加相同变换（与 test 的 compute_p2m 一致）
+    verts_n, center, scale = normalize_sphere(verts.unsqueeze(0))
+    verts_n = verts_n[0]
+    pcl_n = normalize_pcl(pred_points_world.unsqueeze(0), center=center, scale=scale)[0]
+
+    tris = verts_n[faces]  # [T, 3, 3]
+    points_first_idx = torch.zeros(1, dtype=torch.long, device=device)
+    tris_first_idx = torch.zeros(1, dtype=torch.long, device=device)
+    # 返回每个点到最近面的平方距离，[N]
+    dists = point_face_distance(pcl_n, points_first_idx, tris, tris_first_idx, pcl_n.shape[0])
+    return dists.mean()

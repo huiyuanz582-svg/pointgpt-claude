@@ -53,6 +53,10 @@ langevin:
 surface_projection:
   { enable: False, k: 16, num_iters: 1, blend: 0.6 }
 
+# P2M 训练 loss 权重（可微 point→face）：total = ε_MSE + p2m_weight·P2M
+# 0 = 关闭（纯 ε-prediction）；建议 0.02~0.05 起步，过大会过度贴面丢细节
+p2m_weight: 0.05
+
 npoints: 1024                # 跟 dataset_configs/ScoreDenoise.yaml 里的 PATCH_SIZE 对齐
 total_bs: 32                 # 实际生效（覆盖 dataset_configs 里的 TRAIN_BATCH_SIZE）
 step_per_update: 1
