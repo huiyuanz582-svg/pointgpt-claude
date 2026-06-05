@@ -297,14 +297,21 @@ class AddLaplacianNoise(object):
 
 # uniform noise 单个gpu版本
 class AddNoise(object):
-    def __init__(self, noise_std_min, noise_std_max):
+    def __init__(self, noise_std_min, noise_std_max, log_uniform=False):
         super().__init__()
         self.noise_std_min = noise_std_min
         self.noise_std_max = noise_std_max
+        # log_uniform=True: 在 [min,max] 内按对数均匀采样 σ（EDM 式），
+        # 让小 σ 样本占比更高，精细去噪区(贴表面/降 P2M)训练更充分；范围不变保证公平对比
+        self.log_uniform = log_uniform
 
     def __call__(self, data):
         # 随机噪声标准差
-        noise_std = random.uniform(self.noise_std_min, self.noise_std_max)
+        if self.log_uniform:
+            log_min, log_max = math.log(self.noise_std_min), math.log(self.noise_std_max)
+            noise_std = math.exp(random.uniform(log_min, log_max))
+        else:
+            noise_std = random.uniform(self.noise_std_min, self.noise_std_max)
         pcl_clean = data['pcl_clean'].float().contiguous()
 
         if pcl_clean.numel() == 0:

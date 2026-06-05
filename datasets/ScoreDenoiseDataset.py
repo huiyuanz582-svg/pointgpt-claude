@@ -601,6 +601,8 @@ class ScoreDenoise(pl.LightningDataModule):
         self.aug_rotate = config.AUG_ROTATE
         # 训练过采样倍数：每张点云每 epoch 切 oversample 次随机 patch（不同种子+不同σ）
         self.train_oversample = getattr(config, 'TRAIN_OVERSAMPLE', 1)
+        # σ 对数均匀采样开关（EDM 式）：范围仍为 [NOISE_MIN, NOISE_MAX] 不变，仅改采样分布
+        self.noise_log_uniform = getattr(config, 'NOISE_LOG_UNIFORM', False)
         # 测试分辨率和带噪目录（从 ScoreDenoise.yaml 读，默认 10k/1%）
         self.test_resolution = getattr(config, 'TEST_RESOLUTION', '10000_poisson')
         self.test_noisy_dir  = getattr(config, 'TEST_NOISY_DIR',
@@ -637,7 +639,7 @@ class ScoreDenoise(pl.LightningDataModule):
         #     单点 loss 贡献 ~ σ²·target² ~ 1e5，主导整个 batch loss
         noise_tran = Compose([
             NormalizeUnitSphere(),
-            AddNoise(self.noise_min, self.noise_max),
+            AddNoise(self.noise_min, self.noise_max, log_uniform=self.noise_log_uniform),
         ])
         # 构建成对 patch 数据集
             # PairedPatchDataset 会把点云随机分割成多个 patch；
