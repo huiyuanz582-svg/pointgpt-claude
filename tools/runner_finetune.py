@@ -217,6 +217,45 @@ def patch_based_denoise(base_model, pcl_noisy, noise_std_t, patch_size=1024,
     return denoised
 
 
+@torch.no_grad()
+def local_surface_projection(pcl, k=16, num_iters=1, blend=1.0, chunk=4096):
+    """
+    局部表面投影后处理：对每个点用 k-NN 做局部 PCA，估计局部表面法向，
+    把点沿法向投影到由邻域质心确定的局部切平面上，压低点到真实表面的距离(P2M)。
+
+    - pcl:       [N, 3]，去噪后点云（归一化空间）
+    - k:         邻域点数
+    - num_iters: 迭代次数（多次迭代收敛到更平滑表面）
+    - blend:     投影强度 [0,1]，1=完全投影，<1=部分投影（保细节）
+    - chunk:     分块大小，控制显存
+
+    返回 [N, 3] 投影后点云。
+    """
+    device = pcl.device
+    N = pcl.shape[0]
+    x = pcl.clone()
+    for _ in range(num_iters):
+        new_x = torch.empty_like(x)
+        for s in range(0, N, chunk):
+            q = x[s:s + chunk]                                   # [c, 3]
+            d = torch.cdist(q, x)                                # [c, N]
+            knn_idx = d.topk(k, dim=1, largest=False).indices    # [c, k]
+            nb = x[knn_idx]                                      # [c, k, 3]
+            centroid = nb.mean(dim=1, keepdim=True)              # [c, 1, 3]
+            cen = nb - centroid                                  # [c, k, 3]
+            cov = cen.transpose(1, 2) @ cen / k                  # [c, 3, 3]
+            # 最小特征向量 = 局部表面法向
+            evals, evecs = torch.linalg.eigh(cov)                # 升序
+            normal = evecs[:, :, 0]                              # [c, 3]
+            # 把点投影到过质心、法向为 normal 的平面：x' = x - (n·(x-c))·n
+            diff = (q - centroid.squeeze(1))                     # [c, 3]
+            dist_along_n = (diff * normal).sum(dim=1, keepdim=True)  # [c, 1]
+            proj = q - blend * dist_along_n * normal             # [c, 3]
+            new_x[s:s + chunk] = proj
+        x = new_x
+    return x
+
+
 def check_memory_and_exit(base_model, optimizer, epoch, metrics, best_metrics, args, logger,
                           threshold_gpu=0.80, threshold_cpu=85.0):
     """检查 GPU 显存和 CPU 内存，超阈值时保存检查点并主动退出，防止服务器崩溃"""
@@ -611,6 +650,17 @@ def test(base_model, test_dataloader, args, config, logger=None):
     print_log(f'[Inference] Langevin: num_steps={lv_steps}, step_size={lv_step_size}, decay={lv_decay}'
               + (' (单步 Tweedie fallback)' if lv_steps <= 1 else ''), logger=logger)
 
+    # 局部表面投影后处理超参（从 config.surface_projection 读，缺省关闭）
+    sp_cfg = getattr(config, 'surface_projection', None)
+    if sp_cfg is not None and bool(getattr(sp_cfg, 'enable', False)):
+        sp_enable = True
+        sp_k = int(getattr(sp_cfg, 'k', 16))
+        sp_iters = int(getattr(sp_cfg, 'num_iters', 1))
+        sp_blend = float(getattr(sp_cfg, 'blend', 1.0))
+        print_log(f'[Inference] Surface projection: k={sp_k}, num_iters={sp_iters}, blend={sp_blend}', logger=logger)
+    else:
+        sp_enable, sp_k, sp_iters, sp_blend = False, 16, 1, 1.0
+
     with torch.no_grad():
         vote_times = 5
         for idx, (pcl_noisy, pcl_clean, noise_std, center, scale, name) in enumerate(test_dataloader):
@@ -664,6 +714,10 @@ def test(base_model, test_dataloader, args, config, logger=None):
                 )  # [N, 3]
                 denoised_10k = denoised_full.unsqueeze(0)
                 denoised_filtered = sor_filter(denoised_10k[0])
+                # 局部表面投影后处理（仅在 config.surface_projection.enable 时启用）
+                if sp_enable:
+                    denoised_filtered = local_surface_projection(
+                        denoised_filtered, k=sp_k, num_iters=sp_iters, blend=sp_blend)
                 denoised_10k = denoised_filtered.unsqueeze(0).to(denoised_10k.device)
                 denoised_world = denoised_10k * scale_gpu + center_gpu
                 clean_world = pcl_clean * scale_gpu + center_gpu

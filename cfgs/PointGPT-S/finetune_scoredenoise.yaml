@@ -48,6 +48,11 @@ model:
 langevin:
   { num_steps: 30, step_size: 0.3, decay: 0.95 }
 
+# 局部表面投影后处理（仅 --test 生效）：k-NN PCA 估法向，把点投影到局部切平面降 P2M
+# blend<1 保细节；enable=False 关闭做对照
+surface_projection:
+  { enable: True, k: 16, num_iters: 1, blend: 0.6 }
+
 npoints: 1024                # 跟 dataset_configs/ScoreDenoise.yaml 里的 PATCH_SIZE 对齐
 total_bs: 32                 # 实际生效（覆盖 dataset_configs 里的 TRAIN_BATCH_SIZE）
 step_per_update: 1
