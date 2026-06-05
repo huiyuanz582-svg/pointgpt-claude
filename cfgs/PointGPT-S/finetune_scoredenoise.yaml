@@ -43,6 +43,10 @@ model:
     weight_center: 1.0,
   }
 
+# Langevin 多步退火推理（仅 --test 时生效）；num_steps=1 退化为单步 Tweedie
+langevin:
+  { num_steps: 20, step_size: 0.2, decay: 0.95 }
+
 npoints: 1024                # 跟 dataset_configs/ScoreDenoise.yaml 里的 PATCH_SIZE 对齐
 total_bs: 32                 # 实际生效（覆盖 dataset_configs 里的 TRAIN_BATCH_SIZE）
 step_per_update: 1

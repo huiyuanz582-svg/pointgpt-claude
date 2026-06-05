@@ -151,7 +151,8 @@ def sor_filter(pts_tensor, nb_neighbors=20, std_ratio=2.0):
 
 @torch.no_grad()
 def patch_based_denoise(base_model, pcl_noisy, noise_std_t, patch_size=1024,
-                        seed_ratio=3, patch_batch=16):
+                        seed_ratio=3, patch_batch=16,
+                        num_steps=1, step_size=1.0, decay=0.95):
     """
     完整点云的 patch-based 推理：把 N 点云切成覆盖全部点的重叠 1024-patch，
     逐 patch 去噪后按覆盖次数平均拼回完整点云。
@@ -160,6 +161,15 @@ def patch_based_denoise(base_model, pcl_noisy, noise_std_t, patch_size=1024,
     - noise_std_t: [1] 或标量，该点云的噪声水平 σ
     - 与训练一致：每个 patch 是 1024 点，喂给 model 后内部 group_divider 覆盖 200%
     - seed_ratio:  FPS 种子数 = seed_ratio * N / patch_size，控制重叠/覆盖冗余
+
+    多步 Langevin 退火推理（num_steps>1 时启用）：
+        x ← x_noisy
+        for t in range(num_steps):
+            ε   = model(x, σ_t)               # 每步重新估计
+            x   ← x + step_size · σ_t · ε     # 走一小步
+            σ_t ← σ_t · decay                 # 逐步退火
+    - num_steps=1, step_size=1.0 时退化为原单步 Tweedie：x̂ = x + σ·ε（fallback）
+    - patch 内部做迭代（group_divider 是逐 patch 工作的），最后再拼回
 
     返回 [N, 3] 去噪后完整点云。
     """
@@ -176,15 +186,22 @@ def patch_based_denoise(base_model, pcl_noisy, noise_std_t, patch_size=1024,
     patch_idx = dist.topk(patch_size, dim=1, largest=False).indices  # [S, patch_size]
     patches = pcl_noisy[patch_idx]                                  # [S, patch_size, 3]
 
-    sigma = noise_std_t.view(-1)[0] if torch.is_tensor(noise_std_t) else float(noise_std_t)
+    sigma0 = noise_std_t.view(-1)[0] if torch.is_tensor(noise_std_t) else float(noise_std_t)
+    sigma0 = float(sigma0)
 
     # 分批喂模型去噪
     denoised_patches = []
     for i in range(0, patches.shape[0], patch_batch):
-        pb = patches[i:i + patch_batch]                            # [b, patch_size, 3]
-        ns = torch.full((pb.shape[0],), float(sigma), device=device)
-        out = base_model(pb, None, 'val', '', noise_std=ns)        # [b, patch_size, 3]
-        denoised_patches.append(out)
+        x = patches[i:i + patch_batch]                            # [b, patch_size, 3]
+        sigma_t = sigma0
+        for _ in range(num_steps):
+            ns = torch.full((x.shape[0],), float(sigma_t), device=device)
+            # 'val' 路径返回 x + σ_t·ε，反解出 ε 再按 step_size 走一小步
+            out = base_model(x, None, 'val', '', noise_std=ns)    # [b, patch_size, 3]
+            eps = (out - x) / sigma_t                             # 估计的 ε
+            x = x + step_size * sigma_t * eps                     # Langevin 退火步
+            sigma_t = sigma_t * decay                             # σ 逐步退火
+        denoised_patches.append(x)
     denoised_patches = torch.cat(denoised_patches, dim=0)          # [S, patch_size, 3]
 
     # 按覆盖次数平均拼回完整点云
@@ -583,6 +600,17 @@ def test(base_model, test_dataloader, args, config, logger=None):
     total_batches = 0
     total_p2m = 0.0
 
+    # Langevin 多步推理超参（从 config 读，缺省退化为单步 Tweedie）
+    langevin = getattr(config, 'langevin', None)
+    if langevin is not None:
+        lv_steps = int(getattr(langevin, 'num_steps', 1))
+        lv_step_size = float(getattr(langevin, 'step_size', 1.0))
+        lv_decay = float(getattr(langevin, 'decay', 0.95))
+    else:
+        lv_steps, lv_step_size, lv_decay = 1, 1.0, 0.95
+    print_log(f'[Inference] Langevin: num_steps={lv_steps}, step_size={lv_step_size}, decay={lv_decay}'
+              + (' (单步 Tweedie fallback)' if lv_steps <= 1 else ''), logger=logger)
+
     with torch.no_grad():
         vote_times = 5
         for idx, (pcl_noisy, pcl_clean, noise_std, center, scale, name) in enumerate(test_dataloader):
@@ -630,7 +658,10 @@ def test(base_model, test_dataloader, args, config, logger=None):
             best_denoised = None
             for _ in range(vote_times):
                 # patch-based 推理：完整点云切 1024-patch 逐个去噪再拼回，覆盖全部点
-                denoised_full = patch_based_denoise(base_model, pcl_noisy[0], noise_std_t)  # [N, 3]
+                denoised_full = patch_based_denoise(
+                    base_model, pcl_noisy[0], noise_std_t,
+                    num_steps=lv_steps, step_size=lv_step_size, decay=lv_decay,
+                )  # [N, 3]
                 denoised_10k = denoised_full.unsqueeze(0)
                 denoised_filtered = sor_filter(denoised_10k[0])
                 denoised_10k = denoised_filtered.unsqueeze(0).to(denoised_10k.device)
