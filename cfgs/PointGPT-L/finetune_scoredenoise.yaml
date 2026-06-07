@@ -6,8 +6,8 @@
 optimizer: 
   { type: AdamW, kwargs: { lr: 0.0001, weight_decay: 0.05 } }
 
-scheduler: 
-  { type: CosLR, kwargs: { epochs: 300, initial_epochs: 10 } }
+scheduler:
+  { type: CosLR, kwargs: { epochs: 120, initial_epochs: 8 } }
 
 dataset:
   {
@@ -44,10 +44,21 @@ model:
     weight_center: 1.0,
   }
 
+# Langevin 多步退火推理（仅 --test 生效），与 S 版同款经验最优超参
+langevin:
+  { num_steps: 30, step_size: 0.3, decay: 0.95 }
+
+# 局部表面投影后处理（默认关闭，PCA 法向不可靠）
+surface_projection:
+  { enable: False, k: 16, num_iters: 1, blend: 0.6 }
+
+# P2M 训练 loss 权重，与 S 版 v8 一致；L 容量更大，可后续微调
+p2m_weight: 0.30
+
 npoints: 1024                # 跟 dataset_configs/ScoreDenoise.yaml 的 PATCH_SIZE 对齐
 total_bs: 16                 # L 模型显存吃紧，先用 16 试，OOM 再降
 step_per_update: 1
-max_epoch: 300
+max_epoch: 120
 grad_norm_clip: 10
 save_interval: 10
 val_interval: 1
