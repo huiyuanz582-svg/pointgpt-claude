@@ -257,8 +257,12 @@ def local_surface_projection(pcl, k=16, num_iters=1, blend=1.0, chunk=4096):
 
 
 def check_memory_and_exit(base_model, optimizer, epoch, metrics, best_metrics, args, logger,
-                          threshold_gpu=0.80, threshold_cpu=85.0):
-    """检查 GPU 显存和 CPU 内存，超阈值时保存检查点并主动退出，防止服务器崩溃"""
+                          threshold_gpu=0.80, threshold_cpu=78.0):
+    """检查 GPU 显存和 CPU 内存，超阈值时保存检查点并主动退出，防止服务器崩溃
+
+    threshold_cpu=78：给峰值留余量。L 模型内存峰值出现在 epoch 内部（尤其验证阶段
+    全点云 patch 去噪），所以本函数也会被 epoch 内周期性调用（见训练循环 check_interval）。
+    """
     should_exit = False
     reason = ''
 
@@ -465,6 +469,12 @@ def run_net(args, config, train_writer=None, val_writer=None):
 
             batch_time.update(time.time() - batch_start_time)
             batch_start_time = time.time()
+
+            # epoch 内周期性内存检查：L 模型内存峰值在 epoch 中间，epoch 末尾才查会来不及救
+            # 每 mem_check_interval 个 batch 查一次，超阈值立刻保存 ckpt-last 并退出
+            mem_check_interval = int(getattr(config, 'mem_check_interval', 50))
+            if mem_check_interval > 0 and idx > 0 and idx % mem_check_interval == 0:
+                check_memory_and_exit(base_model, optimizer, epoch, best_metrics, best_metrics, args, logger)
 
             # if idx % 10 == 0:
             #     print_log('[Epoch %d/%d][Batch %d/%d] BatchTime = %.3f (s) DataTime = %.3f (s) Loss+Acc = %s lr = %.6f' %

@@ -56,9 +56,10 @@ surface_projection:
 p2m_weight: 0.30
 
 npoints: 1024                # 跟 dataset_configs/ScoreDenoise.yaml 的 PATCH_SIZE 对齐
-total_bs: 16                 # L 模型显存吃紧，先用 16 试，OOM 再降
+total_bs: 8                  # L 模型显存吃紧，从 16 降到 8 防 OOM/服务器崩溃
 step_per_update: 1
 max_epoch: 120
+mem_check_interval: 50       # 每 50 个 batch 检查一次内存（epoch 内峰值保护，0 = 关闭）
 grad_norm_clip: 10
 save_interval: 10
 val_interval: 1
