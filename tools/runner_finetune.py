@@ -257,11 +257,13 @@ def local_surface_projection(pcl, k=16, num_iters=1, blend=1.0, chunk=4096):
 
 
 def check_memory_and_exit(base_model, optimizer, epoch, metrics, best_metrics, args, logger,
-                          threshold_gpu=0.80, threshold_cpu=78.0):
+                          threshold_gpu=0.72, threshold_cpu=78.0):
     """检查 GPU 显存和 CPU 内存，超阈值时保存检查点并主动退出，防止服务器崩溃
 
-    threshold_cpu=78：给峰值留余量。L 模型内存峰值出现在 epoch 内部（尤其验证阶段
-    全点云 patch 去噪），所以本函数也会被 epoch 内周期性调用（见训练循环 check_interval）。
+    实测（A100-80GB）：CPU 125GB 仅占 15GB 完全不是瓶颈，真正风险是 GPU 显存尖峰
+    （L 模型验证阶段一度冲到 57GB ≈ 71%）。故 GPU 阈值收紧到 0.72，在尖峰逼近时
+    及时保存退出，避免 bs 偏大时冲破 80GB 导致 GPU OOM / 服务器卡死。
+    本函数在 epoch 内每 mem_check_interval 个 batch、以及验证前后被调用。
     """
     should_exit = False
     reason = ''
@@ -495,6 +497,9 @@ def run_net(args, config, train_writer=None, val_writer=None):
                   (epoch,  epoch_end_time - epoch_start_time, ['%.4f' % l for l in losses.avg()], p2m_avg_str, optimizer.param_groups[0]['lr']), logger=logger)
     
         if epoch % args.val_freq == 0 and epoch != 0:
+            # 验证前清缓存 + 查显存：验证阶段是 GPU 显存尖峰来源，跑之前先确保有余量
+            torch.cuda.empty_cache()
+            check_memory_and_exit(base_model, optimizer, epoch, best_metrics, best_metrics, args, logger)
             # Validate the current model
             metrics = validate(base_model, test_dataloader,
                                epoch, val_writer, args, config, logger=logger)
