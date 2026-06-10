@@ -151,7 +151,7 @@ def sor_filter(pts_tensor, nb_neighbors=20, std_ratio=2.0):
 
 @torch.no_grad()
 def patch_based_denoise(base_model, pcl_noisy, noise_std_t, patch_size=1024,
-                        seed_ratio=3, patch_batch=16,
+                        seed_ratio=3, patch_batch=4,
                         num_steps=1, step_size=1.0, decay=0.95):
     """
     完整点云的 patch-based 推理：把 N 点云切成覆盖全部点的重叠 1024-patch，
@@ -704,6 +704,7 @@ def test(base_model, test_dataloader, args, config, logger=None):
     with torch.no_grad():
         vote_times = 5
         for idx, (pcl_noisy, pcl_clean, noise_std, center, scale, name) in enumerate(test_dataloader):
+            torch.cuda.empty_cache()   # L 模型测试每个样本前清缓存，防显存尖峰崩机
             save_path = 'test_test_result_1'
             save_path2 = 'visualiza-result10k-1'
             save_path3 = 'finetune_scoredenoise_L'
