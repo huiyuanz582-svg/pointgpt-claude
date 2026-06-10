@@ -193,6 +193,13 @@ def patch_based_denoise(base_model, pcl_noisy, noise_std_t, patch_size=1024,
     # 分批喂模型去噪
     denoised_patches = []
     for i in range(0, patches.shape[0], patch_batch):
+        # 每个 patch 批次前硬保护：逼近上限就主动退出，绝不让服务器崩
+        if i > 0 and gpu_mem_ratio() > 0.90:
+            torch.cuda.empty_cache()
+            if gpu_mem_ratio() > 0.90:
+                print('[测试内存保护] patch 推理中 GPU 显存逼近上限，为防崩溃主动退出；'
+                      '请在 yaml 调小 test_patch_batch 后重跑')
+                sys.exit(0)
         x = patches[i:i + patch_batch]                            # [b, patch_size, 3]
         sigma_t = sigma0
         for _ in range(num_steps):
@@ -202,7 +209,8 @@ def patch_based_denoise(base_model, pcl_noisy, noise_std_t, patch_size=1024,
             eps = (out - x) / sigma_t                             # 估计的 ε
             x = x + step_size * sigma_t * eps                     # Langevin 退火步
             sigma_t = sigma_t * decay                             # σ 逐步退火
-        denoised_patches.append(x)
+        denoised_patches.append(x.detach())
+        del x, out, eps, ns
     denoised_patches = torch.cat(denoised_patches, dim=0)          # [S, patch_size, 3]
 
     # 按覆盖次数平均拼回完整点云
@@ -731,16 +739,21 @@ def test(base_model, test_dataloader, args, config, logger=None):
         sp_enable, sp_k, sp_iters, sp_blend = False, 16, 1, 1.0
 
     with torch.no_grad():
-        vote_times = 5
+        vote_times = 1   # 关闭多次投票：单次推理即可，降一倍以上显存/计算压力，防崩机
         for idx, (pcl_noisy, pcl_clean, noise_std, center, scale, name) in enumerate(test_dataloader):
             torch.cuda.empty_cache()   # L 模型测试每个样本前清缓存，防显存尖峰崩机
             gc.collect()               # 同步回收 CPU 端 numpy/o3d 临时对象（50k 可视化吃 CPU）
-            # 软显存监控（仅告警+清缓存，不退出，保证测试跑完所有样本）
+            # 硬显存保护：宁可中断测试也绝不让服务器崩。
+            # 先清缓存再读真实占用；若清完仍逼近上限，立刻打印已完成结果并安全退出。
             _mr = gpu_mem_ratio()
-            if _mr > 0.85:
-                print_log(f'[测试内存保护] 样本 {idx} 前 GPU 显存 {_mr:.1%} 偏高，已强制清缓存；'
-                          f'若持续 OOM 请在 yaml 调小 test_patch_batch', logger=logger)
-                torch.cuda.empty_cache()
+            _cpu = psutil.virtual_memory().percent
+            if _mr > 0.88 or _cpu > 90.0:
+                print_log(f'[测试内存保护] 样本 {idx} 前 GPU={_mr:.1%} / CPU={_cpu:.1f}% 逼近上限，'
+                          f'为防服务器崩溃主动中断测试。已完成 {total_batches} 个样本：'
+                          f'CD={ (total_cd/total_batches) if total_batches>0 else float("nan"):.6f} '
+                          f'p2m={ (total_p2m/total_batches) if total_batches>0 else float("nan"):.6f}。'
+                          f'请在 yaml 调小 test_patch_batch 后重跑', logger=logger)
+                sys.exit(0)
             save_path = 'test_test_result_1'
             save_path2 = 'visualiza-result10k-1'
             save_path3 = 'finetune_scoredenoise_L'
