@@ -58,7 +58,7 @@ surface_projection:
 p2m_weight: 0.70
 
 npoints: 1024                # 跟 dataset_configs/ScoreDenoise.yaml 里的 PATCH_SIZE 对齐
-total_bs: 32                 # 实际生效（覆盖 dataset_configs 里的 TRAIN_BATCH_SIZE）
+total_bs: 8                  # RTX 4090 24GB：S 模型 bs=8 约占 10-12GB，安全；A100 可调 32
 step_per_update: 1
 max_epoch: 120
 grad_norm_clip: 10
