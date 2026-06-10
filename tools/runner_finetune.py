@@ -257,11 +257,12 @@ def local_surface_projection(pcl, k=16, num_iters=1, blend=1.0, chunk=4096):
 
 
 def check_memory_and_exit(base_model, optimizer, epoch, metrics, best_metrics, args, logger,
-                          threshold_gpu=0.75, threshold_cpu=78.0):
+                          threshold_gpu=0.72, threshold_cpu=78.0):
     """检查 GPU 显存和 CPU 内存，超阈值时保存检查点并主动退出，防止服务器崩溃
 
-    RTX 4090（24GB）：阈值 0.75 → 触发线 18GB，留 6GB 缓冲防止验证阶段尖峰 OOM。
-    A100-80GB：原阈值 0.72（57GB/80GB≈71%），换卡后不再需要那么保守。
+    实测（A100-80GB）：CPU 125GB 仅占 15GB 完全不是瓶颈，真正风险是 GPU 显存尖峰
+    （L 模型验证阶段一度冲到 57GB ≈ 71%）。故 GPU 阈值收紧到 0.72，在尖峰逼近时
+    及时保存退出，避免 bs 偏大时冲破 80GB 导致 GPU OOM / 服务器卡死。
     本函数在 epoch 内每 mem_check_interval 个 batch、以及验证前后被调用。
     """
     should_exit = False

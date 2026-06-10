@@ -56,11 +56,11 @@ surface_projection:
 p2m_weight: 0.30
 
 npoints: 1024                # 跟 dataset_configs/ScoreDenoise.yaml 的 PATCH_SIZE 对齐
-total_bs: 2                  # RTX 4090 仅 24GB，L 模型必须 bs=2；A100-80GB 可调回 8
-step_per_update: 4           # 梯度累积 4 步 ≈ 等效 bs=8，维持训练稳定性
+total_bs: 8                  # L 模型显存吃紧，从 16 降到 8 防 OOM/服务器崩溃
+step_per_update: 1
 max_epoch: 120
-mem_check_interval: 20       # 4090 显存紧张，缩短检查间隔到 20 batch
-test_patch_batch: 1          # 4090 测试时每批只处理 1 个 patch，防 OOM
+mem_check_interval: 50       # 每 50 个 batch 检查一次内存（epoch 内峰值保护，0 = 关闭）
+test_patch_batch: 2          # 测试时每批 patch 数：L 模型显存吃紧，50k 用 2 最稳；10k 可调 4
 grad_norm_clip: 1.0          # L模型depth=24梯度路径是S的2倍，clip必须收紧防爆炸
 save_interval: 10
 val_interval: 1
