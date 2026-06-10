@@ -9,6 +9,7 @@ from utils.AverageMeter import AverageMeter
 import numpy as np
 import psutil
 import sys
+import gc
 from datasets import data_transforms
 from pointnet2_ops import pointnet2_utils
 from torchvision import transforms
@@ -300,6 +301,27 @@ def check_memory_and_exit(base_model, optimizer, epoch, metrics, best_metrics, a
         print_log(f'[内存保护] {reason}，保存检查点后主动退出', logger=logger)
         builder.save_checkpoint(base_model, optimizer, epoch, metrics, best_metrics, 'ckpt-last', args, logger=logger)
         sys.exit(0)
+
+
+def gpu_mem_ratio():
+    """返回当前 GPU(0) 显存使用率 [0,1]，读取失败返回 0.0。仅用于测试路径软监控（不退出）"""
+    if not torch.cuda.is_available():
+        return 0.0
+    import subprocess
+    try:
+        result = subprocess.check_output(
+            ['nvidia-smi', '--query-gpu=memory.used,memory.total',
+             '--format=csv,noheader,nounits', '--id=0'],
+            encoding='utf-8'
+        ).strip().split(',')
+        return int(result[0].strip()) / int(result[1].strip())
+    except Exception:
+        try:
+            reserved = torch.cuda.memory_reserved(0)
+            total = torch.cuda.get_device_properties(0).total_memory
+            return reserved / total
+        except Exception:
+            return 0.0
 
 
 def run_net(args, config, train_writer=None, val_writer=None):
@@ -694,6 +716,9 @@ def test(base_model, test_dataloader, args, config, logger=None):
     test_patch_batch = int(getattr(config, 'test_patch_batch', 4))
     print_log(f'[Inference] test_patch_batch={test_patch_batch}', logger=logger)
 
+    # ChamferDistanceL2 只实例化一次，避免每次投票都新建 CUDA 模块（防显存碎片累积）
+    cd_metric = ChamferDistanceL2().cuda()
+
     # 局部表面投影后处理超参（从 config.surface_projection 读，缺省关闭）
     sp_cfg = getattr(config, 'surface_projection', None)
     if sp_cfg is not None and bool(getattr(sp_cfg, 'enable', False)):
@@ -709,6 +734,13 @@ def test(base_model, test_dataloader, args, config, logger=None):
         vote_times = 5
         for idx, (pcl_noisy, pcl_clean, noise_std, center, scale, name) in enumerate(test_dataloader):
             torch.cuda.empty_cache()   # L 模型测试每个样本前清缓存，防显存尖峰崩机
+            gc.collect()               # 同步回收 CPU 端 numpy/o3d 临时对象（50k 可视化吃 CPU）
+            # 软显存监控（仅告警+清缓存，不退出，保证测试跑完所有样本）
+            _mr = gpu_mem_ratio()
+            if _mr > 0.85:
+                print_log(f'[测试内存保护] 样本 {idx} 前 GPU 显存 {_mr:.1%} 偏高，已强制清缓存；'
+                          f'若持续 OOM 请在 yaml 调小 test_patch_batch', logger=logger)
+                torch.cuda.empty_cache()
             save_path = 'test_test_result_1'
             save_path2 = 'visualiza-result10k-1'
             save_path3 = 'finetune_scoredenoise_L'
@@ -772,15 +804,21 @@ def test(base_model, test_dataloader, args, config, logger=None):
                 _, center1, scale1 = normalize_unit_sphere(clean_world)
                 pcl_clean_10k_norm = (clean_world - center1) / scale1
                 denoised_10k_norm = (denoised_world - center1) / scale1
-                batch_cd = ChamferDistanceL2().cuda()(denoised_10k_norm, pcl_clean_10k_norm) * 1e4
+                batch_cd = cd_metric(denoised_10k_norm, pcl_clean_10k_norm) * 1e4
 
-                if batch_cd.item() < best_cd:
-                    best_cd = batch_cd.item()
+                cur_cd = batch_cd.item()
+                if cur_cd < best_cd:
+                    best_cd = cur_cd
                     best_p2m = p2m_loss.item() if isinstance(p2m_loss, torch.Tensor) else float(p2m_loss)
-                    best_denoised = denoised_world.clone()
+                    best_denoised = denoised_world.detach().clone()
+
+                # 每次投票后释放本轮中间张量并清缓存，防 50k×Langevin 多步显存碎片累积崩机
+                del denoised_full, denoised_10k, denoised_filtered, denoised_world
+                del clean_world, denoised_10k_norm, pcl_clean_10k_norm, batch_cd, p2m_loss
+                torch.cuda.empty_cache()
 
             denoised_10k = best_denoised
-            batch_cd = torch.tensor(best_cd, device=pcl_noisy.device)
+            batch_cd = float(best_cd)
             p2m_loss = best_p2m
            
 # 可视化去噪效果--------------------------------------------------------------------------------------------
