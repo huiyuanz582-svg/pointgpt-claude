@@ -690,6 +690,10 @@ def test(base_model, test_dataloader, args, config, logger=None):
     print_log(f'[Inference] Langevin: num_steps={lv_steps}, step_size={lv_step_size}, decay={lv_decay}'
               + (' (单步 Tweedie fallback)' if lv_steps <= 1 else ''), logger=logger)
 
+    # 测试 patch_batch（从 config 读）：L 模型显存吃紧，10k 用 4、50k 建议 2，缺省 4
+    test_patch_batch = int(getattr(config, 'test_patch_batch', 4))
+    print_log(f'[Inference] test_patch_batch={test_patch_batch}', logger=logger)
+
     # 局部表面投影后处理超参（从 config.surface_projection 读，缺省关闭）
     sp_cfg = getattr(config, 'surface_projection', None)
     if sp_cfg is not None and bool(getattr(sp_cfg, 'enable', False)):
@@ -751,6 +755,7 @@ def test(base_model, test_dataloader, args, config, logger=None):
                 # patch-based 推理：完整点云切 1024-patch 逐个去噪再拼回，覆盖全部点
                 denoised_full = patch_based_denoise(
                     base_model, pcl_noisy[0], noise_std_t,
+                    patch_batch=test_patch_batch,
                     num_steps=lv_steps, step_size=lv_step_size, decay=lv_decay,
                 )  # [N, 3]
                 denoised_10k = denoised_full.unsqueeze(0)
