@@ -70,7 +70,7 @@ for t in range(num_steps):
 **Patch coverage is the recurring subtlety** — `group_divider` only covers ~`num_group·group_size / N` of the points, so feeding a full 10k cloud leaves ~80% of points with ε≈0 (unmoved). The fix is applied in three places that must stay consistent:
 - **Train**: dataset cuts a single 1024-point KNN patch per sample → 64×32/1024 ≈ 200% coverage.
 - **Val**: `val_dataloader` uses `flag='train'` (same 1024-patch) so val CD reflects real denoising, not the noisy baseline.
-- **Test**: `patch_based_denoise` tiles the full cloud into overlapping 1024-patches (FPS seeds + KNN), denoises each, averages overlapping predictions back. Uncovered points fall back to noisy.
+- **Test**: `patch_based_denoise` tiles the full cloud into overlapping 1024-patches (FPS seeds + KNN), denoises each, and fuses overlapping predictions back with a **distance-to-seed Gaussian weight** (`fuse_tau_ratio` in the yaml, default 0.5): a point's contribution from a patch is weighted `exp(−d²/2τ²)`, τ = ratio·patch-radius, so each patch's boundary points are down-weighted and overlap-fusion doesn't blur curved surfaces (targets P2M). `fuse_tau_ratio ≤ 0` reverts to the old equal-weight averaging. Uncovered points fall back to noisy.
 
 **Checkpoint-load output-head re-init (do not remove):** after `load_model_from_ckpt`, the runner re-initializes `generator_blocks.increase_dim[0]` to `std=0.1` weights / zero bias (`runner_finetune.py:run_net`). The pre-trained head generates *absolute coordinates*; reused directly it makes `x + σ·ε` drift wildly. `std=0.1` puts the initial ε magnitude (~2.0) near the target ε (~√3). The earlier `std=0.01` value left points barely moving — if "the model won't learn amplitude", check this.
 
@@ -97,7 +97,7 @@ YAML → `EasyDict` via `utils/config.py:cfg_from_yaml_file`, with recursive `_b
 
 Key denoising-specific yaml knobs (read at runtime; no code edit needed to change them):
 - `cfgs/dataset_configs/ScoreDenoise.yaml`: `NOISE_MIN/MAX` (0.005/0.020 — keep fixed for fair SOTA comparison), `NOISE_LOG_UNIFORM` (log-uniform σ sampling), `TEST_RESOLUTION` / `TEST_NOISY_DIR` / `TEST_NOISE` (switch 10k/50k and noise level here), `PATCH_SIZE` (1024, aligned with pre-train npoints), `TRAIN_OVERSAMPLE` (per-cloud patch resampling per epoch — 120 clouds is far too few steps/epoch without it).
-- Finetune yamls: `langevin`, `surface_projection`, `p2m_weight`, `test_patch_batch`, `mem_check_interval`, `grad_norm_clip`.
+- Finetune yamls: `langevin`, `surface_projection`, `fuse_tau_ratio`, `p2m_weight`, `test_patch_batch`, `mem_check_interval`, `grad_norm_clip`.
 - `val_interval` / `save_interval` in the yaml are inert — validation cadence uses `args.val_freq` (default 1) and `ckpt-last` is saved every epoch.
 
 ## Dataset wiring and on-disk layout

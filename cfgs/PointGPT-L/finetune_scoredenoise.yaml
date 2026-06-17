@@ -52,6 +52,10 @@ langevin:
 surface_projection:
   { enable: False, k: 16, num_iters: 1, blend: 0.6 }
 
+# 跨 patch 拼接权重（仅 --test 生效）：到 patch 种子点距离的高斯权重 τ = fuse_tau_ratio · patch 半径
+# 边界点降权，避免重叠区等权平均把曲面磨平（降 P2M）；<=0 退化为等权平均（旧行为）
+fuse_tau_ratio: 0.5
+
 # P2M 训练 loss 权重，与 S 版 v8 一致；L 容量更大，可后续微调
 p2m_weight: 0.30
 

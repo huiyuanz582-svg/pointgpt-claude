@@ -153,15 +153,18 @@ def sor_filter(pts_tensor, nb_neighbors=20, std_ratio=2.0):
 @torch.no_grad()
 def patch_based_denoise(base_model, pcl_noisy, noise_std_t, patch_size=1024,
                         seed_ratio=3, patch_batch=4,
-                        num_steps=1, step_size=1.0, decay=0.95):
+                        num_steps=1, step_size=1.0, decay=0.95,
+                        fuse_tau_ratio=0.5):
     """
     完整点云的 patch-based 推理：把 N 点云切成覆盖全部点的重叠 1024-patch，
-    逐 patch 去噪后按覆盖次数平均拼回完整点云。
+    逐 patch 去噪后按到种子点距离的高斯权重加权拼回完整点云。
 
     - pcl_noisy:   [N, 3]，归一化空间的完整噪声点云
     - noise_std_t: [1] 或标量，该点云的噪声水平 σ
     - 与训练一致：每个 patch 是 1024 点，喂给 model 后内部 group_divider 覆盖 200%
     - seed_ratio:  FPS 种子数 = seed_ratio * N / patch_size，控制重叠/覆盖冗余
+    - fuse_tau_ratio: 重叠 patch 拼接的高斯权重宽度 τ = fuse_tau_ratio · patch 半径；
+                      边界点降权锐化表面（降 P2M），<=0 退化为等权平均
 
     多步 Langevin 退火推理（num_steps>1 时启用）：
         x ← x_noisy
@@ -184,7 +187,9 @@ def patch_based_denoise(base_model, pcl_noisy, noise_std_t, patch_size=1024,
 
     # 每个种子 KNN 取 patch_size 个点（用 noisy 空间距离，与训练切 patch 一致）
     dist = torch.cdist(seeds, pcl_noisy)                            # [S, N]
-    patch_idx = dist.topk(patch_size, dim=1, largest=False).indices  # [S, patch_size]
+    topk = dist.topk(patch_size, dim=1, largest=False)
+    patch_idx = topk.indices                                       # [S, patch_size]
+    patch_dist = topk.values                                       # [S, patch_size] 每点到其种子点的距离
     patches = pcl_noisy[patch_idx]                                  # [S, patch_size, 3]
 
     sigma0 = noise_std_t.view(-1)[0] if torch.is_tensor(noise_std_t) else float(noise_std_t)
@@ -213,15 +218,25 @@ def patch_based_denoise(base_model, pcl_noisy, noise_std_t, patch_size=1024,
         del x, out, eps, ns
     denoised_patches = torch.cat(denoised_patches, dim=0)          # [S, patch_size, 3]
 
-    # 按覆盖次数平均拼回完整点云
+    # 加权拼回完整点云：点离它所在 patch 的种子点越近，ε 估计越可靠，权重越大。
+    # 重叠区按权重融合而非等权平均——边界点（patch 外缘）降权，避免把曲面磨平（专门降 P2M）。
+    # τ = fuse_tau_ratio · patch 半径（最远 KNN 距离），自适应点云密度；
+    # fuse_tau_ratio <= 0 退化为等权平均（旧行为，便于 A/B 对照）。
+    if fuse_tau_ratio > 0:
+        patch_radius = patch_dist[:, -1:].clamp_min(1e-6)             # [S, 1]
+        tau = fuse_tau_ratio * patch_radius                          # [S, 1]
+        fuse_w = torch.exp(-(patch_dist ** 2) / (2 * tau ** 2))      # [S, patch_size]
+    else:
+        fuse_w = torch.ones_like(patch_dist)                         # 等权平均 fallback
     accum = torch.zeros(N, 3, device=device)
-    count = torch.zeros(N, 1, device=device)
-    flat_idx = patch_idx.reshape(-1)                               # [S*patch_size]
-    accum.index_add_(0, flat_idx, denoised_patches.reshape(-1, 3))
-    count.index_add_(0, flat_idx, torch.ones(flat_idx.shape[0], 1, device=device))
+    wsum = torch.zeros(N, 1, device=device)
+    flat_idx = patch_idx.reshape(-1)                                 # [S*patch_size]
+    flat_w = fuse_w.reshape(-1, 1)                                   # [S*patch_size, 1]
+    accum.index_add_(0, flat_idx, denoised_patches.reshape(-1, 3) * flat_w)
+    wsum.index_add_(0, flat_idx, flat_w)
     # 未被任何 patch 覆盖的点回退为原始 noisy（理论上 seed_ratio>=1 时不会发生）
-    uncovered = (count < 0.5).squeeze(-1)
-    denoised = accum / count.clamp(min=1.0)
+    uncovered = (wsum < 1e-8).squeeze(-1)
+    denoised = accum / wsum.clamp(min=1e-8)
     denoised[uncovered] = pcl_noisy[uncovered]
     return denoised
 
@@ -724,6 +739,12 @@ def test(base_model, test_dataloader, args, config, logger=None):
     test_patch_batch = int(getattr(config, 'test_patch_batch', 4))
     print_log(f'[Inference] test_patch_batch={test_patch_batch}', logger=logger)
 
+    # 跨 patch 拼接权重：到种子点距离的高斯权重 τ = fuse_tau_ratio · patch 半径
+    # 边界点降权锐化表面（降 P2M）；<=0 退化为等权平均（旧行为）。从 config 读，缺省 0.5
+    fuse_tau_ratio = float(getattr(config, 'fuse_tau_ratio', 0.5))
+    print_log(f'[Inference] cross-patch fuse_tau_ratio={fuse_tau_ratio}'
+              + (' (等权平均 fallback)' if fuse_tau_ratio <= 0 else ''), logger=logger)
+
     # ChamferDistanceL2 只实例化一次，避免每次投票都新建 CUDA 模块（防显存碎片累积）
     cd_metric = ChamferDistanceL2().cuda()
 
@@ -802,6 +823,7 @@ def test(base_model, test_dataloader, args, config, logger=None):
                     base_model, pcl_noisy[0], noise_std_t,
                     patch_batch=test_patch_batch,
                     num_steps=lv_steps, step_size=lv_step_size, decay=lv_decay,
+                    fuse_tau_ratio=fuse_tau_ratio,
                 )  # [N, 3]
                 denoised_10k = denoised_full.unsqueeze(0)
                 denoised_filtered = sor_filter(denoised_10k[0])
