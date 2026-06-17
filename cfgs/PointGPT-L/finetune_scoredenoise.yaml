@@ -72,6 +72,9 @@ max_epoch: 120
 mem_check_interval: 50       # 每 50 个 batch 检查一次内存（epoch 内峰值保护，0 = 关闭）
 test_patch_batch: 2          # 测试时每批 patch 数：L 模型显存吃紧，50k 用 2 最稳；10k 可调 4
 grad_norm_clip: 1.0          # L模型depth=24梯度路径是S的2倍，clip必须收紧防爆炸
+# 主动资源限制（共享服务器防吃满核 / 防单进程吃爆整卡显存崩机），0 或删除该行 = 不限制
+cpu_threads: 8               # PyTorch + numpy/MKL CPU 线程上限；核多可调大或设 0（CPU 一般非瓶颈）
+gpu_mem_fraction: 0.9        # 单进程显存占整卡比例上限；超限触发可捕获 OOM(跳 batch) 而非整卡崩
 save_interval: 10
 val_interval: 1
 

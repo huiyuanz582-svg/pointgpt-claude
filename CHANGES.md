@@ -357,3 +357,16 @@ decay: 0.95 }`（step_size/decay 对齐推理 langevin）。L 单步已较慢，
 
 **待办**：用 consistency 重训 L（先小 num_steps 验证 val CD 收敛与显存稳定），跑全量
 10k/50k × 1/2/3% test 对比当前最佳 L，重点看低噪声 P2M 是否下降。
+
+### 改动 3：主动 CPU/GPU 资源上限
+
+原来只有"被动监控+超阈值退出"(`check_memory_and_exit` GPU>72%/CPU>78%、test 88%/90%)，
+没有主动封顶。新增 `main.py:apply_resource_limits`（train/test 都生效，从 yaml 读，缺省不限制）：
+- `cpu_threads`：`torch.set_num_threads` + `OMP/MKL/...NUM_THREADS` env（worker 子进程继承），
+  共享服务器防吃满核。
+- `gpu_mem_fraction`：`torch.cuda.set_per_process_memory_fraction`，把单进程显存封顶到整卡比例，
+  超限触发**可被 try/except 捕获的 OOM**（训练 loop 跳过该 batch）而非把整卡/服务器拖崩。
+  注意是相对整卡总量、不计其它进程占用。
+
+S/L finetune yaml 默认 `cpu_threads: 8`、`gpu_mem_fraction: 0.9`（均可调；设 0 或删行=不限制）。
+与被动退出互补：被动保存进度、主动防尖峰。

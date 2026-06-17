@@ -72,6 +72,9 @@ total_bs: 32                 # 实际生效（覆盖 dataset_configs 里的 TRAI
 step_per_update: 1
 max_epoch: 120
 grad_norm_clip: 10
+# 主动资源限制（共享服务器防吃满核 / 防单进程吃爆整卡显存崩机），0 或删除该行 = 不限制
+cpu_threads: 8               # PyTorch + numpy/MKL CPU 线程上限；核多可调大或设 0（CPU 一般非瓶颈）
+gpu_mem_fraction: 0.9        # 单进程显存占整卡比例上限；超限触发可捕获 OOM(跳 batch) 而非整卡崩
 save_interval: 10
 val_interval: 1
 

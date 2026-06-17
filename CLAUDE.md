@@ -98,7 +98,7 @@ YAML → `EasyDict` via `utils/config.py:cfg_from_yaml_file`, with recursive `_b
 
 Key denoising-specific yaml knobs (read at runtime; no code edit needed to change them):
 - `cfgs/dataset_configs/ScoreDenoise.yaml`: `NOISE_MIN/MAX` (0.005/0.020 — keep fixed for fair SOTA comparison), `NOISE_LOG_UNIFORM` (log-uniform σ sampling), `TEST_RESOLUTION` / `TEST_NOISY_DIR` / `TEST_NOISE` (switch 10k/50k and noise level here), `PATCH_SIZE` (1024, aligned with pre-train npoints), `TRAIN_OVERSAMPLE` (per-cloud patch resampling per epoch — 120 clouds is far too few steps/epoch without it).
-- Finetune yamls: `langevin`, `surface_projection`, `fuse_tau_ratio`, `p2m_weight`, `consistency` (iterative-training unroll: `enable`/`num_steps`/`step_size`/`decay`), `test_patch_batch`, `mem_check_interval`, `grad_norm_clip`.
+- Finetune yamls: `langevin`, `surface_projection`, `fuse_tau_ratio`, `p2m_weight`, `consistency` (iterative-training unroll: `enable`/`num_steps`/`step_size`/`decay`), `test_patch_batch`, `mem_check_interval`, `grad_norm_clip`, `cpu_threads` / `gpu_mem_fraction` (proactive resource caps, see Memory guards).
 - `val_interval` / `save_interval` in the yaml are inert — validation cadence uses `args.val_freq` (default 1) and `ckpt-last` is saved every epoch.
 
 ## Dataset wiring and on-disk layout
@@ -131,10 +131,16 @@ experiments/<config_stem>/<parent_stem>/TFBoard/<exp_name>/{train,test}/
 
 ## Memory guards (look like "graceful OOM", not bugs)
 
-The server crashed repeatedly on the large model, so the runner self-terminates rather than risk it:
+There are two complementary layers: **reactive monitor-and-exit guards** and **proactive hard caps**.
+
+Reactive (the runner self-terminates rather than risk a server crash):
 - `check_memory_and_exit` (train path) saves `ckpt-last` and `sys.exit(0)` when **GPU > 72%** or **CPU > 78%** (defaults). Called every `mem_check_interval` (≈50) batches, before validation, and after each epoch.
 - `test()` has its own hard guard (GPU > 88% / CPU > 90%) before each sample and inside `patch_based_denoise`; on trip it prints the running mean and exits 0. If a test run dies "early but clean", lower `test_patch_batch` in the yaml.
 - `vote_times` is pinned to 1 in `test()` (multi-vote was the main crash source).
+
+Proactive (`main.py:apply_resource_limits`, applied to both train and test; yaml knobs, `0`/absent = no limit):
+- `cpu_threads` → `torch.set_num_threads` + `OMP/MKL/OPENBLAS/NUMEXPR_NUM_THREADS` env (so DataLoader workers inherit it) — caps CPU core usage on a shared box.
+- `gpu_mem_fraction` → `torch.cuda.set_per_process_memory_fraction` — caps this process's GPU allocation to a fraction of the card; a spike past it raises a **catchable** CUDA OOM (the train loop's `except OOM` skips the batch) instead of taking the whole card down. Note it's relative to *total* card memory, not free memory, so it doesn't account for other tenants.
 
 ## Dependencies pip alone does not install
 
