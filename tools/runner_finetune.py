@@ -536,6 +536,7 @@ def run_net(args, config, train_writer=None, val_writer=None):
                     print_log('OOM，清理显存并跳过当前 batch', logger=logger)
                     torch.cuda.empty_cache()
                     base_model.zero_grad()
+                    num_iter = 0   # 复位累计计数：否则 step_per_update=1 时此后整个 epoch 不再 optimizer.step()
                     continue
                 else:
                     raise e
