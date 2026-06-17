@@ -347,6 +347,29 @@ def gpu_mem_ratio():
             return 0.0
 
 
+def _p2m_batch_loss(denoised_norm, center, scale, name, logger=None, verbose=False):
+    """对一个 batch 的归一化预测点算可微 P2M 训练 loss（还原 mesh 世界坐标 → 单向 point→face）。
+
+    denoised_norm: [B, N, 3] 归一化空间预测去噪点；center/scale/name 为每样本归一化参数与名字。
+    返回：标量 P2M loss（已 ×1e4，量级对齐 test 的 P2M）；无任何可用 mesh 时返回 None。
+    """
+    p2m_terms = []
+    B = denoised_norm.shape[0]
+    for b in range(B):
+        try:
+            c_b = center[b].to(denoised_norm.device).view(1, 3)
+            s_b = scale[b].to(denoised_norm.device).view(1, 1)
+            pred_world = denoised_norm[b] * s_b + c_b   # [N,3] 还原世界坐标
+            p2m_b = compute_p2m_train(pred_world, name[b], split='train')
+            p2m_terms.append(p2m_b)
+        except Exception as e:
+            if verbose:
+                print_log(f'[P2M] 跳过 (mesh 缺失或 pytorch3d 问题): {e}', logger=logger)
+    if len(p2m_terms) == 0:
+        return None
+    return torch.stack(p2m_terms).mean() * 1e4
+
+
 def run_net(args, config, train_writer=None, val_writer=None):
 
     logger = get_logger(args.log_name)
@@ -413,6 +436,19 @@ def run_net(args, config, train_writer=None, val_writer=None):
     p2m_weight = float(getattr(config, 'p2m_weight', 0.0))
     if p2m_weight > 0:
         print_log(f'[Training] P2M loss 已启用，权重 = {p2m_weight}', logger=logger)
+    # Consistency（迭代/unroll）训练：从 config.consistency 读，缺省关闭 → 退回原单步训练。
+    # 把"训练单步 ε-MSE vs 推理 30 步 Langevin"的鸿沟补上：训练时也展开 num_steps 步退火，
+    # 每步喂模型自己上一步的部分去噪结果（截断 BPTT + 逐步 backward，峰值显存≈单步、计算≈K×）。
+    cons_cfg = getattr(config, 'consistency', None)
+    cons_enable = bool(getattr(cons_cfg, 'enable', False)) if cons_cfg is not None else False
+    cons_steps = max(1, int(getattr(cons_cfg, 'num_steps', 3))) if cons_cfg is not None else 3
+    cons_step_size = float(getattr(cons_cfg, 'step_size', 0.3)) if cons_cfg is not None else 0.3
+    cons_decay = float(getattr(cons_cfg, 'decay', 0.95)) if cons_cfg is not None else 0.95
+    if cons_enable:
+        print_log(f'[Training] Consistency 迭代训练已启用: num_steps={cons_steps}, '
+                  f'step_size={cons_step_size}, decay={cons_decay}'
+                  f'（截断 BPTT，逐步 backward，峰值显存≈单步，计算≈{cons_steps}×）',
+                  logger=logger)
     for epoch in range(start_epoch, config.max_epoch + 1):
         if args.distributed:
             train_sampler.set_epoch(epoch)
@@ -446,50 +482,66 @@ def run_net(args, config, train_writer=None, val_writer=None):
                 # 训练时 PairedPatchDataset 始终提供 noise_std，走到这里是 bug
                 raise RuntimeError('training noise_std is None — AddNoise transform 是否被意外移除？')
 
-            loss1, denoised_norm = base_model(pcl_noisy, pcl_clean, 'train', name,
-                               epoch=epoch, max_epoch=config.max_epoch,
-                               noise_std=noise_std_t)
-            _loss = loss1.mean()  # ε-MSE 标量
-
-            # P2M 训练 loss（可微，单向 point→face）：把预测点还原到 mesh 世界坐标系再算
-            if p2m_weight > 0:
-                p2m_terms = []
-                B = denoised_norm.shape[0]
-                for b in range(B):
-                    try:
-                        c_b = center[b].to(denoised_norm.device).view(1, 3)
-                        s_b = scale[b].to(denoised_norm.device).view(1, 1)
-                        pred_world = denoised_norm[b] * s_b + c_b   # [N,3] 还原世界坐标
-                        p2m_b = compute_p2m_train(pred_world, name[b], split='train')
-                        p2m_terms.append(p2m_b)
-                    except Exception as e:
-                        if idx == 0 and b == 0:
-                            print_log(f'[P2M] 跳过 (mesh 缺失或 pytorch3d 问题): {e}', logger=logger)
-                if len(p2m_terms) > 0:
-                    p2m_loss = torch.stack(p2m_terms).mean() * 1e4  # 量级对齐 test 的 P2M
-                    _loss = _loss + p2m_weight * p2m_loss
-                    p2m_meter.update([p2m_loss.item()])
-
-            # loss, acc = base_model.module.get_loss_acc(ret, label)
-
-            # _loss = loss + 3 * loss1 #loss下游任务的损失 loss1生成任务的损失
-
+            # ===== 前向 + loss + backward =====
+            # 单步路径（cons_enable=False）与原实现等价；consistency 路径展开 K 步迭代。
             try:
-                _loss = _loss.mean()     # 永远先变成标量
-                _loss.backward()
+                if cons_enable:
+                    # 迭代展开：x 从 noisy 出发，逐步用模型自己的部分去噪结果作为下一步输入，
+                    # σ 逐步退火，对齐推理端 Langevin。逐步 backward + detach（截断 BPTT）省显存。
+                    x = pcl_noisy
+                    sigma_k = noise_std_t.clone()
+                    eps_loss_sum = 0.0
+                    p2m_log = None
+                    for k in range(cons_steps):
+                        x_in = x if k == 0 else x.detach()
+                        # 复用 'train' 路径：传 x_in 当 noisy、sigma_k 当 σ，模型内部即按
+                        # target_ε=(clean-x_in)/σ_k 算该步 EDM 加权 ε-MSE，并返回该步全量去噪点
+                        loss_k, denoised_k = base_model(
+                            x_in, pcl_clean, 'train', name,
+                            epoch=epoch, max_epoch=config.max_epoch, noise_std=sigma_k)
+                        step_loss = loss_k.mean()
+                        eps_loss_sum += step_loss.item()
+                        # P2M 只在最后一步（test 真正产出的点）算，省 K× P2M 开销
+                        if p2m_weight > 0 and k == cons_steps - 1:
+                            p2m_l = _p2m_batch_loss(denoised_k, center, scale, name,
+                                                    logger=logger, verbose=(idx == 0))
+                            if p2m_l is not None:
+                                step_loss = step_loss + p2m_weight * p2m_l
+                                p2m_log = p2m_l.item()
+                        # 逐步 backward：梯度累加进 .grad 后立即释放本步计算图（峰值≈单步）
+                        (step_loss / cons_steps).backward()
+                        # 部分 Langevin 步推进轨迹：x_next = x_in + step·(denoised_k - x_in)，
+                        # detach 作为下一步输入；σ 退火
+                        x = (x_in + cons_step_size * (denoised_k.detach() - x_in)).detach()
+                        sigma_k = sigma_k * cons_decay
+                    loss_scalar = eps_loss_sum / cons_steps
+                    if p2m_log is not None:
+                        p2m_meter.update([p2m_log])
+                else:
+                    loss1, denoised_norm = base_model(pcl_noisy, pcl_clean, 'train', name,
+                                       epoch=epoch, max_epoch=config.max_epoch,
+                                       noise_std=noise_std_t)
+                    _loss = loss1.mean()  # ε-MSE 标量
+                    # P2M 训练 loss（可微，单向 point→face）：还原到 mesh 世界坐标系再算
+                    if p2m_weight > 0:
+                        p2m_l = _p2m_batch_loss(denoised_norm, center, scale, name,
+                                                logger=logger, verbose=(idx == 0))
+                        if p2m_l is not None:
+                            _loss = _loss + p2m_weight * p2m_l
+                            p2m_meter.update([p2m_l.item()])
+                    loss_scalar = loss1.mean().item()
+                    _loss.backward()
             except RuntimeError as e:
                 if "out of memory" in str(e):
                     print_log('OOM，清理显存并跳过当前 batch', logger=logger)
-                    del loss1, _loss
                     torch.cuda.empty_cache()
                     base_model.zero_grad()
                     continue
                 else:
                     raise e
 
-
-
-            # forward
+            # 累加到 step_per_update 个 batch 后再 clip + step
+            # （consistency 的 K 步 backward 已累加进同一份 .grad，与单步路径共用这段）
             if num_iter == config.step_per_update:
                 if config.get('grad_norm_clip') is not None:
                     torch.nn.utils.clip_grad_norm_(
@@ -498,14 +550,7 @@ def run_net(args, config, train_writer=None, val_writer=None):
                 optimizer.step()
                 base_model.zero_grad()
 
-            if args.distributed:
-                loss = dist_utils.reduce_tensor(loss1, args)
-                losses.update([ loss.item()])
-            else:
-                try:
-                    losses.update([loss1.item()])
-                except:
-                    losses.update([loss1.mean().item()])
+            losses.update([loss_scalar])
 
             if args.distributed:
                 torch.cuda.synchronize()

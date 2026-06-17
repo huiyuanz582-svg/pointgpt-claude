@@ -61,6 +61,12 @@ fuse_tau_ratio: 0.5
 # v6=0.05→v8=0.30→v9=0.70；v7→v8 跨度证明大 weight 对中高噪声持续有效
 p2m_weight: 0.70
 
+# Consistency 迭代训练（训练端对齐推理 Langevin）：展开 num_steps 步退火，每步喂模型
+# 上一步的部分去噪结果。截断 BPTT + 逐步 backward → 峰值显存≈单步，但计算≈num_steps×。
+# enable=False 退回原单步 ε-prediction 训练（用于 A/B）；step_size/decay 建议与 langevin 对齐。
+consistency:
+  { enable: True, num_steps: 3, step_size: 0.3, decay: 0.95 }
+
 npoints: 1024                # 跟 dataset_configs/ScoreDenoise.yaml 里的 PATCH_SIZE 对齐
 total_bs: 32                 # 实际生效（覆盖 dataset_configs 里的 TRAIN_BATCH_SIZE）
 step_per_update: 1

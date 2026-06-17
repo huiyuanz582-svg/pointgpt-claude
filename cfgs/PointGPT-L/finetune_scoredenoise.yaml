@@ -59,6 +59,12 @@ fuse_tau_ratio: 0.5
 # P2M 训练 loss 权重，与 S 版 v8 一致；L 容量更大，可后续微调
 p2m_weight: 0.30
 
+# Consistency 迭代训练（训练端对齐推理 Langevin）：展开 num_steps 步退火，每步喂模型
+# 上一步的部分去噪结果。截断 BPTT + 逐步 backward → 峰值显存≈单步，但计算≈num_steps×。
+# L 模型单步已较慢，num_steps 先取 3；太慢可降到 2，enable=False 退回单步（用于 A/B）。
+consistency:
+  { enable: True, num_steps: 3, step_size: 0.3, decay: 0.95 }
+
 npoints: 1024                # 跟 dataset_configs/ScoreDenoise.yaml 的 PATCH_SIZE 对齐
 total_bs: 8                  # L 模型显存吃紧，从 16 降到 8 防 OOM/服务器崩溃
 step_per_update: 1

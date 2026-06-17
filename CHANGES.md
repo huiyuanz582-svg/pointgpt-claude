@@ -310,3 +310,50 @@ EDM 配置（代码层全局生效），epoch 300→120 对齐 S。
 **EdgeConv 几何支路 + 显式表面投影**，针对性攻 P2M 短板：在 patch tokenizer 里
 并行加一条 EdgeConv 局部几何特征支路（残差融合），强化 patch 内表面感知；推理端
 加显式表面投影后处理。代码改动在独立分支进行，保留本分支的最佳 L 结果。
+
+---
+
+## Session: 跨 patch 加权拼接 + Consistency 迭代训练 (2026-06-17)
+
+围绕"P2M 是系统性短板（尤其低噪声），模型把点拉到正确均值位但不贴面"这个诊断，
+从推理端和训练端各做一项改进。
+
+### 改动 1（推理端，不重训）：跨 patch 加权拼接 `fuse_tau_ratio`
+
+`patch_based_denoise` 原来把重叠 patch 的预测**等权平均**拼回，会把曲面磨平（伤 P2M）。
+改为按"点到该 patch 种子点距离"的高斯权重 `exp(-d²/2τ²)`（τ = `fuse_tau_ratio`·patch 半径）
+融合，边界点降权。`fuse_tau_ratio<=0` 退回等权（旧行为）。yaml 默认 0.5。
+
+**A/B（PointGPT-L, 10k/1%）**：
+
+| fuse_tau_ratio | CD | P2M |
+|---|---|---|
+| 0（等权基线）| 2.121 | 0.707 |
+| 0.3 | 2.1246 | 0.7131 |
+| **0.5** | **2.1061** | 0.7045 |
+| 0.7 | 2.1090 | 0.7038 |
+
+结论：τ=0.5 按仓库 `cd+0.3·p2m` 排序最优，但**提升很小**（CD −0.7%、P2M −0.4%），
+0.3 反而更差。证伪了"等权平均是 P2M 主要误差源"（至少 10k/1%）。τ=0.5 保留为默认
+（免费微赢、不亏），但拼接不是撬动 P2M 的杠杆。10k/1% 是这条改进最不该见效的regime
+（噪声最低、patch 内最平），高噪声段（10k/3%、50k/3%）仍值得各跑一次 τ=0.5 vs 0 确认。
+
+### 改动 2（训练端）：Consistency 迭代训练 `consistency`
+
+补"训练单步 ε-MSE vs 推理 30 步 Langevin"的鸿沟。`runner_finetune.py:run_net` 训练时
+展开 `num_steps` 步退火：x 从 noisy 出发，每步喂模型**自己上一步的部分去噪结果**、σ 退火，
+对齐推理轨迹。实现要点：
+
+- **复用 'train' 前向不改模型**：把部分去噪点 x_in 当 `noisy_pts`、σ_k 当 `noise_std` 传进去，
+  模型内部即按 `target_ε=(clean-x_in)/σ_k` 算该步 EDM 加权 ε-MSE，并返回该步全量去噪点。
+- **ε-MSE 逐步深监督**（每步都监督），**P2M 只在最后一步**（test 真正产出的点）算，省 K× P2M。
+- **截断 BPTT + 逐步 backward**：每步 backward 后立即释放计算图、detach 出下一步输入，
+  **峰值显存 ≈ 单步**（关键，沿用现有 GPU>72% 显存保护），计算 ≈ `num_steps×`。
+- `consistency.enable=False`（或不写该块）→ 完全退回原单步路径（用于 A/B）。
+
+配置：S/L 的 finetune yaml 均加 `consistency: { enable: True, num_steps: 3, step_size: 0.3,
+decay: 0.95 }`（step_size/decay 对齐推理 langevin）。L 单步已较慢，太慢可把 num_steps 降到 2。
+另把训练 P2M 抽成 `_p2m_batch_loss` 辅助函数，单步/迭代两条路径共用。
+
+**待办**：用 consistency 重训 L（先小 num_steps 验证 val CD 收敛与显存稳定），跑全量
+10k/50k × 1/2/3% test 对比当前最佳 L，重点看低噪声 P2M 是否下降。

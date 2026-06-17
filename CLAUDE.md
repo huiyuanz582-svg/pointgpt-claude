@@ -56,6 +56,7 @@ The backbone does **ε-prediction (DDPM-style noise prediction)**, *not* score e
 - ε-MSE with **EDM 1/σ² weighting**: `((pred_ε − target_ε)² · (σ_ref/σ)²).sum(-1).mean()`, `σ_ref = 0.01`. Small-noise samples (σ≈0.01) keep full gradient; large-noise samples are down-weighted, pushing precision on fine denoising.
 - The runner then adds an **optional differentiable P2M term**: `total = ε_MSE + p2m_weight · P2M` (`runner_finetune.py:run_net`). `p2m_weight` from the yaml (S: 0.70, L: 0.30; 0 disables). P2M comes from `utils/p2m_loss.py:compute_p2m_train` — restores the predicted patch to mesh world coords (per-sample `center`/`scale`), normalizes to the mesh's unit sphere, and takes the differentiable one-directional point→face distance (scaled `×1e4` to match test-time P2M magnitude).
 - The training log prints only the ε-MSE term (`losses`) and P2M separately (`p2m_meter`); backward is on their weighted sum.
+- **Consistency / iterative training** (opt-in via `config.consistency.enable`): instead of one ε step, the runner unrolls `num_steps` Langevin steps at train time — each step feeds the model its own partially-denoised output at the decayed σ (reusing the `'train'` forward: passing the partial point as the "noisy" arg makes it compute the right per-step target `(clean − x_in)/σ_k`). ε-MSE is deep-supervised on every step; P2M only on the final step. Uses **truncated BPTT (`detach` between steps) + per-step `backward`**, so peak memory ≈ single-step while compute is ≈`num_steps×`. This closes the "train 1 step vs test 30 steps" gap (IterativePFN-style). `enable=False` (or block absent) is the original single-step path — keep it for A/B.
 
 **Inference** (`type='val'`, val + test): **multi-step Langevin annealing is implemented** in `tools/runner_finetune.py:patch_based_denoise`:
 ```
@@ -97,7 +98,7 @@ YAML → `EasyDict` via `utils/config.py:cfg_from_yaml_file`, with recursive `_b
 
 Key denoising-specific yaml knobs (read at runtime; no code edit needed to change them):
 - `cfgs/dataset_configs/ScoreDenoise.yaml`: `NOISE_MIN/MAX` (0.005/0.020 — keep fixed for fair SOTA comparison), `NOISE_LOG_UNIFORM` (log-uniform σ sampling), `TEST_RESOLUTION` / `TEST_NOISY_DIR` / `TEST_NOISE` (switch 10k/50k and noise level here), `PATCH_SIZE` (1024, aligned with pre-train npoints), `TRAIN_OVERSAMPLE` (per-cloud patch resampling per epoch — 120 clouds is far too few steps/epoch without it).
-- Finetune yamls: `langevin`, `surface_projection`, `fuse_tau_ratio`, `p2m_weight`, `test_patch_batch`, `mem_check_interval`, `grad_norm_clip`.
+- Finetune yamls: `langevin`, `surface_projection`, `fuse_tau_ratio`, `p2m_weight`, `consistency` (iterative-training unroll: `enable`/`num_steps`/`step_size`/`decay`), `test_patch_batch`, `mem_check_interval`, `grad_norm_clip`.
 - `val_interval` / `save_interval` in the yaml are inert — validation cadence uses `args.val_freq` (default 1) and `ckpt-last` is saved every epoch.
 
 ## Dataset wiring and on-disk layout
