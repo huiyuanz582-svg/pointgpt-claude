@@ -607,6 +607,10 @@ class ScoreDenoise(pl.LightningDataModule):
         self.test_resolution = getattr(config, 'TEST_RESOLUTION', '10000_poisson')
         self.test_noisy_dir  = getattr(config, 'TEST_NOISY_DIR',
                                        f'PUNet_{self.test_resolution}_0.01')
+        # TEST_NOISY_PATH（可选）：泛化实验换测试集时，直接指向任意带噪 .xyz 文件夹
+        # （相对运行目录/仓库根 或 绝对路径）；设了就覆盖上面默认的 examples 路径构造。
+        # clean 仍用 PUNet test（按 TEST_RESOLUTION 配对+归一化+P2M），故带噪 .xyz 要与之同名同分辨率。
+        self.test_noisy_path = getattr(config, 'TEST_NOISY_PATH', None)
         self.args = args
     
 # 训练数据加载函数 划分成小点云块 添加噪声、旋转、缩放
@@ -696,9 +700,16 @@ class ScoreDenoise(pl.LightningDataModule):
         clean_dset = PointCloudDataset(
             root=self.root, dataset='PUNet', split='test', resolution=test_resolution
         )
-        noisy_dir = os.path.join(
-            self.root, 'examples', 'pointclouds', 'test', test_noisy_dir_name
-        )
+        # 带噪目录：TEST_NOISY_PATH 若设置则直接用它（泛化实验换测试集，指向任意文件夹）；
+        # 否则用默认 <root>/examples/pointclouds/test/<TEST_NOISY_DIR>
+        test_noisy_path = getattr(self, 'test_noisy_path', None)
+        if test_noisy_path:
+            noisy_dir = test_noisy_path
+            print(f'[INFO] TEST_NOISY_PATH 生效，带噪点云取自: {noisy_dir}')
+        else:
+            noisy_dir = os.path.join(
+                self.root, 'examples', 'pointclouds', 'test', test_noisy_dir_name
+            )
         noisy_dset = PointCloudNoisyDataset(noisy_dir=noisy_dir)
         val_dset = PairedEvalDataset(clean_dataset=clean_dset, noisy_dataset=noisy_dset)
 

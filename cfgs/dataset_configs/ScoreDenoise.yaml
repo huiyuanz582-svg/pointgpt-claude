@@ -11,6 +11,10 @@ TEST_NOISE: 0.010
 # 测试用分辨率和带噪目录名（改这里换 10k/50k 以及噪声水平，无需改代码）
 TEST_RESOLUTION: 10000_poisson
 TEST_NOISY_DIR: PUNet_10000_poisson_0.01
+# 泛化实验换测试集：取消注释并指向任意「直接装着带噪 .xyz 的文件夹」（相对仓库根 或 绝对路径），
+# 设了就覆盖上面 TEST_NOISY_DIR 的默认 examples 路径。clean 仍取 PUNet test（按 TEST_RESOLUTION 配对+
+# 归一化+P2M）→ 带噪 .xyz 必须与 PUNet test 同名同分辨率；TEST_NOISE 改成该噪声条件对应的 σ。
+# TEST_NOISY_PATH: compare_methods/other-noise/examples/<某个子文件夹>
 AUG_ROTATE: True
 DATASET: PUNet
 RESOLUTIONS: ['10000_poisson','30000_poisson','50000_poisson']
