@@ -24,9 +24,10 @@ sys.path.append(BASE_DIR)
 # 加载原始点云（干净） 单个gpu版本
 class PointCloudDataset(Dataset):
 
-    def __init__(self, root, dataset, split, resolution, transform=None):
+    def __init__(self, root, dataset, split, resolution, transform=None, pcl_dir=None):
         super().__init__()
-        self.pcl_dir = os.path.join(root, dataset, 'pointclouds', split, resolution)
+        # pcl_dir 若给定则直接用它（泛化实验换数据集，绕过 PUNet 固定路径）；否则按默认拼接
+        self.pcl_dir = pcl_dir if pcl_dir is not None else os.path.join(root, dataset, 'pointclouds', split, resolution)
         self.transform = transform
         self.pointclouds = []
         self.pointcloud_names = []
@@ -611,6 +612,9 @@ class ScoreDenoise(pl.LightningDataModule):
         # （相对运行目录/仓库根 或 绝对路径）；设了就覆盖上面默认的 examples 路径构造。
         # clean 仍用 PUNet test（按 TEST_RESOLUTION 配对+归一化+P2M），故带噪 .xyz 要与之同名同分辨率。
         self.test_noisy_path = getattr(config, 'TEST_NOISY_PATH', None)
+        # TEST_CLEAN_PATH（可选）：换整个数据集（如 PCNet）时，干净点云根目录（其下应有 <分辨率>/ 子目录）
+        # 干净点云目录 = <TEST_CLEAN_PATH>/<TEST_RESOLUTION>；缺省用 PUNet 默认路径。
+        self.test_clean_path = getattr(config, 'TEST_CLEAN_PATH', None)
         self.args = args
     
 # 训练数据加载函数 划分成小点云块 添加噪声、旋转、缩放
@@ -697,9 +701,19 @@ class ScoreDenoise(pl.LightningDataModule):
         # 从 config 读分辨率和带噪目录，不想改代码时只改 ScoreDenoise.yaml
         test_resolution = getattr(self, 'test_resolution', '10000_poisson')
         test_noisy_dir_name = getattr(self, 'test_noisy_dir', f'PUNet_{test_resolution}_0.01')
-        clean_dset = PointCloudDataset(
-            root=self.root, dataset='PUNet', split='test', resolution=test_resolution
-        )
+        # 干净点云：TEST_CLEAN_PATH 若设置则用 <它>/<分辨率>（换数据集，如 PCNet）；否则 PUNet 默认
+        test_clean_path = getattr(self, 'test_clean_path', None)
+        if test_clean_path:
+            clean_pcl_dir = os.path.join(test_clean_path, test_resolution)
+            clean_dset = PointCloudDataset(
+                root=self.root, dataset='PUNet', split='test', resolution=test_resolution,
+                pcl_dir=clean_pcl_dir
+            )
+            print(f'[INFO] TEST_CLEAN_PATH 生效，干净点云取自: {clean_pcl_dir}')
+        else:
+            clean_dset = PointCloudDataset(
+                root=self.root, dataset='PUNet', split='test', resolution=test_resolution
+            )
         # 带噪目录：TEST_NOISY_PATH 若设置则直接用它（泛化实验换测试集，指向任意文件夹）；
         # 否则用默认 <root>/examples/pointclouds/test/<TEST_NOISY_DIR>
         test_noisy_path = getattr(self, 'test_noisy_path', None)

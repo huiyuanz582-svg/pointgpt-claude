@@ -765,6 +765,14 @@ def test(base_model, test_dataloader, args, config, logger=None):
     npoints = config.npoints
     base_model.eval()  # set model to eval mode
 
+    # 换数据集时（如 PCNet）重定向 P2M mesh 根目录：TEST_MESH_ROOT 设了就覆盖 p2m_loss._MESH_ROOT
+    # （compute_p2m 用 <_MESH_ROOT>/test/<name>.off）。缺省用 PUNet 默认（或 PUNET_MESH_ROOT 环境变量）。
+    _test_mesh_root = getattr(config.dataset.test._base_, 'TEST_MESH_ROOT', None)
+    if _test_mesh_root:
+        import utils.p2m_loss as _p2ml
+        _p2ml._MESH_ROOT = _test_mesh_root
+        print_log(f'[Test] P2M mesh 根目录 → {_test_mesh_root}', logger=logger)
+
     total_cd = 0.0
     total_cd_10k = 0.0
     total_batches = 0
