@@ -630,62 +630,74 @@ def run_net(args, config, train_writer=None, val_writer=None):
         val_writer.close()
 
 
-# validate10k  ----------------------------------------------------------------------------------------
-def validate(base_model, test_dataloader, epoch, val_writer, args, config, logger=None):
+# validate  ----------------------------------------------------------------------------------------
+# 验证 = test 同款 pipeline（整云切块→Langevin 退火→高斯拼接→SOR），算 CD+P2M，
+# 按 cd+0.3·p2m（DenoiseMetrics.better_than）选 ckpt-best —— 选模型标准 = 报告标准。
+# 验证集是从训练集留出的完整云（datasets 里已把它们排除出训练，防泄漏），mesh 用 meshes/train/。
+# 整云 30 步 Langevin 较慢，建议用较大的 --val_freq（如 5）降低验证频率。
+def validate(base_model, val_dataloader, epoch, val_writer, args, config, logger=None):
     base_model.eval()  # set model to eval mode
-    npoints = config.npoints
+
+    # 与 test 一致的推理超参（从 config 读，缺省退化为单步）
+    langevin = getattr(config, 'langevin', None)
+    lv_steps = int(getattr(langevin, 'num_steps', 1)) if langevin is not None else 1
+    lv_step_size = float(getattr(langevin, 'step_size', 1.0)) if langevin is not None else 1.0
+    lv_decay = float(getattr(langevin, 'decay', 0.95)) if langevin is not None else 0.95
+    test_patch_batch = int(getattr(config, 'test_patch_batch', 4))
+    fuse_tau_ratio = float(getattr(config, 'fuse_tau_ratio', 0.5))
+    cd_metric = ChamferDistanceL2().cuda()
 
     total_cd = 0.0
-    total_cd_10k = 0.0
-    total_batches = 0
     total_p2m = 0.0
-    total_cd_noisy_baseline = 0.0
+    total_batches = 0
 
     with torch.no_grad():
-        for idx, (pcl_noisy, pcl_clean, noise_std, center, scale, name) in enumerate(test_dataloader):
+        for idx, (pcl_noisy, pcl_clean, noise_std, center, scale, name) in enumerate(val_dataloader):
+            torch.cuda.empty_cache()
             pcl_noisy = pcl_noisy.cuda()
             pcl_clean = pcl_clean.cuda()
-            if noise_std is not None:
-                noise_std_t = noise_std.cuda()
-            else:
-                # PairedEvalDataset 不含 noise_std；从 config.TEST_NOISE fallback
-                _test_sigma = getattr(config.dataset.test._base_, 'TEST_NOISE', 0.01)
-                noise_std_t = torch.full(
-                    (pcl_noisy.shape[0],), _test_sigma, dtype=torch.float32
-                ).cuda()
-            # val 用 1024-point patch（dataloader flag='train'），base_model 直接去噪，覆盖 200%
-            denoised = base_model(pcl_noisy, pcl_clean, 'val', name, noise_std=noise_std_t)
+            # HeldOutValDataset 一定提供 noise_std（每个验证云的固定噪声级）
+            noise_std_t = noise_std.cuda()
+            center_gpu = center[0].to(pcl_noisy.device)
+            scale_gpu = scale[0].to(pcl_noisy.device)
 
-            # 归一化空间 CD
-            batch_cd = ChamferDistanceL2().cuda()(denoised, pcl_clean) * 1e4
-            # noisy baseline CD（参考：去噪前 vs 去噪后）
-            batch_cd_noisy = ChamferDistanceL2().cuda()(pcl_noisy, pcl_clean) * 1e4
-            total_cd_noisy_baseline = total_cd_noisy_baseline + batch_cd_noisy
+            # 整云 patch-based 去噪（与 test 同款：多步 Langevin + 高斯拼接）
+            denoised_full = patch_based_denoise(
+                base_model, pcl_noisy[0], noise_std_t,
+                patch_batch=test_patch_batch,
+                num_steps=lv_steps, step_size=lv_step_size, decay=lv_decay,
+                fuse_tau_ratio=fuse_tau_ratio,
+            )  # [N, 3]
+            denoised = sor_filter(denoised_full).unsqueeze(0).to(pcl_noisy.device)
 
-            # val 阶段只用 CD 监控（patch 无法对齐完整 mesh）；P2M 留到最终 test
-            total_cd_10k += batch_cd
+            # 还原世界坐标算 P2M（验证 shape 属 train，mesh 用 meshes/train/<name>.off → split='train'）
+            denoised_world = denoised * scale_gpu + center_gpu
+            clean_world = pcl_clean * scale_gpu + center_gpu
+            p2m = compute_p2m(denoised_world[0], name[0], 'train') * 1e4
+
+            # CD：干净点云单位球归一化后再算（与 test 一致）
+            _, center1, scale1 = normalize_unit_sphere(clean_world)
+            cd = cd_metric((denoised_world - center1) / scale1,
+                           (clean_world - center1) / scale1) * 1e4
+
+            total_cd += cd.item()
+            total_p2m += (p2m.item() if torch.is_tensor(p2m) else float(p2m))
             total_batches += 1
 
-    if args.distributed:
-        total_cd_10k = dist_utils.gather_tensor(total_cd_10k.cuda() if torch.is_tensor(total_cd_10k) else torch.tensor(total_cd_10k).cuda(), args)
-        total_batches = dist_utils.gather_tensor(torch.tensor(total_batches).cuda(), args)
-        if args.local_rank != 0:
-            return None
+    avg_cd = total_cd / max(total_batches, 1)
+    avg_p2m = total_p2m / max(total_batches, 1)
+    score = avg_cd + 0.3 * avg_p2m  # 与 DenoiseMetrics.better_than 一致的排序分
 
-    avg_cd = total_cd_10k / total_batches
-    avg_cd_noisy = total_cd_noisy_baseline / total_batches
-
-    print_log('[Validation] EPOCH: %d  Chamfer Distance = %.6f  (Noisy baseline CD = %.6f, delta = %.6f)' %
-        (epoch, avg_cd, avg_cd_noisy, avg_cd_noisy - avg_cd), logger=logger)
-
-    if args.distributed:
-        torch.cuda.synchronize()
+    print_log('[Validation] EPOCH: %d  CD = %.6f  P2M = %.6f  (score = cd+0.3*p2m = %.6f, %d clouds)' %
+              (epoch, avg_cd, avg_p2m, score, total_batches), logger=logger)
 
     if val_writer is not None:
         val_writer.add_scalar('Metric/CD', avg_cd, epoch)
+        val_writer.add_scalar('Metric/P2M', avg_p2m, epoch)
+        val_writer.add_scalar('Metric/Score', score, epoch)
 
-    # val 只用 CD 排 checkpoint（P2M 置 0，better_than 退化为按 CD 比较）
-    return DenoiseMetrics(avg_cd, 0.0)
+    # 返回 CD+P2M，better_than 按 cd+0.3*p2m 选 checkpoint（= 报告口径）
+    return DenoiseMetrics(avg_cd, avg_p2m)
 
 def validate_vote(base_model, test_dataloader, epoch, val_writer, args, config, logger=None, times=10):
     print_log(f"[VALIDATION_VOTE] epoch {epoch}", logger=logger)

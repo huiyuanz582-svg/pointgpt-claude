@@ -33,3 +33,13 @@ NUM_WORKERS: 4
 # 训练时每张点云的过采样倍数（每 epoch 用同一张点云切多个不同 patch）
 # 原始 120 张 / batch 32 = 3 step/epoch，远远不够；50× 后约 187 step/epoch
 TRAIN_OVERSAMPLE: 50
+
+# ===== 验证集（从训练集留出，独立于 test，防泄漏）=====
+# 原来没有 val 文件夹时 val 会静默回退到 test → 用测试集选模型（数据泄漏）。现改为：
+# 确定性地从 train 留出 VAL_NUM 个 shape 作验证，并把它们从训练集排除（跨所有分辨率）。
+# runner 的 validate() 对这些完整云跑 test 同款 pipeline（Langevin+拼接+SOR）算 CD+P2M，
+# 按 cd+0.3*p2m 选 ckpt-best —— 选模型标准 = 报告标准。整云 30 步较慢，建议 --val_freq 5。
+VAL_NUM: 10                    # 留出多少个 shape 作验证（其余训练）；PUNet ~40 train，留 10 剩 30
+VAL_SPLIT_SEED: 2024          # 划分随机种子（固定→train/val 划分可复现，勿随意改）
+VAL_RESOLUTION: 10000_poisson # 验证分辨率（单一，与主基准对齐；留出 shape 在所有分辨率都排除出训练）
+VAL_NOISE_LEVELS: [0.01]      # 验证噪声级（固定、可复现）；想跨噪声更鲁棒可设 [0.01, 0.02, 0.03]（成倍耗时）

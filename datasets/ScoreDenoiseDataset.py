@@ -24,24 +24,32 @@ sys.path.append(BASE_DIR)
 # 加载原始点云（干净） 单个gpu版本
 class PointCloudDataset(Dataset):
 
-    def __init__(self, root, dataset, split, resolution, transform=None, pcl_dir=None):
+    def __init__(self, root, dataset, split, resolution, transform=None, pcl_dir=None,
+                 exclude_names=None, include_names=None):
         super().__init__()
         # pcl_dir 若给定则直接用它（泛化实验换数据集，绕过 PUNet 固定路径）；否则按默认拼接
         self.pcl_dir = pcl_dir if pcl_dir is not None else os.path.join(root, dataset, 'pointclouds', split, resolution)
         self.transform = transform
         self.pointclouds = []
         self.pointcloud_names = []
+        # exclude_names / include_names：按 shape 名过滤（用于 train/val 划分：训练排除验证 shape，
+        # 验证只取这些 shape）。二者可同时为 None（不过滤）。
         for fn in os.listdir(self.pcl_dir):
             if fn[-3:] != 'xyz':
+                continue
+            nm = fn[:-4]
+            if exclude_names is not None and nm in exclude_names:
+                continue
+            if include_names is not None and nm not in include_names:
                 continue
             pcl_path = os.path.join(self.pcl_dir, fn)
             if not os.path.exists(pcl_path):
                 raise FileNotFoundError('File not found: %s' % pcl_path)
             pcl = torch.FloatTensor(np.loadtxt(pcl_path, dtype=np.float32))
             self.pointclouds.append(pcl)
-            self.pointcloud_names.append(fn[:-4])
-        
-        print(f'[INFO] Loaded dataset {dataset} - {resolution}')
+            self.pointcloud_names.append(nm)
+
+        print(f'[INFO] Loaded dataset {dataset} - {resolution} ({len(self.pointclouds)} clouds)')
 
     def __len__(self):
         return len(self.pointclouds)
@@ -189,6 +197,45 @@ class PairedEvalDataset(Dataset):
             'center': center,
             'scale': scale,
             'name': name
+        }
+
+
+class HeldOutValDataset(Dataset):
+    """验证集：从训练集留出的【完整点云】+ 固定种子加噪。
+
+    - 每个 (点云, 噪声级) 生成一条样本，返回完整云（供 runner 用 test 同款 pipeline 评测）。
+    - 噪声用 per-sample 固定种子 → 每个 epoch 复现同一份噪声，保证跨 epoch 的 val 分数可比、
+      checkpoint 排序稳定（若每次随机加噪，val 分数会抖动，选模型不可靠）。
+    - 归一化基准取自干净点云自身（与 train/test 一致）。P2M 用 meshes/train/<name>.off，
+      因为这些 shape 物理上仍在 train 目录里（只是被排除出训练，留作验证）。
+    """
+    def __init__(self, clean_dataset, noise_levels, seed=2024):
+        super().__init__()
+        self.samples = []  # (clean_world[N,3], name, sigma, sample_seed)
+        for i in range(len(clean_dataset)):
+            item = clean_dataset[i]
+            for j, sigma in enumerate(noise_levels):
+                self.samples.append(
+                    (item['pcl_clean'], item['name'], float(sigma), int(seed) + i * 131 + j))
+        print(f'[INFO] HeldOutValDataset: {len(clean_dataset)} clouds × {len(noise_levels)} '
+              f'noise level(s) = {len(self.samples)} val samples (levels={list(noise_levels)})')
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        clean_world, name, sigma, s = self.samples[idx]
+        clean_norm, center, scale = NormalizeUnitSphere.normalize(clean_world.clone())
+        g = torch.Generator().manual_seed(s)
+        noise = torch.randn(clean_norm.shape, generator=g) * sigma
+        noisy_norm = clean_norm + noise
+        return {
+            'pcl_noisy': noisy_norm,
+            'pcl_clean': clean_norm,
+            'center': center,
+            'scale': scale,
+            'name': name,
+            'noise_std': sigma,
         }
 
 # 加载原始点云（干净） 多个gpu版本
@@ -615,7 +662,33 @@ class ScoreDenoise(pl.LightningDataModule):
         # TEST_CLEAN_PATH（可选）：换整个数据集（如 PCNet）时，干净点云根目录（其下应有 <分辨率>/ 子目录）
         # 干净点云目录 = <TEST_CLEAN_PATH>/<TEST_RESOLUTION>；缺省用 PUNet 默认路径。
         self.test_clean_path = getattr(config, 'TEST_CLEAN_PATH', None)
+        # ===== 验证集划分（从训练集留出，独立于 test，防泄漏）=====
+        # 原来没有 val 文件夹时 val_dataloader 会静默回退到 test split → 用测试集选模型（泄漏）。
+        # 现在改为：确定性地从 train 里留出 VAL_NUM 个 shape 作验证，并把它们从训练集排除。
+        self.val_num = int(getattr(config, 'VAL_NUM', 10))
+        self.val_split_seed = int(getattr(config, 'VAL_SPLIT_SEED', 2024))
+        # 验证分辨率：单一，与主基准对齐（留出 shape 在所有分辨率都排除出训练）
+        self.val_resolution = getattr(config, 'VAL_RESOLUTION', '10000_poisson')
+        # 验证噪声级：固定、可复现的列表；缺省用单个 VAL_NOISE。想更鲁棒可设 [0.01,0.02,0.03]
+        _levels = getattr(config, 'VAL_NOISE_LEVELS', None)
+        self.val_noise_levels = [float(x) for x in _levels] if _levels else [float(self.val_noise)]
+        self._val_names_cache = None
         self.args = args
+
+    def _get_val_names(self):
+        """确定性地从 train 里挑 VAL_NUM 个 shape 名作验证集（固定 seed → train/val 划分可复现）。
+        返回 shape 名集合；训练时排除这些名、验证时只取这些名（跨所有分辨率一致）。"""
+        if self._val_names_cache is not None:
+            return self._val_names_cache
+        train_dir = os.path.join(self.root, self.dataset, 'pointclouds', 'train', self.resolutions[0])
+        names = sorted([fn[:-4] for fn in os.listdir(train_dir) if fn.endswith('xyz')])
+        n_val = min(self.val_num, max(0, len(names) - 1))  # 至少给训练留 1 个
+        rng = random.Random(self.val_split_seed)
+        rng.shuffle(names)
+        val_names = set(names[:n_val])
+        self._val_names_cache = val_names
+        print(f'[Split] 从训练集留出 {len(val_names)} 个 shape 作验证（其余训练）: {sorted(val_names)}')
+        return val_names
     
 # 训练数据加载函数 划分成小点云块 添加噪声、旋转、缩放
     def train_dataloader(self):
@@ -632,8 +705,11 @@ class ScoreDenoise(pl.LightningDataModule):
        
         transforms = Compose(transforms)
     
+        # 训练时排除留作验证的 shape（跨所有分辨率都排除，防泄漏）
+        val_names = self._get_val_names()
         pc_datasets = [
-            PointCloudDataset(root=self.root, dataset=self.dataset, split='train', resolution=resl,transform=transforms)
+            PointCloudDataset(root=self.root, dataset=self.dataset, split='train', resolution=resl,transform=transforms,
+                              exclude_names=val_names)
             for resl in self.resolutions
         ]
         # print(pc_datasets[2][39]['pcl_clean'].shape,'pc_datasets---------------------------------------------------')
@@ -671,32 +747,21 @@ class ScoreDenoise(pl.LightningDataModule):
             dataloader = DataLoader(train_dset, batch_size=self.train_batch_size,shuffle=True, num_workers=self.num_workers,drop_last=True,collate_fn=denoise_collate_fn_test)
 
         return sampler,dataloader
-# 验证数据加载函数：用和训练一致的 1024-point patch（flag='train'）
-# 原来用 flag='test' 返回完整 10k 点云，但 group_divider 只覆盖其中 20%（64×32/10000），
-# 80% 的点 ε=0 不动，导致 val CD 永远接近 noisy baseline，无法反映模型真实去噪能力。
+# 验证数据加载函数：返回【从训练集留出的完整点云】+ 固定噪声（独立于 test，防泄漏）。
+# runner 的 validate() 会对这些完整云跑 test 同款 pipeline（整云切块→Langevin→拼接→SOR），
+# 算 CD+P2M 并按 cd+0.3·p2m 选 ckpt-best —— 选模型标准 = 报告标准，选出的模型最贴近 test 最优。
+# 验证集不切分片（DDP 下也让每个 rank 跑完整 val，样本少、且噪声固定→各 rank 结果一致，
+# rank0 的 checkpoint 决策才正确）。
     def val_dataloader(self):
-        val_split = 'val'
-        val_dir = os.path.join(self.root, self.dataset, 'pointclouds', val_split)
-        if not os.path.isdir(val_dir):
-            print(f"[WARN] split '{val_split}' 不存在，验证集回退到 test split")
-            val_split = 'test'
-
-        val_dset = [
-            PointCloudDataset(root=self.root, dataset=self.dataset, split=val_split, resolution=resl)
-            for resl in ['10000_poisson']
-        ]
-        transform = standard_train_transforms(noise_std_min=self.val_noise, noise_std_max=self.val_noise, rotate=False, scale_d=0.0)
-        # flag='train'：切 1024-point patch，与训练 coverage 一致（group_divider 覆盖 200% vs 原来 20%）
-        val_dset = PairedPatchDataset(datasets=val_dset, patch_size=self.patch_size, num_patches=self.num_patches, patch_ratio=1.0, on_the_fly=True, noise_min=self.val_noise, noise_max=self.val_noise, transform=transform, flag='train')
-
-        if self.args.distributed:
-            sampler = torch.utils.data.distributed.DistributedSampler(
-                val_dset, shuffle=False)
-            dataloader = DataLoader(val_dset, batch_size=1, num_workers=self.num_workers, drop_last=False, collate_fn=denoise_collate_fn_test, worker_init_fn=worker_init_fn, sampler=sampler)
-        else:
-            sampler = None
-            dataloader = DataLoader(val_dset, batch_size=1, shuffle=False, num_workers=self.num_workers, drop_last=False, collate_fn=denoise_collate_fn_test)
-        return sampler, dataloader
+        val_names = self._get_val_names()
+        clean_dset = PointCloudDataset(
+            root=self.root, dataset=self.dataset, split='train',
+            resolution=self.val_resolution, include_names=val_names)
+        val_dset = HeldOutValDataset(clean_dset, self.val_noise_levels, seed=self.val_split_seed)
+        dataloader = DataLoader(
+            val_dset, batch_size=1, shuffle=False, num_workers=self.num_workers,
+            drop_last=False, collate_fn=denoise_collate_fn_test)
+        return None, dataloader
     def test_dataloader(self):
         # 从 config 读分辨率和带噪目录，不想改代码时只改 ScoreDenoise.yaml
         test_resolution = getattr(self, 'test_resolution', '10000_poisson')
