@@ -206,8 +206,8 @@ class HeldOutValDataset(Dataset):
     - 每个 (点云, 噪声级) 生成一条样本，返回完整云（供 runner 用 test 同款 pipeline 评测）。
     - 噪声用 per-sample 固定种子 → 每个 epoch 复现同一份噪声，保证跨 epoch 的 val 分数可比、
       checkpoint 排序稳定（若每次随机加噪，val 分数会抖动，选模型不可靠）。
-    - 归一化基准取自干净点云自身（与 train/test 一致）。P2M 用 meshes/train/<name>.off，
-      因为这些 shape 物理上仍在 train 目录里（只是被排除出训练，留作验证）。
+    - 归一化基准取自干净点云自身（与 train/test 一致）。P2M 的 mesh split 由 runner 按
+      VAL_NUM 决定：VAL_NUM<=0（验证看 test）→ meshes/test/；VAL_NUM>0（留出 train shape）→ meshes/train/。
     """
     def __init__(self, clean_dataset, noise_levels, seed=2024):
         super().__init__()
@@ -665,7 +665,9 @@ class ScoreDenoise(pl.LightningDataModule):
         # ===== 验证集划分（从训练集留出，独立于 test，防泄漏）=====
         # 原来没有 val 文件夹时 val_dataloader 会静默回退到 test split → 用测试集选模型（泄漏）。
         # 现在改为：确定性地从 train 里留出 VAL_NUM 个 shape 作验证，并把它们从训练集排除。
-        self.val_num = int(getattr(config, 'VAL_NUM', 10))
+        # VAL_NUM<=0（默认）: 不留出，验证看 test split → 与 ScoreDenoise/PD-Flow 对齐（train 全用）。
+        # VAL_NUM>0: 从 train 留出这么多 shape 作验证（方法学更干净，但训练数据变少、偏离 baseline 协议）。
+        self.val_num = int(getattr(config, 'VAL_NUM', 0))
         self.val_split_seed = int(getattr(config, 'VAL_SPLIT_SEED', 2024))
         # 验证分辨率：单一，与主基准对齐（留出 shape 在所有分辨率都排除出训练）
         self.val_resolution = getattr(config, 'VAL_RESOLUTION', '10000_poisson')
@@ -679,6 +681,10 @@ class ScoreDenoise(pl.LightningDataModule):
         """确定性地从 train 里挑 VAL_NUM 个 shape 名作验证集（固定 seed → train/val 划分可复现）。
         返回 shape 名集合；训练时排除这些名、验证时只取这些名（跨所有分辨率一致）。"""
         if self._val_names_cache is not None:
+            return self._val_names_cache
+        if self.val_num <= 0:
+            # 不留出：训练用满 train split，验证看 test（对齐 baseline）
+            self._val_names_cache = set()
             return self._val_names_cache
         train_dir = os.path.join(self.root, self.dataset, 'pointclouds', 'train', self.resolutions[0])
         names = sorted([fn[:-4] for fn in os.listdir(train_dir) if fn.endswith('xyz')])
@@ -753,10 +759,20 @@ class ScoreDenoise(pl.LightningDataModule):
 # 验证集不切分片（DDP 下也让每个 rank 跑完整 val，样本少、且噪声固定→各 rank 结果一致，
 # rank0 的 checkpoint 决策才正确）。
     def val_dataloader(self):
-        val_names = self._get_val_names()
-        clean_dset = PointCloudDataset(
-            root=self.root, dataset=self.dataset, split='train',
-            resolution=self.val_resolution, include_names=val_names)
+        if self.val_num > 0:
+            # 从训练集留出验证 shape（方法学更干净，但训练数据变少、且与 baseline 协议不同）；
+            # 这些 shape 已在 train_dataloader 里被排除出训练。P2M 用 meshes/train/。
+            val_names = self._get_val_names()
+            clean_dset = PointCloudDataset(
+                root=self.root, dataset=self.dataset, split='train',
+                resolution=self.val_resolution, include_names=val_names)
+        else:
+            # VAL_NUM<=0（默认）：验证用 test split 干净云 + 固定噪声，与 ScoreDenoise / PD-Flow 对齐
+            #（它们都是 train 全用、验证看 test）。训练数据量与选模型协议都对齐 baseline → 公平对比。
+            #  P2M 用 meshes/test/（validate() 里按 VAL_NUM 决定 split）。
+            clean_dset = PointCloudDataset(
+                root=self.root, dataset=self.dataset, split='test',
+                resolution=self.val_resolution)
         val_dset = HeldOutValDataset(clean_dset, self.val_noise_levels, seed=self.val_split_seed)
         dataloader = DataLoader(
             val_dset, batch_size=1, shuffle=False, num_workers=self.num_workers,

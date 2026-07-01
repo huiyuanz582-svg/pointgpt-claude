@@ -647,6 +647,11 @@ def validate(base_model, val_dataloader, epoch, val_writer, args, config, logger
     fuse_tau_ratio = float(getattr(config, 'fuse_tau_ratio', 0.5))
     cd_metric = ChamferDistanceL2().cuda()
 
+    # 验证 shape 的 mesh split：VAL_NUM<=0（默认，验证看 test，对齐 baseline）→ meshes/test/；
+    # VAL_NUM>0（从 train 留出）→ meshes/train/。P2M 要用对应 split 的 mesh。
+    _val_num = int(getattr(config.dataset.val._base_, 'VAL_NUM', 0))
+    val_mesh_split = 'train' if _val_num > 0 else 'test'
+
     total_cd = 0.0
     total_p2m = 0.0
     total_batches = 0
@@ -670,10 +675,10 @@ def validate(base_model, val_dataloader, epoch, val_writer, args, config, logger
             )  # [N, 3]
             denoised = sor_filter(denoised_full).unsqueeze(0).to(pcl_noisy.device)
 
-            # 还原世界坐标算 P2M（验证 shape 属 train，mesh 用 meshes/train/<name>.off → split='train'）
+            # 还原世界坐标算 P2M（mesh split 由 VAL_NUM 决定：默认看 test → meshes/test/）
             denoised_world = denoised * scale_gpu + center_gpu
             clean_world = pcl_clean * scale_gpu + center_gpu
-            p2m = compute_p2m(denoised_world[0], name[0], 'train') * 1e4
+            p2m = compute_p2m(denoised_world[0], name[0], val_mesh_split) * 1e4
 
             # CD：干净点云单位球归一化后再算（与 test 一致）
             _, center1, scale1 = normalize_unit_sphere(clean_world)
