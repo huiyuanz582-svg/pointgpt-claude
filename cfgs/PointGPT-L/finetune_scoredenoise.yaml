@@ -44,26 +44,24 @@ model:
     weight_center: 1.0,
   }
 
-# Langevin 多步退火推理（仅 --test 生效），与 S 版同款经验最优超参
+# Baseline（消融分支）：单次前向直接输出去噪点云，关闭 Langevin 多步退火
+# （num_steps=1 + step_size=1.0 时 patch_based_denoise 退化为 x = model(x)）
 langevin:
-  { num_steps: 30, step_size: 0.3, decay: 0.95 }
+  { num_steps: 1, step_size: 1.0, decay: 0.95 }
 
 # 局部表面投影后处理（默认关闭，PCA 法向不可靠）
 surface_projection:
   { enable: False, k: 16, num_iters: 1, blend: 0.6 }
 
-# 跨 patch 拼接权重（仅 --test 生效）：到 patch 种子点距离的高斯权重 τ = fuse_tau_ratio · patch 半径
-# 边界点降权，避免重叠区等权平均把曲面磨平（降 P2M）；<=0 退化为等权平均（旧行为）
-fuse_tau_ratio: 0.5
+# Baseline（消融分支）：跨 patch 拼接退回等权平均（<=0 = 旧行为，关闭高斯加权）
+fuse_tau_ratio: 0
 
-# P2M 训练 loss 权重，与 S 版 v8 一致；L 容量更大，可后续微调
-p2m_weight: 0.30
+# Baseline（消融分支）：关闭 P2M 训练 loss（纯 Chamfer 坐标回归）
+p2m_weight: 0
 
-# Consistency 迭代训练（训练端对齐推理 Langevin）：展开 num_steps 步退火，每步喂模型
-# 上一步的部分去噪结果。截断 BPTT + 逐步 backward → 峰值显存≈单步，但计算≈num_steps×。
-# L 模型单步已较慢，num_steps 先取 3；太慢可降到 2，enable=False 退回单步（用于 A/B）。
+# Baseline（消融分支）：关闭 Consistency 迭代训练（单步训练）
 consistency:
-  { enable: True, num_steps: 3, step_size: 0.3, decay: 0.95 }
+  { enable: False, num_steps: 3, step_size: 0.3, decay: 0.95 }
 
 npoints: 1024                # 跟 dataset_configs/ScoreDenoise.yaml 的 PATCH_SIZE 对齐
 total_bs: 8                  # L 模型显存吃紧，从 16 降到 8 防 OOM/服务器崩溃

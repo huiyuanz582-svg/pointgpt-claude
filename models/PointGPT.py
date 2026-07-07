@@ -769,10 +769,11 @@ class PointTransformer(nn.Module):
     
     def forward(self, noisy_pts, clean_pts=None, type='val', name='', epoch=0, max_epoch=None, noise_std=None):
         """
-        ε-prediction 去噪框架（等价于 DDPM ε-parameterization）：
-        - generator 输出 ε = (clean - noisy) / σ，量级 O(1)，N(0,1) 分布
-        - 训练：MSE(pred_ε, target_ε)，无 σ 加权，梯度信号不被压缩
-        - 推理：x̂ = x + σ · pred_ε（Step 3 可换成 Langevin 多步）
+        Baseline（消融对照分支）：原始 PointGPT 语义，不做 ε-prediction。
+        - generator 直接生成 patch 内点坐标（局部偏移，与预训练一致），融合时加 center
+        - 训练：预训练同款 Chamfer loss（cdl1+cdl2），GT = 与 noisy 同索引对齐的 clean patch
+        - 推理：单次前向直接输出融合后的去噪点云（无 Langevin 多步）
+        - noise_std 仅为保持与 runner 的接口兼容，此处不使用
         """
         neighborhood_noisy, center_noisy, patch_idx = self.group_divider(noisy_pts)
         group_input_tokens = self.encoder(neighborhood_noisy)  # B G C
@@ -792,46 +793,43 @@ class PointTransformer(nn.Module):
 
         x = group_input_tokens
 
-        # 全 attention：去噪不需要因果约束（去掉了预训练的 causal mask）
+        # 全 attention：与完整方法一致（去噪没有生成顺序，causal mask 无意义），
+        # 保证 baseline 与完整方法的唯一差异是方法学组件（ε/EDM/P2M/consistency/Langevin）
         encoded_features = self.blocks(x, pos, attn_mask=None, classify=False)
         encoded_features = encoded_features[:, 1:, :]   # 去掉 sos
 
-        generated_delta = self.generator_blocks(
+        generated_points = self.generator_blocks(
             encoded_features, pos_relative, attn_mask=None)
-        generated_delta = generated_delta.view(
+        generated_points = generated_points.view(
             B, self.num_group, self.group_size, 3
         )
 
-        # generator 输出 = score 向量（不是坐标），融合时不加 center
-        pred_score_global = project_patch_scores_weighted(
-            generated_delta,
+        # generator 输出 = patch 局部坐标（原始 PointGPT 语义），融合时加 center；
+        # 未被任何 patch 覆盖的点回填 noisy，避免落到 (0,0,0)
+        denoised = project_patch_predictions_weighted(
+            generated_points,
+            center_noisy,
             patch_idx,
             neighborhood_noisy,
             num_points=noisy_pts.shape[1],
+            fallback_points=noisy_pts,
         )
 
         if type == 'train':
-            assert noise_std is not None, 'ε-prediction training requires noise_std'
             assert clean_pts is not None, 'training requires clean_pts'
-            sigma = noise_std.view(-1, 1, 1).to(noisy_pts.device)   # [B, 1, 1]
-            # ε-target: (clean - noisy) / σ，量级 O(1)
-            target_eps = (clean_pts - noisy_pts) / sigma
-            # EDM 1/σ² 加权：小噪声段（1%）梯度信号放大，迫使模型对精确去噪更敏感
-            # 乘以 σ_ref² 归一化保持数值量级稳定（σ_ref=0.01 对应 1% 噪声基准）
-            sigma_ref = 0.01
-            loss = ((pred_score_global - target_eps) ** 2 * (sigma_ref / sigma) ** 2).sum(dim=-1).mean()
-            # 同时返回预测去噪点 x̂ = x + σ·ε（归一化空间），供 runner 计算可微 P2M loss
-            denoised = noisy_pts + sigma * pred_score_global
-            return loss, denoised
+            # GT：用与 noisy 相同的 patch 索引取 clean 点（训练数据点级对齐），转到 patch 局部坐标
+            N = noisy_pts.shape[1]
+            idx_base = torch.arange(B, device=noisy_pts.device).view(-1, 1, 1) * N
+            idx = (patch_idx + idx_base).view(-1)
+            gt_neighborhood = clean_pts.reshape(B * N, 3)[idx].view(
+                B, self.num_group, self.group_size, 3) - center_noisy.unsqueeze(2)
 
+            # 预训练同款 Chamfer loss（cdl1 + cdl2），按 B·G 个 patch 计算
+            pred_flat = generated_points.reshape(B * self.num_group, self.group_size, 3)
+            gt_flat = gt_neighborhood.reshape(B * self.num_group, self.group_size, 3)
+            loss = self.loss_func_p1(pred_flat, gt_flat) + self.loss_func_p2(pred_flat, gt_flat)
+            return loss, denoised
         else:
-            # Val / test: x̂ = x + σ · pred_ε
-            # Step 3 会在 runner 里实现 Langevin 多步替代
-            assert noise_std is not None, (
-                'val/test requires noise_std; runner 应从 config.TEST_NOISE 填充'
-            )
-            sigma = noise_std.view(-1, 1, 1).to(noisy_pts.device)
-            denoised = noisy_pts + sigma * pred_score_global
             return denoised
 
 

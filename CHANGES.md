@@ -370,3 +370,51 @@ decay: 0.95 }`（step_size/decay 对齐推理 langevin）。L 单步已较慢，
 
 S/L finetune yaml 默认 `cpu_threads: 8`、`gpu_mem_fraction: 0.9`（均可调；设 0 或删行=不限制）。
 与被动退出互补：被动保存进度、主动防尖峰。
+
+---
+
+## Session 2026-07-07: baseline-original-pointgpt 消融基线分支
+
+### 目的
+
+证明本 fork 各方法学改动的有效性：在**同一骨干、同一数据、同一评测协议**下，
+把方法学贡献全部退掉，得到"原始 PointGPT 直接微调用于去噪"的对照基线。
+本分支（`baseline-original-pointgpt`）只做消融，主线代码在原分支不动。
+
+### 退掉的组件（baseline vs 完整方法）
+
+| 组件 | 完整方法 | baseline |
+|---|---|---|
+| 输出语义 | ε-prediction | 原始 PointGPT：generator 直接生成 patch 局部坐标 |
+| 训练 loss | EDM 1/σ² 加权 ε-MSE | 预训练同款 Chamfer (cdl1+cdl2)，GT=点级对齐的 clean patch |
+| P2M 训练 loss | 0.70(S)/0.30(L) | 0（关闭） |
+| Consistency 迭代训练 | 开 | 关 |
+| 推理 | 30 步 Langevin 退火 | 单次前向（langevin: num_steps=1, step_size=1.0） |
+| 跨 patch 拼接 | 高斯加权 (fuse_tau_ratio=0.5) | 等权平均 (fuse_tau_ratio=0) |
+| σ 采样 | 对数均匀 (NOISE_LOG_UNIFORM) | 均匀 |
+| 输出头重置 | std=0.1 重置 | 不重置（预训练头本就生成坐标，语义匹配） |
+
+### 保留不变（公平对比的前提）
+
+- 骨干配置（trans_dim/depth/num_group/group_size）、优化器/lr/epoch/batch
+- 1024-patch 训练管线（noisy 空间 KNN 同步索引 clean/noisy）、TRAIN_OVERSAMPLE、噪声范围
+- 测试协议：整云切块 → 拼回 → SOR → CD/P2M（两边完全同款）
+- 全 attention（去噪无生成顺序；保证唯一差异是方法学组件）
+- 内存保护（被动退出 + 主动封顶）
+
+### 改动位置
+
+- `models/PointGPT.py:PointTransformer.forward`：坐标回归 + Chamfer loss（复用
+  `project_patch_predictions_weighted` 融合，加 center，未覆盖点回填 noisy）
+- `tools/runner_finetune.py:run_net`：删 generator 输出头 std=0.1 重置
+- `cfgs/PointGPT-{S,L}/finetune_scoredenoise.yaml`：langevin 1 步、fuse_tau_ratio 0、
+  p2m_weight 0、consistency.enable False
+- `cfgs/dataset_configs/ScoreDenoise.yaml`：NOISE_LOG_UNIFORM False
+
+P2M/consistency/Langevin/高斯拼接的**代码**保留（配置关闭即失效），只退行为不删基建，
+方便在同一分支上做单组件消融（如只开 Langevin）。
+
+### 跑法
+
+baseline 需要**重新微调**（不能用 ε 语义的旧 ckpt 测试）：训练/测试命令与主线完全相同，
+只是在本分支上跑；建议 `--exp_name baseline_L` 之类区分。

@@ -2,8 +2,8 @@ NAME: ScoreDenoise
 ROOT: data/ScoreDenoise
 NOISE_MIN: 0.005
 NOISE_MAX: 0.020
-# σ 对数均匀采样(EDM 式)：范围不变，小 σ 样本占比更高，精细去噪/降 P2M 更充分
-NOISE_LOG_UNIFORM: True
+# Baseline（消融分支）：σ 均匀采样（关闭 EDM 式对数均匀采样，范围不变）
+NOISE_LOG_UNIFORM: False
 VAL_NOISE: 0.010
 # TEST_NOISE: val/test 路径 noise_std 的 fallback（PairedEvalDataset 不含 noise_std 字段）
 # 跑 3% noise 测试时改为 0.030

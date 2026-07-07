@@ -395,16 +395,10 @@ def run_net(args, config, train_writer=None, val_writer=None):
     # 加载预训练
     if args.ckpts is not None:
         base_model.load_model_from_ckpt(args.ckpts)
-        # Score-based 关键步骤：重新初始化 generator 输出头
-        # 预训练的输出头学的是"生成绝对坐标"，直接用会让 noisy + σ·ε 大幅漂移
-        # ε-prediction target 的每点 norm ≈ √3 ≈ 1.7（标准正态）；增益头经过 ln_f 后
-        # 输出幅度 ≈ std·√fan_in ≈ std·√384。std=0.1 → 起点 ≈ 2.0，与 target 量级对齐，
-        # 避免之前 std=0.01（起点 ≈ 0.2，仅 target 的 ~12%）导致点几乎不动、幅度学不上来。
-        with torch.no_grad():
-            nn.init.normal_(base_model.generator_blocks.increase_dim[0].weight, std=0.1)
-            if base_model.generator_blocks.increase_dim[0].bias is not None:
-                nn.init.zeros_(base_model.generator_blocks.increase_dim[0].bias)
-        print_log('[ε-prediction] Re-initialized generator output head (std=0.1)', logger=logger)
+        # Baseline（消融分支）：不重置 generator 输出头。
+        # 原始 PointGPT 预训练头学的就是"生成 patch 坐标"，与本分支的坐标回归语义一致，直接复用。
+        # （完整方法分支因为改成 ε-prediction 语义才需要 std=0.1 重置。）
+        print_log('[Baseline] 复用预训练 generator 输出头（坐标语义一致，不重置）', logger=logger)
     else:
         print_log('Training from scratch', logger=logger)
     
