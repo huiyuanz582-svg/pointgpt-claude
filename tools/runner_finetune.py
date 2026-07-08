@@ -645,6 +645,9 @@ def validate(base_model, val_dataloader, epoch, val_writer, args, config, logger
     lv_decay = float(getattr(langevin, 'decay', 0.95)) if langevin is not None else 0.95
     test_patch_batch = int(getattr(config, 'test_patch_batch', 4))
     fuse_tau_ratio = float(getattr(config, 'fuse_tau_ratio', 0.5))
+    # SOR 后处理开关（默认 True 保持旧行为）。SOR 删边角点会抬高 face→point（P2M 双向项），
+    # 对照方法均无后处理滤波 → 关掉可做公平对比。从 config 读，缺省 True。
+    sor_enable = bool(getattr(config, 'sor_enable', True))
     cd_metric = ChamferDistanceL2().cuda()
 
     # 验证 shape 的 mesh split：VAL_NUM<=0（默认，验证看 test，对齐 baseline）→ meshes/test/；
@@ -673,7 +676,8 @@ def validate(base_model, val_dataloader, epoch, val_writer, args, config, logger
                 num_steps=lv_steps, step_size=lv_step_size, decay=lv_decay,
                 fuse_tau_ratio=fuse_tau_ratio,
             )  # [N, 3]
-            denoised = sor_filter(denoised_full).unsqueeze(0).to(pcl_noisy.device)
+            denoised_post = sor_filter(denoised_full) if sor_enable else denoised_full.cpu()
+            denoised = denoised_post.unsqueeze(0).to(pcl_noisy.device)
 
             # 还原世界坐标算 P2M（mesh split 由 VAL_NUM 决定：默认看 test → meshes/test/）
             denoised_world = denoised * scale_gpu + center_gpu
@@ -816,6 +820,11 @@ def test(base_model, test_dataloader, args, config, logger=None):
     print_log(f'[Inference] cross-patch fuse_tau_ratio={fuse_tau_ratio}'
               + (' (等权平均 fallback)' if fuse_tau_ratio <= 0 else ''), logger=logger)
 
+    # SOR 后处理开关（默认 True 保持旧行为）。SOR 删边角点会抬高 face→point（P2M 双向项），
+    # 对照方法（IterativePFN/Score/PD-Flow…）均无后处理滤波 → 与它们公平对比时设 False。
+    sor_enable = bool(getattr(config, 'sor_enable', True))
+    print_log(f'[Inference] SOR 后处理: {"开启" if sor_enable else "关闭（无后处理，对齐 baseline）"}', logger=logger)
+
     # ChamferDistanceL2 只实例化一次，避免每次投票都新建 CUDA 模块（防显存碎片累积）
     cd_metric = ChamferDistanceL2().cuda()
 
@@ -897,7 +906,7 @@ def test(base_model, test_dataloader, args, config, logger=None):
                     fuse_tau_ratio=fuse_tau_ratio,
                 )  # [N, 3]
                 denoised_10k = denoised_full.unsqueeze(0)
-                denoised_filtered = sor_filter(denoised_10k[0])
+                denoised_filtered = sor_filter(denoised_10k[0]) if sor_enable else denoised_10k[0].cpu()
                 # 局部表面投影后处理（仅在 config.surface_projection.enable 时启用）
                 if sp_enable:
                     denoised_filtered = local_surface_projection(

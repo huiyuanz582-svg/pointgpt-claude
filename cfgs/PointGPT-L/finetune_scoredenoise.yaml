@@ -56,6 +56,11 @@ surface_projection:
 # 边界点降权，避免重叠区等权平均把曲面磨平（降 P2M）；<=0 退化为等权平均（旧行为）
 fuse_tau_ratio: 0.5
 
+# SOR 后处理开关（val/test 生效）。True=旧行为（删离群点）；False=不做任何后处理滤波。
+# 与 IterativePFN/Score/PD-Flow 等无后处理的方法做公平对比时设 False —— SOR 删尖锐边角点
+# 会抬高 P2M 的 face→point 覆盖项（对 CAD 类形状尤甚），是独有的自我惩罚。
+sor_enable: True
+
 # P2M 训练 loss 权重，与 S 版 v8 一致；L 容量更大，可后续微调
 p2m_weight: 0.30
 
