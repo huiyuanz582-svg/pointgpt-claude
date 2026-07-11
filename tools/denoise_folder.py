@@ -74,7 +74,8 @@ def main():
     print(f'[Config] test_patch_batch={test_patch_batch} fuse_tau_ratio={fuse_tau_ratio} '
           f'SOR={"on" if sor_enable else "off"}  noise_std(σ0)={args.noise_std}')
 
-    # 建模 + 载权重
+    # 建模 + 载权重（先下发消融开关，保证与训练该 ckpt 时的模型行为一致）
+    builder.inject_ablation(config)
     model = builder.model_builder(config.model)
     builder.load_model(model, args.ckpt)
     model = model.to(device).eval()

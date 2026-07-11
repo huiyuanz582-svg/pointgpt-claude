@@ -35,6 +35,25 @@ def model_builder(config):
     return model
 
 
+def inject_ablation(config):
+    """把 yaml 顶层 ablation 块下发为 model config 的 abl_* 开关（模型内部读取）。
+
+    所有模型入口（run_net / test_net / denoise_folder）建模型前都要调用，
+    保证训练用某个消融开关训出的 ckpt，测试时行为一致。缺省无该块 = 完整方法。
+    """
+    abl = config.get('ablation', None)
+    if abl:
+        if abl.get('decoder_random_init') and abl.get('fc_decoder'):
+            raise ValueError('[Ablation] decoder_random_init 与 fc_decoder 互斥：'
+                             'fc_decoder 已绕过 generator，重建它无意义，请只开一个')
+        for k, v in abl.items():
+            config.model['abl_' + k] = v
+        enabled = [k for k, v in abl.items() if v]
+        if enabled:
+            print(f'[Ablation] 生效的消融开关: {enabled}')
+    return config
+
+
 def build_opti_sche(base_model, config):
     opti_config = config.optimizer
     if opti_config.type == 'AdamW':

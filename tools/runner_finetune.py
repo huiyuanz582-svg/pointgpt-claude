@@ -376,10 +376,11 @@ def run_net(args, config, train_writer=None, val_writer=None):
 
     # 1. 构建数据集
     train_sampler,train_dataloader = builder.dataset_builder(args, config.dataset.train)
-    _,test_dataloader  = builder.dataset_builder(args, config.dataset.val)  
-    
+    _,test_dataloader  = builder.dataset_builder(args, config.dataset.val)
 
-    # 2. 构建模型
+
+    # 2. 构建模型（先下发消融开关：yaml 顶层 ablation 块 → config.model.abl_*）
+    builder.inject_ablation(config)
     base_model = builder.model_builder(config.model)
 
     # Score-based 去噪：encoder 不冻结
@@ -395,6 +396,12 @@ def run_net(args, config, train_writer=None, val_writer=None):
     # 加载预训练
     if args.ckpts is not None:
         base_model.load_model_from_ckpt(args.ckpts)
+        # 消融 (b1)：随机重建 generator decoder（同结构、丢预训练权重）——
+        # 检验"复用预训练生成式 decoder"的价值。必须在输出头 std=0.1 重置之前做，
+        # 这样重建后的头仍会走下面同款初始化，与完整方法唯一差异 = decoder 主体权重来源。
+        if bool(getattr(config.model, 'abl_decoder_random_init', False)):
+            base_model.reinit_generator_decoder()
+            print_log('[Ablation] generator decoder 已随机重建（丢弃预训练权重，结构不变）', logger=logger)
         # Score-based 关键步骤：重新初始化 generator 输出头
         # 预训练的输出头学的是"生成绝对坐标"，直接用会让 noisy + σ·ε 大幅漂移
         # ε-prediction target 的每点 norm ≈ √3 ≈ 1.7（标准正态）；增益头经过 ln_f 后
@@ -763,6 +770,8 @@ def test_net(args, config):
     logger = get_logger(args.log_name)
     print_log('Tester start ... ', logger=logger)
     _,test_dataloader  = builder.dataset_builder(args, config.dataset.test)
+    # 下发消融开关（与训练同一份 yaml → 测试行为和训练时一致，如 causal mask / FC 换头）
+    builder.inject_ablation(config)
     base_model = builder.model_builder(config.model)
 
     # load checkpoints

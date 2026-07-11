@@ -94,6 +94,7 @@ def project_patch_scores_weighted(
     patch_xyz,    # [B, G, M, 3] patch 局部坐标（仅用于距离权重）
     num_points,
     sigma=None,
+    uniform=False,  # 消融 (c)：True = 等权平均（关闭高斯距离加权）
 ):
     """
     把每个 patch 内每点的 score 通过 Gaussian 距离加权融合回全局每点 score。
@@ -106,8 +107,11 @@ def project_patch_scores_weighted(
     if sigma is None:
         sigma = 0.05 * (10000 / num_points) ** 0.5
 
-    dist = torch.norm(patch_xyz, dim=-1, keepdim=True)  # [B, G, M, 1]
-    weight = torch.exp(- dist ** 2 / (2 * sigma ** 2))
+    if uniform:
+        weight = torch.ones(B, G, M, 1, device=device)
+    else:
+        dist = torch.norm(patch_xyz, dim=-1, keepdim=True)  # [B, G, M, 1]
+        weight = torch.exp(- dist ** 2 / (2 * sigma ** 2))
 
     full_score = torch.zeros(B, num_points, 3, device=device)
     weight_sum = torch.zeros(B, num_points, 1, device=device)
@@ -684,6 +688,27 @@ class PointTransformer(nn.Module):
 # 重复定义；与上面同一含义（会覆盖之前的 self.norm）。
         self.norm = nn.LayerNorm(self.trans_dim)
 
+# ===== 消融开关（yaml 顶层 ablation 块经 builder.inject_ablation 下发为 abl_* 键）=====
+# 缺省全 False = 完整方法。对应论文 Sec.4 的组件消融：
+#   (a) abl_causal_attn:   微调恢复预训练的因果 mask（对照：双向注意力）
+#   (b2) abl_fc_decoder:   PMI 式换头——绕过预训练 generator，用新 FC 头从 encoder 特征回归 ε
+#   (c) abl_fusion_uniform: 组内 ε 融合改等权平均（对照：高斯距离加权）
+#   (d1) abl_no_loss_weight: 关闭 (σ_ref/σ)² 噪声级加权
+# (b1) abl_decoder_random_init 在 runner 里生效（加载 ckpt 后调 reinit_generator_decoder）
+        self.abl_causal_attn = bool(getattr(config, 'abl_causal_attn', False))
+        self.abl_fc_decoder = bool(getattr(config, 'abl_fc_decoder', False))
+        self.abl_fusion_uniform = bool(getattr(config, 'abl_fusion_uniform', False))
+        self.abl_no_loss_weight = bool(getattr(config, 'abl_no_loss_weight', False))
+        if self.abl_fc_decoder:
+            self.fc_decoder_head = nn.Sequential(
+                nn.Linear(self.trans_dim, self.trans_dim),
+                nn.GELU(),
+                nn.Linear(self.trans_dim, 3 * self.group_size),
+            )
+            # 输出层与完整方法的生成头同款初始化（std=0.1），保证初始 ε 幅度可比
+            nn.init.normal_(self.fc_decoder_head[-1].weight, std=0.1)
+            nn.init.zeros_(self.fc_decoder_head[-1].bias)
+
 # 构建损失函数
         self.build_loss_func()
 
@@ -766,7 +791,20 @@ class PointTransformer(nn.Module):
             trunc_normal_(m.weight, std=.02)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
-    
+
+    def reinit_generator_decoder(self):
+        """消融 (b1)：随机重建 generator decoder（结构不变、丢弃预训练权重）。
+        用重新构造而非 apply(_init_weights)：nn.MultiheadAttention 的 in_proj 参数
+        不属于 Linear/Conv1d，apply 触不到，只有重建才能保证完全随机初始化。
+        须在 load_model_from_ckpt 之后、输出头 std=0.1 重置之前调用（runner 里）。"""
+        self.generator_blocks = GPT_generator(
+            embed_dim=self.encoder_dims,
+            num_heads=self.num_heads,
+            num_layers=self.decoder_depth,
+            trans_dim=self.trans_dim,
+            group_size=self.group_size,
+        )
+
     def forward(self, noisy_pts, clean_pts=None, type='val', name='', epoch=0, max_epoch=None, noise_std=None):
         """
         ε-prediction 去噪框架（等价于 DDPM ε-parameterization）：
@@ -793,21 +831,38 @@ class PointTransformer(nn.Module):
         x = group_input_tokens
 
         # 全 attention：去噪不需要因果约束（去掉了预训练的 causal mask）
-        encoded_features = self.blocks(x, pos, attn_mask=None, classify=False)
+        # 消融 (a) abl_causal_attn=True 时恢复预训练式因果 mask（triu, True=禁止注意）
+        attn_mask_enc = None
+        attn_mask_gen = None
+        if self.abl_causal_attn:
+            len_enc = x.shape[1] + 1   # extractor 内部会前置 sos token
+            attn_mask_enc = torch.triu(
+                torch.ones(len_enc, len_enc, device=x.device, dtype=torch.bool), diagonal=1)
+            len_gen = x.shape[1]
+            attn_mask_gen = torch.triu(
+                torch.ones(len_gen, len_gen, device=x.device, dtype=torch.bool), diagonal=1)
+
+        encoded_features = self.blocks(x, pos, attn_mask=attn_mask_enc, classify=False)
         encoded_features = encoded_features[:, 1:, :]   # 去掉 sos
 
-        generated_delta = self.generator_blocks(
-            encoded_features, pos_relative, attn_mask=None)
+        if self.abl_fc_decoder:
+            # 消融 (b2)：PMI 式换头——绕过预训练 generator，用新 FC 头直接从 encoder 特征回归 ε
+            generated_delta = self.fc_decoder_head(encoded_features)   # [B, G, 3M]
+        else:
+            generated_delta = self.generator_blocks(
+                encoded_features, pos_relative, attn_mask=attn_mask_gen)
         generated_delta = generated_delta.view(
             B, self.num_group, self.group_size, 3
         )
 
         # generator 输出 = score 向量（不是坐标），融合时不加 center
+        # 消融 (c) abl_fusion_uniform=True 时等权平均（关闭高斯距离加权）
         pred_score_global = project_patch_scores_weighted(
             generated_delta,
             patch_idx,
             neighborhood_noisy,
             num_points=noisy_pts.shape[1],
+            uniform=self.abl_fusion_uniform,
         )
 
         if type == 'train':
@@ -816,10 +871,14 @@ class PointTransformer(nn.Module):
             sigma = noise_std.view(-1, 1, 1).to(noisy_pts.device)   # [B, 1, 1]
             # ε-target: (clean - noisy) / σ，量级 O(1)
             target_eps = (clean_pts - noisy_pts) / sigma
-            # EDM 1/σ² 加权：小噪声段（1%）梯度信号放大，迫使模型对精确去噪更敏感
-            # 乘以 σ_ref² 归一化保持数值量级稳定（σ_ref=0.01 对应 1% 噪声基准）
-            sigma_ref = 0.01
-            loss = ((pred_score_global - target_eps) ** 2 * (sigma_ref / sigma) ** 2).sum(dim=-1).mean()
+            if self.abl_no_loss_weight:
+                # 消融 (d1)：关闭噪声级加权，纯 ε-MSE（各噪声级等权）
+                loss = ((pred_score_global - target_eps) ** 2).sum(dim=-1).mean()
+            else:
+                # EDM 1/σ² 加权：小噪声段（1%）梯度信号放大，迫使模型对精确去噪更敏感
+                # 乘以 σ_ref² 归一化保持数值量级稳定（σ_ref=0.01 对应 1% 噪声基准）
+                sigma_ref = 0.01
+                loss = ((pred_score_global - target_eps) ** 2 * (sigma_ref / sigma) ** 2).sum(dim=-1).mean()
             # 同时返回预测去噪点 x̂ = x + σ·ε（归一化空间），供 runner 计算可微 P2M loss
             denoised = noisy_pts + sigma * pred_score_global
             return loss, denoised

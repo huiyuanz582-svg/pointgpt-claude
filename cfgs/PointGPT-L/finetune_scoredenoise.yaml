@@ -70,6 +70,27 @@ p2m_weight: 0.30
 consistency:
   { enable: True, num_steps: 3, step_size: 0.3, decay: 0.95 }
 
+# ===== 消融开关总索引（对应论文 Sec.4 组件；缺省/全 False = 完整方法）=====
+# 下方 ablation 块的开关 + 已有配置项，共同覆盖全部消融行。
+# 【需重训】改完必须重新训练（模型/损失行为变了）：
+#   (a)  ablation.causal_attn: True         微调恢复因果 mask（对照：双向注意力）
+#   (b1) ablation.decoder_random_init: True generator decoder 随机重建（同结构、丢预训练权重）
+#   (b2) ablation.fc_decoder: True          PMI 式换头：绕过预训练 generator，新 FC 头回归 ε
+#   (c)  ablation.fusion_uniform: True      组内 ε 融合等权平均（对照：高斯距离加权）
+#   (d1) ablation.no_loss_weight: True      关闭 (σ_ref/σ)² 噪声级加权
+#   (d2) dataset 配置 NOISE_LOG_UNIFORM: False   σ 改均匀采样
+#   (e)  p2m_weight: 0                      去掉可微 P2M 训练项
+#   (f)  consistency.enable: False          退回单步训练（不展开）
+#   框架级: scratch = 只加 --scratch_model 不加 --ckpts；naive 迁移 = 上游原始 PointGPT
+# 【只影响测试，无需重训】：
+#   (g)  langevin.num_steps: 1 (+step_size: 1.0)   单步推理
+#   (h)  fuse_tau_ratio: 0                  跨 patch 拼接等权平均
+#        sor_enable: False                  关 SOR 后处理
+# 注意：b1 与 b2 互斥（别同时开）；训练用了哪套开关，--test 必须用同一份 yaml。
+ablation:
+  { causal_attn: False, decoder_random_init: False, fc_decoder: False,
+    fusion_uniform: False, no_loss_weight: False }
+
 npoints: 1024                # 跟 dataset_configs/ScoreDenoise.yaml 的 PATCH_SIZE 对齐
 total_bs: 8                  # L 模型显存吃紧，从 16 降到 8 防 OOM/服务器崩溃
 step_per_update: 1
