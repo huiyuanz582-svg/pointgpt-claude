@@ -1,0 +1,112 @@
+# =====【消融配置】equal fusion —— 跨 patch 拼接等权平均（仅 --test 生效，无需重训）
+# 由 finetune_scoredenoise.yaml 生成，仅改动本消融相关的键，其余与完整方法一致。
+
+# ======================================================
+# PointGPT-L Fine-tuning Configuration for Denoising Task
+# Using paired noisy-clean dataset (e.g., PD-Flow, PUSet, DMRSet)
+# ======================================================
+
+optimizer:
+  { type: AdamW, kwargs: { lr: 0.00005, weight_decay: 0.05 } }
+
+scheduler:
+  { type: CosLR, kwargs: { epochs: 120, initial_epochs: 10 } }
+
+dataset:
+  {
+    train:
+      {
+        _base_: cfgs/dataset_configs/ScoreDenoise.yaml,
+        others: { subset: "train" },
+      },
+    val:
+      {
+        _base_: cfgs/dataset_configs/ScoreDenoise.yaml,
+        others: { subset: "val" },
+      },
+    test:
+      {
+        _base_: cfgs/dataset_configs/ScoreDenoise.yaml,
+        others: { subset: "test" },
+      },
+  }
+
+model:
+  {
+    NAME: PointTransformer,
+    cls_dim: 15,  # 去噪任务用不到，但 PointTransformer 构造时仍要读这个字段
+    trans_dim: 1024,
+    depth: 24,
+    drop_path_rate: 0.2,
+    num_heads: 16,
+    group_size: 32,
+    num_group: 128,           # 跟 PointGPT-L pretrain 一致，复用预训练权重
+    encoder_dims: 1024,
+    decoder_depth: 4,
+    loss: cdl12,
+    weight_center: 1.0,
+  }
+
+# Langevin 多步退火推理（仅 --test 生效），与 S 版同款经验最优超参
+langevin:
+  { num_steps: 30, step_size: 0.3, decay: 0.95 }
+
+# 局部表面投影后处理（默认关闭，PCA 法向不可靠）
+surface_projection:
+  { enable: False, k: 16, num_iters: 1, blend: 0.6 }
+
+# 跨 patch 拼接权重（仅 --test 生效）：到 patch 种子点距离的高斯权重 τ = fuse_tau_ratio · patch 半径
+# 边界点降权，避免重叠区等权平均把曲面磨平（降 P2M）；<=0 退化为等权平均（旧行为）
+fuse_tau_ratio: 0
+
+# SOR 后处理开关（val/test 生效）。True=旧行为（删离群点）；False=不做任何后处理滤波。
+# 与 IterativePFN/Score/PD-Flow 等无后处理的方法做公平对比时设 False —— SOR 删尖锐边角点
+# 会抬高 P2M 的 face→point 覆盖项（对 CAD 类形状尤甚），是独有的自我惩罚。
+sor_enable: True
+
+# P2M 训练 loss 权重，与 S 版 v8 一致；L 容量更大，可后续微调
+p2m_weight: 0.30
+
+# Consistency 迭代训练（训练端对齐推理 Langevin）：展开 num_steps 步退火，每步喂模型
+# 上一步的部分去噪结果。截断 BPTT + 逐步 backward → 峰值显存≈单步，但计算≈num_steps×。
+# L 模型单步已较慢，num_steps 先取 3；太慢可降到 2，enable=False 退回单步（用于 A/B）。
+consistency:
+  { enable: True, num_steps: 3, step_size: 0.3, decay: 0.95 }
+
+# ===== 消融开关总索引（对应论文 Sec.4 组件；缺省/全 False = 完整方法）=====
+# 下方 ablation 块的开关 + 已有配置项，共同覆盖全部消融行。
+# 【需重训】改完必须重新训练（模型/损失行为变了）：
+#   (a)  ablation.causal_attn: True         微调恢复因果 mask（对照：双向注意力）
+#   (b1) ablation.decoder_random_init: True generator decoder 随机重建（同结构、丢预训练权重）
+#   (b2) ablation.fc_decoder: True          PMI 式换头：绕过预训练 generator，新 FC 头回归 ε
+#   (c)  ablation.fusion_uniform: True      组内 ε 融合等权平均（对照：高斯距离加权）
+#   (d1) ablation.no_loss_weight: True      关闭 (σ_ref/σ)² 噪声级加权
+#   (d2) dataset 配置 NOISE_LOG_UNIFORM: False   σ 改均匀采样
+#   (e)  p2m_weight: 0                      去掉可微 P2M 训练项
+#   (f)  consistency.enable: False          退回单步训练（不展开）
+#   框架级: scratch = 只加 --scratch_model 不加 --ckpts；naive 迁移 = 上游原始 PointGPT
+# 【只影响测试，无需重训】：
+#   (g)  langevin.num_steps: 1 (+step_size: 1.0)   单步推理
+#   (h)  fuse_tau_ratio: 0                  跨 patch 拼接等权平均
+#        sor_enable: False                  关 SOR 后处理
+# 注意：b1 与 b2 互斥（别同时开）；训练用了哪套开关，--test 必须用同一份 yaml。
+ablation:
+  { causal_attn: False, decoder_random_init: False, fc_decoder: False,
+    fusion_uniform: False, no_loss_weight: False }
+
+npoints: 1024                # 跟 dataset_configs/ScoreDenoise.yaml 的 PATCH_SIZE 对齐
+total_bs: 8                  # L 模型显存吃紧，从 16 降到 8 防 OOM/服务器崩溃
+step_per_update: 1
+max_epoch: 120
+mem_check_interval: 50       # 每 50 个 batch 检查一次内存（epoch 内峰值保护，0 = 关闭）
+test_patch_batch: 2          # 测试时每批 patch 数：L 模型显存吃紧，50k 用 2 最稳；10k 可调 4
+grad_norm_clip: 1.0          # L模型depth=24梯度路径是S的2倍，clip必须收紧防爆炸
+# 主动资源限制（共享服务器防吃满核 / 防单进程吃爆整卡显存崩机），0 或删除该行 = 不限制
+cpu_threads: 8               # PyTorch + numpy/MKL CPU 线程上限；核多可调大或设 0（CPU 一般非瓶颈）
+gpu_mem_fraction: 0.9        # 单进程显存占整卡比例上限；超限触发可捕获 OOM(跳 batch) 而非整卡崩
+save_interval: 10
+val_interval: 1
+
+pretrain: pretrainModel/L/post_pretrained.pth   # 指定预训练模型路径
+
+exp_name: finetune_denoise_pointGPT

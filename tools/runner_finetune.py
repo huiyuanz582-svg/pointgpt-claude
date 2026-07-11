@@ -864,7 +864,9 @@ def test(base_model, test_dataloader, args, config, logger=None):
                           f'p2m={ (total_p2m/total_batches) if total_batches>0 else float("nan"):.6f}。'
                           f'请在 yaml 调小 test_patch_batch 后重跑', logger=logger)
                 sys.exit(0)
-            save_path = 'test_test_result_1'
+            # 可视化输出按 exp_name 分目录：不同实验/消融的 --test 结果互不覆盖
+            # （原来硬编码 'test_test_result_1'，多组测试会相互clobber）
+            save_path = args.exp_name          # parser 已自动给 test 加 'test_' 前缀
             save_path2 = 'visualiza-result10k-1'
             save_path3 = 'finetune_scoredenoise_L'
             PointGPTtype = 'PointGPT-Change'
