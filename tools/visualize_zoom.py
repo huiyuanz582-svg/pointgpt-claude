@@ -1,34 +1,46 @@
 # -*- coding: utf-8 -*-
-"""Render a point cloud with a magnified inset of a selected region.
+"""Render point clouds with a magnified inset, PD-Flow-figure style.
 
-Reproduces the common "paper figure" style: the full cloud is rendered in a
-3D view, a rectangle marks a region of interest, and a framed inset shows the
-points inside that region re-drawn at a larger scale (real re-render, not a
-blurry pixel crop).
+Single-cloud mode reproduces the common "paper figure" layout: the cloud is
+rendered in a 3D view, a rectangle marks a region of interest, and a framed
+inset re-draws the points inside that region at a larger scale (a real
+re-render, not a blurry pixel crop).
+
+Passing several clouds renders a one-row comparison (one column per method):
+same camera, same zoom box position in every column, and a color scale shared
+across all columns so the methods are directly comparable.
+
+Coloring (highest priority first):
+  --mesh MESH        per-point point-to-face distance to a clean mesh,
+                     mapped through a light->dark-blue "Clean -> Noisy"
+                     gradient (needs point_cloud_utils)
+  --color-col K      0-based input column used as a color scalar
+  --color HEX        flat color (default soft lavender)
 
 Point cloud formats: .npy / .npz (first array), .txt / .xyz / .pts
-(whitespace, ';' or ',' separated; first 3 columns are XYZ, an optional 4th
-column can be used as a scalar for coloring via --color-col).
+(whitespace, ';' or ',' separated; first 3 columns are XYZ).
 
 Region selection (choose one):
-  --box FX,FY,FW,FH      rectangle in image fractions (origin at the TOP-LEFT
-                         of the saved image, like an image viewer), e.g.
-                         0.10,0.30,0.25,0.25
+  --box FX,FY,FW,FH  rectangle as fractions of one column cell, origin at the
+                     TOP-LEFT (like an image viewer), e.g. 0.10,0.30,0.25,0.25
   --center X,Y,Z --radius R
-                         all points within a 3D sphere; the drawn rectangle is
-                         the projected bounding box of those points
-  --index I --radius R   like --center but the sphere is centered on point I
-  --pick                 click twice on an interactive window to define the
-                         rectangle (needs a display)
+                     points inside a 3D sphere; the drawn rectangle is their
+                     projected bounding box (aligned across columns for free)
+  --index I --radius R
+                     like --center, centered on point I of the FIRST cloud
+  --pick             click twice on an interactive window (single cloud only)
 
-Typical usage:
-  python tools/visualize_zoom.py vis/denoised.txt out.png \
-      --box 0.12,0.35,0.22,0.22 --inset 0.55,0.52,0.42,0.42 \
-      --elev 20 --azim -60 --point-size 2
+Typical single-figure usage:
+  python tools/visualize_zoom.py denoised.xyz out.png \
+      --mesh clean_mesh.off --box 0.12,0.35,0.22,0.22 --colorbar
 
-Overlay a second cloud (e.g. noisy input in red over the denoised result):
-  python tools/visualize_zoom.py denoised.txt out.png --color '#6d76d8' \
-      --overlay noisy.txt --overlay-color '#e2574c' --box 0.4,0.4,0.2,0.2
+Paper-style comparison row (shared color scale, one colorbar):
+  python tools/visualize_zoom.py noisy.xyz m1.xyz m2.xyz ours.xyz row.png \
+      --mesh clean_mesh.off --box 0.55,0.2,0.25,0.25 --colorbar \
+      --titles "Noisy,Method A,Method B,Ours"
+
+To keep colors comparable across SEPARATE runs, reuse the vmin/vmax that the
+script prints via --vmin/--vmax.
 """
 
 import argparse
@@ -43,8 +55,12 @@ if not os.environ.get("DISPLAY") and "--pick" not in sys.argv:
 
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle, ConnectionPatch
-from matplotlib.colors import to_rgba
+from matplotlib.colors import to_rgba, LinearSegmentedColormap
 from mpl_toolkits.mplot3d import proj3d
+
+# Light -> dark blue gradient mimicking the PD-Flow "Clean -> Noisy" figures.
+CLEAN_NOISY = LinearSegmentedColormap.from_list(
+    "clean-noisy", ["#f5f5fc", "#8e97dd", "#2b3a9e"])
 
 
 def load_points(path):
@@ -79,9 +95,16 @@ def parse_floats(text, n, name):
     return vals
 
 
-def image_frac_to_fig(fx, fy, fw, fh):
-    """Convert a top-left-origin image-fraction rect to figure coords."""
-    return fx, 1.0 - fy - fh, fw, fh
+def p2f_distance(pts, mesh_path):
+    """Unsigned per-point distance to a clean mesh."""
+    try:
+        import point_cloud_utils as pcu
+    except ImportError:
+        raise SystemExit("--mesh needs point_cloud_utils: pip install point-cloud-utils")
+    v, f = pcu.load_mesh_vf(mesh_path)
+    sdf, _, _ = pcu.signed_distance_to_mesh(
+        np.ascontiguousarray(pts, dtype=np.float64), v.astype(np.float64), f)
+    return np.abs(sdf)
 
 
 def pick_box(fig):
@@ -107,153 +130,263 @@ def pick_box(fig):
     return fx0, fy0, fx1 - fx0, fy1 - fy0
 
 
-def main():
+def cell_rect_to_fig(cell, fx, fy, fw, fh):
+    """Top-left-origin fractions of a column cell -> figure-fraction rect."""
+    cx, cy, cw, ch = cell
+    return cx + fx * cw, cy + (1.0 - fy - fh) * ch, fw * cw, fh * ch
+
+
+def build_parser():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("input", help="point cloud file (.txt/.xyz/.pts/.npy/.npz)")
-    ap.add_argument("output", help="output image path (.png/.pdf/...)")
-    ap.add_argument("--box", help="zoom region as image fractions FX,FY,FW,FH (top-left origin)")
+    ap.add_argument("paths", nargs="+", metavar="INPUT... OUTPUT",
+                    help="one or more point cloud files followed by the output image")
+    ap.add_argument("--box", help="zoom region as cell fractions FX,FY,FW,FH (top-left origin)")
     ap.add_argument("--center", help="zoom region center in 3D coords X,Y,Z (with --radius)")
-    ap.add_argument("--index", type=int, help="zoom region centered on point INDEX (with --radius)")
+    ap.add_argument("--index", type=int,
+                    help="zoom region centered on point INDEX of the first cloud (with --radius)")
     ap.add_argument("--radius", type=float, help="3D radius for --center/--index selection")
-    ap.add_argument("--pick", action="store_true", help="pick the region interactively (2 clicks)")
+    ap.add_argument("--pick", action="store_true",
+                    help="pick the region interactively, 2 clicks (single cloud only)")
     ap.add_argument("--inset", default="0.52,0.50,0.44,0.44",
-                    help="inset position as image fractions FX,FY,FW,FH (default lower-right)")
+                    help="inset position as cell fractions FX,FY,FW,FH (default lower-right)")
+    ap.add_argument("--mesh", help="clean mesh (.off/.obj/.ply): color points by P2F distance")
+    ap.add_argument("--eps", type=float, default=0.0,
+                    help="P2F distances below this absolute value count as perfectly clean")
+    ap.add_argument("--vmin", type=float, help="fixed lower bound of the color scale")
+    ap.add_argument("--vmax", type=float,
+                    help="fixed upper bound of the color scale (default: 99th percentile "
+                         "over ALL inputs; the value used is printed for reuse)")
+    ap.add_argument("--gamma", type=float, default=1.0,
+                    help="nonlinearity applied to the normalized distance (e.g. 0.7)")
+    ap.add_argument("--colorbar", action="store_true",
+                    help="draw a Clean->Noisy gradient legend above the figure")
+    ap.add_argument("--titles", help="comma-separated per-column titles (method names)")
     ap.add_argument("--elev", type=float, default=20, help="camera elevation (default 20)")
     ap.add_argument("--azim", type=float, default=-60, help="camera azimuth (default -60)")
     ap.add_argument("--point-size", type=float, default=2.0, help="marker area in the main view")
     ap.add_argument("--max-zoom-scale", type=float, default=200.0,
                     help="cap on the marker-area magnification in the inset")
     ap.add_argument("--color", default="#b9bce8",
-                    help="flat point color (default soft lavender, like the reference figure)")
-    ap.add_argument("--edge-color", default="#8d90c4", help="marker edge color ('' disables)")
+                    help="flat point color used when neither --mesh nor --color-col is given")
+    ap.add_argument("--edge-color", default="auto",
+                    help="marker edge color; 'auto' darkens each point's own color, '' disables")
     ap.add_argument("--color-col", type=int,
                     help="0-based column of the input used as a scalar for coloring")
-    ap.add_argument("--cmap", default="coolwarm", help="colormap for --color-col")
-    ap.add_argument("--overlay", help="optional second point cloud drawn on top (e.g. noise)")
+    ap.add_argument("--cmap", help="matplotlib colormap overriding the default "
+                                   "(clean-noisy for --mesh, coolwarm for --color-col)")
+    ap.add_argument("--overlay", help="second cloud drawn on top, single input only (e.g. noise)")
     ap.add_argument("--overlay-color", default="#e2574c", help="color of the overlay cloud")
     ap.add_argument("--overlay-point-size", type=float, help="marker area of the overlay cloud")
     ap.add_argument("--frame-color", default="#17798e", help="color of the box and inset frame")
     ap.add_argument("--frame-width", type=float, default=4.0, help="inset frame line width")
     ap.add_argument("--connect", action="store_true", help="draw lines linking box and inset")
-    ap.add_argument("--figsize", type=float, default=8.0, help="figure size in inches (square)")
+    ap.add_argument("--figsize", type=float, default=8.0,
+                    help="size of one square column cell in inches")
     ap.add_argument("--dpi", type=int, default=300, help="output resolution")
     ap.add_argument("--bg", default="white", help="background color")
-    args = ap.parse_args()
+    return ap
 
-    data = load_points(args.input)
-    pts = data[:, :3]
-    n_base = len(pts)
 
-    # Per-point colors for the base cloud.
-    if args.color_col is not None:
-        scalars = data[:, args.color_col]
-        norm = plt.Normalize(scalars.min(), scalars.max())
-        colors = plt.get_cmap(args.cmap)(norm(scalars))
+def resolve_colors(clouds, data_list, args):
+    """Per-cloud RGBA arrays; scalar-based modes share one normalization."""
+    if args.mesh:
+        dists = [p2f_distance(pts, args.mesh) for pts in clouds]
+        if args.eps > 0:
+            dists = [np.where(d < args.eps, 0.0, d) for d in dists]
+        scalars, default_cmap = dists, CLEAN_NOISY
+    elif args.color_col is not None:
+        scalars, default_cmap = [d[:, args.color_col] for d in data_list], "coolwarm"
     else:
-        colors = np.tile(to_rgba(args.color), (n_base, 1))
+        return [np.tile(to_rgba(args.color), (len(pts), 1)) for pts in clouds]
 
-    sizes = np.full(n_base, args.point_size)
+    stacked = np.concatenate(scalars)
+    vmin = args.vmin if args.vmin is not None else float(stacked.min())
+    vmax = args.vmax if args.vmax is not None else (
+        float(np.percentile(stacked, 99)) if args.mesh else float(stacked.max()))
+    if args.mesh and args.vmin is None:
+        vmin = 0.0
+    print(f"color scale: --vmin {vmin:.6g} --vmax {vmax:.6g}  "
+          "(pass these to other runs to keep colors comparable)")
+
+    cmap = plt.get_cmap(args.cmap) if args.cmap else (
+        default_cmap if args.mesh else plt.get_cmap(default_cmap))
+    out = []
+    for s in scalars:
+        t = np.clip((s - vmin) / (vmax - vmin + 1e-12), 0.0, 1.0) ** args.gamma
+        out.append(cmap(t))
+    return out
+
+
+def edge_colors_for(colors, args):
+    if args.edge_color == "auto":
+        edges = colors.copy()
+        edges[:, :3] *= 0.75
+        return edges
+    return args.edge_color or "none"
+
+
+def main():
+    args = build_parser().parse_args()
+    if len(args.paths) < 2:
+        raise SystemExit("need at least one input cloud and the output image path")
+    inputs, output = args.paths[:-1], args.paths[-1]
+    n_cols = len(inputs)
+    if n_cols > 1 and args.pick:
+        raise SystemExit("--pick works with a single input cloud only")
+    if n_cols > 1 and args.overlay:
+        raise SystemExit("--overlay works with a single input cloud only")
+
+    data_list = [load_points(p) for p in inputs]
+    clouds = [d[:, :3] for d in data_list]
+    colors = resolve_colors(clouds, data_list, args)
+    sizes = [np.full(len(pts), args.point_size) for pts in clouds]
 
     if args.overlay:
         over = load_points(args.overlay)[:, :3]
-        pts = np.vstack([pts, over])
-        colors = np.vstack([colors, np.tile(to_rgba(args.overlay_color), (len(over), 1))])
+        clouds[0] = np.vstack([clouds[0], over])
+        colors[0] = np.vstack([colors[0],
+                               np.tile(to_rgba(args.overlay_color), (len(over), 1))])
         over_size = args.overlay_point_size or args.point_size
-        sizes = np.concatenate([sizes, np.full(len(over), over_size)])
+        sizes[0] = np.concatenate([sizes[0], np.full(len(over), over_size)])
 
-    edge = args.edge_color or "none"
+    titles = None
+    if args.titles:
+        titles = [t.strip() for t in args.titles.split(",")]
+        if len(titles) != n_cols:
+            raise SystemExit(f"--titles has {len(titles)} entries for {n_cols} inputs")
 
-    # ---- main 3D view ----------------------------------------------------
-    fig = plt.figure(figsize=(args.figsize, args.figsize), facecolor=args.bg)
-    ax = fig.add_axes([0.0, 0.0, 1.0, 1.0], projection="3d")
-    ax.set_axis_off()
-    ax.view_init(elev=args.elev, azim=args.azim)
-    lo, hi = pts.min(), pts.max()
+    # ---- figure layout: one square cell per column + optional top strip ---
+    cell_in = args.figsize
+    strip_in = (0.45 if titles else 0.0) + (0.55 if args.colorbar else 0.0)
+    fig_w, fig_h = n_cols * cell_in, cell_in + strip_in
+    fig = plt.figure(figsize=(fig_w, fig_h), facecolor=args.bg)
+    cell_h = cell_in / fig_h
+    cells = [(i / n_cols, 0.0, 1.0 / n_cols, cell_h) for i in range(n_cols)]
+
+    # Shared axes bounds so every column is rendered at the same scale.
+    lo = min(pts.min() for pts in clouds)
+    hi = max(pts.max() for pts in clouds)
     pad = 0.05 * (hi - lo)
-    for setter in (ax.set_xlim, ax.set_ylim, ax.set_zlim):
-        setter(lo - pad, hi + pad)
-    ax.set_box_aspect((1, 1, 1))
-    ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], c=colors, s=sizes,
-               edgecolors=edge, linewidths=0.25, depthshade=True)
+
+    axes = []
+    for cell, pts, cols, szs in zip(cells, clouds, colors, sizes):
+        ax = fig.add_axes(cell, projection="3d")
+        ax.set_axis_off()
+        ax.view_init(elev=args.elev, azim=args.azim)
+        for setter in (ax.set_xlim, ax.set_ylim, ax.set_zlim):
+            setter(lo - pad, hi + pad)
+        ax.set_box_aspect((1, 1, 1))
+        edges = edge_colors_for(cols, args)
+        ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], c=cols, s=szs,
+                   edgecolors=edges, linewidths=0.25, depthshade=True)
+        axes.append((ax, edges))
 
     fig.canvas.draw()  # transforms are only valid after a draw
 
-    # Project every point into the figure to know where it lands on screen.
-    px, py, pz = proj3d.proj_transform(pts[:, 0], pts[:, 1], pts[:, 2], ax.get_proj())
-    disp = ax.transData.transform(np.column_stack([px, py]))
-    frac = fig.transFigure.inverted().transform(disp)  # figure fractions
-
-    # ---- resolve the zoom region into a figure-fraction rectangle --------
-    mask = None
-    if args.pick:
-        bx, by, bw, bh = pick_box(fig)
-    elif args.box:
-        bx, by, bw, bh = image_frac_to_fig(*parse_floats(args.box, 4, "box"))
-    elif args.center or args.index is not None:
+    # ---- zoom region per column -------------------------------------------
+    box_cell = parse_floats(args.box, 4, "box") if args.box else None
+    center3d = None
+    if args.center or args.index is not None:
         if args.radius is None:
             raise SystemExit("--center/--index also needs --radius")
-        center = (np.array(parse_floats(args.center, 3, "center"))
-                  if args.center else pts[args.index])
-        mask = np.linalg.norm(pts - center, axis=1) <= args.radius
-        if not mask.any():
-            raise SystemExit("no points inside the given sphere")
-        sel = frac[mask]
-        margin = 0.01
-        bx, by = sel[:, 0].min() - margin, sel[:, 1].min() - margin
-        bw = sel[:, 0].max() - sel[:, 0].min() + 2 * margin
-        bh = sel[:, 1].max() - sel[:, 1].min() + 2 * margin
-    else:
+        center3d = (np.array(parse_floats(args.center, 3, "center"))
+                    if args.center else clouds[0][args.index])
+    elif not (args.box or args.pick):
         raise SystemExit("select a region with --box, --center/--radius, --index or --pick")
 
-    if mask is None:
-        mask = ((frac[:, 0] >= bx) & (frac[:, 0] <= bx + bw)
-                & (frac[:, 1] >= by) & (frac[:, 1] <= by + bh))
-    if not mask.any():
-        raise SystemExit("the selected rectangle contains no points")
+    inset_cell = parse_floats(args.inset, 4, "inset")
 
-    # Rectangle marking the region on the main view.
-    fig.add_artist(Rectangle((bx, by), bw, bh, transform=fig.transFigure,
-                             fill=False, edgecolor=args.frame_color,
-                             linewidth=max(1.5, args.frame_width * 0.45), zorder=10))
+    for col, (cell, pts, cols, szs, (ax, edges)) in enumerate(
+            zip(cells, clouds, colors, sizes, axes)):
+        px, py, pz = proj3d.proj_transform(pts[:, 0], pts[:, 1], pts[:, 2], ax.get_proj())
+        disp = ax.transData.transform(np.column_stack([px, py]))
+        frac = fig.transFigure.inverted().transform(disp)
 
-    # ---- inset: re-draw the selected points, magnified -------------------
-    ix, iy, iw, ih = image_frac_to_fig(*parse_floats(args.inset, 4, "inset"))
-    inset = fig.add_axes([ix, iy, iw, ih], facecolor=args.bg)
-    inset.set_xticks([])
-    inset.set_yticks([])
-    for spine in inset.spines.values():
-        spine.set_edgecolor(args.frame_color)
-        spine.set_linewidth(args.frame_width)
+        mask = None
+        if args.pick:
+            bx, by, bw, bh = pick_box(fig)
+            cx, cy, cw, ch = cell
+            print("picked region: --box %.3f,%.3f,%.3f,%.3f" % (
+                (bx - cx) / cw, 1.0 - (by - cy + bh) / ch, bw / cw, bh / ch))
+        elif box_cell:
+            bx, by, bw, bh = cell_rect_to_fig(cell, *box_cell)
+        else:
+            mask = np.linalg.norm(pts - center3d, axis=1) <= args.radius
+            if not mask.any():
+                raise SystemExit(f"{inputs[col]}: no points inside the given sphere")
+            sel = frac[mask]
+            margin = 0.01 * cell[2]
+            bx, by = sel[:, 0].min() - margin, sel[:, 1].min() - margin
+            bw = sel[:, 0].max() - sel[:, 0].min() + 2 * margin
+            bh = sel[:, 1].max() - sel[:, 1].min() + 2 * margin
 
-    # Inset limits in projected data coordinates = the rectangle we drew.
-    inv = ax.transData.inverted()
-    corners_disp = fig.transFigure.transform([[bx, by], [bx + bw, by + bh]])
-    (dx0, dy0), (dx1, dy1) = inv.transform(corners_disp)
-    inset.set_xlim(dx0, dx1)
-    inset.set_ylim(dy0, dy1)
-    inset.set_aspect("equal", adjustable="datalim")
+        if mask is None:
+            mask = ((frac[:, 0] >= bx) & (frac[:, 0] <= bx + bw)
+                    & (frac[:, 1] >= by) & (frac[:, 1] <= by + bh))
+        if not mask.any():
+            raise SystemExit(f"{inputs[col]}: the selected rectangle contains no points")
 
-    # Painter's algorithm: draw far points first, like mplot3d does.
-    order = np.flatnonzero(mask)[np.argsort(pz[mask])[::-1]]
-    zoom = min(iw / bw, ih / bh)
-    scale = min(zoom ** 2, args.max_zoom_scale)
-    inset.scatter(px[order], py[order], c=colors[order], s=sizes[order] * scale,
-                  edgecolors=edge, linewidths=0.25 * np.sqrt(scale))
+        fig.add_artist(Rectangle((bx, by), bw, bh, transform=fig.transFigure,
+                                 fill=False, edgecolor=args.frame_color,
+                                 linewidth=max(1.5, args.frame_width * 0.45), zorder=10))
 
-    if args.connect:
-        for cx, cy in ((bx + bw, by), (bx + bw, by + bh)):
-            fig.add_artist(ConnectionPatch(
-                xyA=(cx, cy), coordsA=fig.transFigure,
-                xyB=(ix, iy if cy == by else iy + ih), coordsB=fig.transFigure,
-                color=args.frame_color, linewidth=1.0, zorder=9))
+        ix, iy, iw, ih = cell_rect_to_fig(cell, *inset_cell)
+        inset = fig.add_axes([ix, iy, iw, ih], facecolor=args.bg)
+        inset.set_xticks([])
+        inset.set_yticks([])
+        for spine in inset.spines.values():
+            spine.set_edgecolor(args.frame_color)
+            spine.set_linewidth(args.frame_width)
 
-    fig.savefig(args.output, dpi=args.dpi, facecolor=args.bg)
-    print(f"saved {args.output}  ({int(mask.sum())} points in the inset, zoom x{zoom:.1f})")
-    if args.pick:
-        img_box = (bx, 1.0 - by - bh, bw, bh)
-        print("re-run without --pick using: --box %.3f,%.3f,%.3f,%.3f" % img_box)
+        # Inset limits in projected data coordinates = the rectangle we drew.
+        inv = ax.transData.inverted()
+        (dx0, dy0), (dx1, dy1) = inv.transform(
+            fig.transFigure.transform([[bx, by], [bx + bw, by + bh]]))
+        inset.set_xlim(dx0, dx1)
+        inset.set_ylim(dy0, dy1)
+        inset.set_aspect("equal", adjustable="datalim")
+
+        # Painter's algorithm: draw far points first, like mplot3d does.
+        order = np.flatnonzero(mask)[np.argsort(pz[mask])[::-1]]
+        zoom = min(iw / bw, ih / bh)
+        scale = min(zoom ** 2, args.max_zoom_scale)
+        inset_edges = edges[order] if isinstance(edges, np.ndarray) else edges
+        inset.scatter(px[order], py[order], c=cols[order], s=szs[order] * scale,
+                      edgecolors=inset_edges, linewidths=0.25 * np.sqrt(scale))
+
+        if args.connect:
+            for corner_y in (by, by + bh):
+                fig.add_artist(ConnectionPatch(
+                    xyA=(bx + bw, corner_y), coordsA=fig.transFigure,
+                    xyB=(ix, iy if corner_y == by else iy + ih), coordsB=fig.transFigure,
+                    color=args.frame_color, linewidth=1.0, zorder=9))
+
+        if titles:
+            fig.text(cell[0] + cell[2] / 2, cell_h + 0.12 / fig_h, titles[col],
+                     ha="center", va="bottom", fontsize=16)
+        print(f"{inputs[col]}: {int(mask.sum())} points in the inset, zoom x{zoom:.1f}")
+
+    # ---- Clean -> Noisy legend --------------------------------------------
+    if args.colorbar:
+        cmap = plt.get_cmap(args.cmap) if args.cmap else CLEAN_NOISY
+        bar_w, bar_h = min(0.16, 1.6 / fig_w), 0.16 / fig_h
+        bar_y = 1.0 - (0.36 / fig_h)
+        bar_x = 1.0 - bar_w - 0.9 / fig_w
+        cax = fig.add_axes([bar_x, bar_y, bar_w, bar_h])
+        cax.imshow(np.linspace(0, 1, 256)[None, :], aspect="auto", cmap=cmap)
+        cax.set_xticks([])
+        cax.set_yticks([])
+        for spine in cax.spines.values():
+            spine.set_linewidth(0.5)
+        fig.text(bar_x - 0.08 / fig_w, bar_y + bar_h / 2, "Clean",
+                 ha="right", va="center", fontsize=16)
+        fig.text(bar_x + bar_w + 0.08 / fig_w, bar_y + bar_h / 2, "Noisy",
+                 ha="left", va="center", fontsize=16)
+
+    fig.savefig(output, dpi=args.dpi, facecolor=args.bg)
+    print(f"saved {output}")
 
 
 if __name__ == "__main__":
