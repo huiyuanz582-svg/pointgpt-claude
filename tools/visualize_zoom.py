@@ -144,6 +144,19 @@ def pick_box(fig):
     return fx0, fy0, fx1 - fx0, fy1 - fy0
 
 
+def to_z_up(pts, up):
+    """Rotate points so the chosen data axis becomes the screen-vertical z.
+
+    Uses proper rotations (no mirroring), so the model keeps its handedness.
+    Works with any matplotlib version, unlike view_init(vertical_axis=...).
+    """
+    if up == "y":  # +90 deg about x: (x, y, z) -> (x, -z, y)
+        return pts[:, [0, 2, 1]] * np.array([1.0, -1.0, 1.0])
+    if up == "x":  # +90 deg about y: (x, y, z) -> (-z, y, x)
+        return pts[:, [2, 1, 0]] * np.array([-1.0, 1.0, 1.0])
+    return pts
+
+
 def cell_rect_to_fig(cell, fx, fy, fw, fh):
     """Top-left-origin fractions of a grid cell -> figure-fraction rect."""
     cx, cy, cw, ch = cell
@@ -193,9 +206,12 @@ def build_parser():
                     help="camera azimuth, default -60; repeatable, one per row")
     ap.add_argument("--up", action="append", choices=["x", "y", "z"],
                     help="which data axis points up on screen (default z; PUNet/"
-                         "ShapeNet-style models are usually y-up); repeatable, one per row")
+                         "ShapeNet-style models are usually y-up); with it, --azim "
+                         "spins the model about its natural vertical axis; "
+                         "repeatable, one per row")
     ap.add_argument("--roll", type=float, action="append",
-                    help="camera roll in degrees, default 0; repeatable, one per row")
+                    help="camera roll in degrees, default 0 (needs matplotlib >= 3.6); "
+                         "repeatable, one per row")
     ap.add_argument("--point-size", type=float, default=2.0, help="marker area in the main view")
     ap.add_argument("--max-zoom-scale", type=float, default=200.0,
                     help="cap on the marker-area magnification in the inset")
@@ -345,6 +361,11 @@ def main():
         grid_sizes[0][0] = np.concatenate([grid_sizes[0][0],
                                            np.full(len(over), over_size)])
 
+    # Display-only rotation, after colors are computed on original coords.
+    if any(u != "z" for u in ups):
+        grid_clouds = [[to_z_up(pts, ups[r]) for pts in row]
+                       for r, row in enumerate(grid_clouds)]
+
     titles = None
     if args.titles:
         titles = [t.strip() for t in args.titles.split(",")]
@@ -369,8 +390,13 @@ def main():
             cell = (c / n_cols, (n_rows - 1 - r) * cell_h, 1.0 / n_cols, cell_h)
             ax = fig.add_axes(cell, projection="3d")
             ax.set_axis_off()
-            ax.view_init(elev=elevs[r], azim=azims[r], roll=rolls[r],
-                         vertical_axis=ups[r])
+            try:
+                ax.view_init(elev=elevs[r], azim=azims[r], roll=rolls[r])
+            except TypeError:
+                if rolls[r]:
+                    raise SystemExit("--roll needs matplotlib >= 3.6 "
+                                     "(pip install -U matplotlib)")
+                ax.view_init(elev=elevs[r], azim=azims[r])
             for setter in (ax.set_xlim, ax.set_ylim, ax.set_zlim):
                 setter(lo - pad, hi + pad)
             ax.set_box_aspect((1, 1, 1))
@@ -387,7 +413,9 @@ def main():
     for r in range(n_rows):
         center3d = None
         if not args.box and not args.pick:
-            center3d = (centers[r] if args.center
+            # --center is given in original coords; --index picks an already
+            # rotated point, so only the former needs the display rotation.
+            center3d = (to_z_up(centers[r][None, :], ups[r])[0] if args.center
                         else grid_clouds[r][0][centers[r]])
         for c in range(n_cols):
             cell, ax, edges = axes[r][c]
