@@ -98,6 +98,38 @@ def is_image(path):
     return os.path.splitext(path)[1].lower() in IMAGE_EXTS
 
 
+def load_image(path):
+    img = plt.imread(path)
+    if img.ndim == 2:  # grayscale -> RGB
+        img = np.stack([img] * 3, axis=-1)
+    rgb = img[..., :3].astype(np.float64)
+    if rgb.max() > 1.0:
+        rgb /= 255.0
+    return rgb
+
+
+def tint_image(img, color, threshold):
+    """Recolor an image's foreground (the points) with `color`.
+
+    The background color is estimated from the image corners; every pixel
+    sufficiently different from it counts as foreground and is replaced by
+    the tint scaled by the pixel's original luminance, so splat shading and
+    anti-aliased edges survive the recoloring.
+    """
+    h, w = img.shape[:2]
+    k = max(2, min(h, w) // 50)
+    corners = np.concatenate([img[:k, :k].reshape(-1, 3), img[:k, -k:].reshape(-1, 3),
+                              img[-k:, :k].reshape(-1, 3), img[-k:, -k:].reshape(-1, 3)])
+    bg = np.median(corners, axis=0)
+    fg = np.linalg.norm(img - bg, axis=-1) > threshold
+    if not fg.any():
+        return img
+    lum = img @ np.array([0.299, 0.587, 0.114])
+    out = img.copy()
+    out[fg] = np.asarray(to_rgba(color)[:3]) * lum[fg, None]
+    return out
+
+
 def load_points(path):
     ext = os.path.splitext(path)[1].lower()
     if ext == ".npy":
@@ -252,12 +284,23 @@ def build_parser():
                     help="0-based column of the input used as a scalar for coloring")
     ap.add_argument("--cmap", help="matplotlib colormap overriding the default "
                                    "(clean-noisy for --mesh, coolwarm for --color-col)")
+    ap.add_argument("--tint",
+                    help="recolor the foreground of IMAGE inputs with this color "
+                         "(e.g. '#4a6fd8' to turn white points blue); the background "
+                         "is auto-detected from the image corners and kept as is")
+    ap.add_argument("--tint-threshold", type=float, default=0.1,
+                    help="how different from the background a pixel must be to count "
+                         "as foreground for --tint (0-1, default 0.1)")
     ap.add_argument("--overlay", help="second cloud drawn on top, single input only (e.g. noise)")
     ap.add_argument("--overlay-color", default="#e2574c", help="color of the overlay cloud")
     ap.add_argument("--overlay-point-size", type=float, help="marker area of the overlay cloud")
     ap.add_argument("--frame-color", default="#17798e", help="color of the box and inset frame")
     ap.add_argument("--frame-width", type=float, default=4.0, help="inset frame line width")
     ap.add_argument("--connect", action="store_true", help="draw lines linking box and inset")
+    ap.add_argument("--fit-percentile", type=float, default=100.0,
+                    help="fit the view to this central percentile of the coordinates "
+                         "(default 100 = all points); lower it to ~99 when far "
+                         "outliers make the model tiny")
     ap.add_argument("--figsize", type=float, default=8.0,
                     help="size of one square grid cell in inches")
     ap.add_argument("--dpi", type=int, default=300, help="output resolution")
@@ -401,7 +444,10 @@ def main():
         drow, crow = [], []
         for p in row:
             if is_image(p):
-                drow.append(plt.imread(p))
+                img = load_image(p)
+                if args.tint:
+                    img = tint_image(img, args.tint, args.tint_threshold)
+                drow.append(img)
                 crow.append(None)
             else:
                 d = load_points(p)
@@ -451,11 +497,16 @@ def main():
     axes = []
     for r in range(n_rows):
         # Shared bounds per row so all methods render at the same scale.
+        # Per-axis and centered: real-world scans sit far from the origin
+        # with unequal extents, so a global min/max would shrink the model.
         row_pts = [pts for pts in grid_clouds[r] if pts is not None]
         if row_pts:
-            lo = min(pts.min() for pts in row_pts)
-            hi = max(pts.max() for pts in row_pts)
-            pad = 0.05 * (hi - lo)
+            all_pts = np.vstack(row_pts)
+            q = (100.0 - args.fit_percentile) / 2.0
+            mins = np.percentile(all_pts, q, axis=0)
+            maxs = np.percentile(all_pts, 100.0 - q, axis=0)
+            ctr = (mins + maxs) / 2.0
+            half = float((maxs - mins).max()) * 0.5 * 1.05 + 1e-12
         row_axes = []
         for c in range(n_cols):
             cell = (c / n_cols, (n_rows - 1 - r) * cell_h, 1.0 / n_cols, cell_h)
@@ -474,8 +525,8 @@ def main():
                     raise SystemExit("--roll needs matplotlib >= 3.6 "
                                      "(pip install -U matplotlib)")
                 ax.view_init(elev=elevs[r], azim=azims[r])
-            for setter in (ax.set_xlim, ax.set_ylim, ax.set_zlim):
-                setter(lo - pad, hi + pad)
+            for axis, setter in enumerate((ax.set_xlim, ax.set_ylim, ax.set_zlim)):
+                setter(ctr[axis] - half, ctr[axis] + half)
             ax.set_box_aspect((1, 1, 1))
             pts, cols = grid_clouds[r][c], grid_colors[r][c]
             edges = edge_colors_for(cols, args)
