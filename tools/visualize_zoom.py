@@ -26,6 +26,12 @@ Coloring (highest priority first):
 Point cloud formats: .npy / .npz (first array), .txt / .xyz / .pts
 (whitespace, ';' or ',' separated; first 3 columns are XYZ).
 
+Inputs may also be IMAGES (.bmp/.png/.jpg/...), e.g. screenshots rendered by
+another tool: they are placed in their cells unchanged, and --mark / --box /
+--inset then work in fractions of the image itself (top-left origin). For an
+image, the inset is an enlarged pixel crop; --center/--index/--pick and the
+coloring options do not apply.
+
 Region selection (choose one style for all rows):
   --box FX,FY,FW,FH  rectangle as fractions of one column cell, origin at the
                      TOP-LEFT (like an image viewer), e.g. 0.10,0.30,0.25,0.25
@@ -83,6 +89,13 @@ from mpl_toolkits.mplot3d import proj3d
 # Light -> dark blue gradient mimicking the PD-Flow "Clean -> Noisy" figures.
 CLEAN_NOISY = LinearSegmentedColormap.from_list(
     "clean-noisy", ["#f5f5fc", "#8e97dd", "#2b3a9e"])
+
+
+IMAGE_EXTS = {".bmp", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".gif"}
+
+
+def is_image(path):
+    return os.path.splitext(path)[1].lower() in IMAGE_EXTS
 
 
 def load_points(path):
@@ -290,21 +303,30 @@ def per_row(values, n_rows, name, default=None):
 
 
 def resolve_colors(grid_clouds, grid_data, meshes, args):
-    """Per-cloud RGBA arrays; scalar-based modes share one normalization."""
+    """Per-cloud RGBA arrays (None for image cells); scalar modes share one scale."""
+    colors = [[None] * len(row) for row in grid_clouds]
+    cloud_cells = [(r, c) for r, row in enumerate(grid_clouds)
+                   for c, pts in enumerate(row) if pts is not None]
+    if not cloud_cells:
+        if meshes[0]:
+            print("note: --mesh has no effect, all inputs are images")
+        return colors
+
     if meshes[0]:
-        scalars = [[p2f_distance(pts, meshes[r]) for pts in row]
-                   for r, row in enumerate(grid_clouds)]
+        scalars = {(r, c): p2f_distance(grid_clouds[r][c], meshes[r])
+                   for r, c in cloud_cells}
         if args.eps > 0:
-            scalars = [[np.where(d < args.eps, 0.0, d) for d in row] for row in scalars]
+            scalars = {rc: np.where(s < args.eps, 0.0, s) for rc, s in scalars.items()}
         default_cmap = CLEAN_NOISY
     elif args.color_col is not None:
-        scalars = [[d[:, args.color_col] for d in row] for row in grid_data]
+        scalars = {(r, c): grid_data[r][c][:, args.color_col] for r, c in cloud_cells}
         default_cmap = plt.get_cmap("coolwarm")
     else:
-        return [[np.tile(to_rgba(args.color), (len(pts), 1)) for pts in row]
-                for row in grid_clouds]
+        for r, c in cloud_cells:
+            colors[r][c] = np.tile(to_rgba(args.color), (len(grid_clouds[r][c]), 1))
+        return colors
 
-    stacked = np.concatenate([s for row in scalars for s in row])
+    stacked = np.concatenate(list(scalars.values()))
     vmin = args.vmin if args.vmin is not None else (
         0.0 if meshes[0] else float(stacked.min()))
     vmax = args.vmax if args.vmax is not None else (
@@ -313,8 +335,10 @@ def resolve_colors(grid_clouds, grid_data, meshes, args):
           "(pass these to other runs to keep colors comparable)")
 
     cmap = plt.get_cmap(args.cmap) if args.cmap else default_cmap
-    return [[cmap(np.clip((s - vmin) / (vmax - vmin + 1e-12), 0.0, 1.0) ** args.gamma)
-             for s in row] for row in scalars]
+    for (r, c), s in scalars.items():
+        colors[r][c] = cmap(
+            np.clip((s - vmin) / (vmax - vmin + 1e-12), 0.0, 1.0) ** args.gamma)
+    return colors
 
 
 def edge_colors_for(colors, args):
@@ -372,13 +396,32 @@ def main():
         raise SystemExit("select a region with --box, --center/--radius, --index or "
                          "--pick, and/or draw highlight boxes with --mark")
 
-    grid_data = [[load_points(p) for p in row] for row in grid_files]
-    grid_clouds = [[d[:, :3] for d in row] for row in grid_data]
+    grid_data, grid_clouds = [], []
+    for row in grid_files:
+        drow, crow = [], []
+        for p in row:
+            if is_image(p):
+                drow.append(plt.imread(p))
+                crow.append(None)
+            else:
+                d = load_points(p)
+                drow.append(d)
+                crow.append(d[:, :3])
+        grid_data.append(drow)
+        grid_clouds.append(crow)
+
+    if any(pts is None for row in grid_clouds for pts in row):
+        if args.center or args.index is not None or args.pick:
+            raise SystemExit("image inputs support --box and --mark only "
+                             "(no --center/--index/--pick)")
+
     grid_colors = resolve_colors(grid_clouds, grid_data, meshes, args)
-    grid_sizes = [[np.full(len(pts), args.point_size) for pts in row]
-                  for row in grid_clouds]
+    grid_sizes = [[np.full(len(pts), args.point_size) if pts is not None else None
+                   for pts in row] for row in grid_clouds]
 
     if args.overlay:
+        if grid_clouds[0][0] is None:
+            raise SystemExit("--overlay needs a point cloud input, not an image")
         over = load_points(args.overlay)[:, :3]
         grid_clouds[0][0] = np.vstack([grid_clouds[0][0], over])
         grid_colors[0][0] = np.vstack([
@@ -389,8 +432,8 @@ def main():
 
     # Display-only rotation, after colors are computed on original coords.
     if any(u != "z" for u in ups):
-        grid_clouds = [[to_z_up(pts, ups[r]) for pts in row]
-                       for r, row in enumerate(grid_clouds)]
+        grid_clouds = [[to_z_up(pts, ups[r]) if pts is not None else None
+                        for pts in row] for r, row in enumerate(grid_clouds)]
 
     titles = None
     if args.titles:
@@ -408,12 +451,20 @@ def main():
     axes = []
     for r in range(n_rows):
         # Shared bounds per row so all methods render at the same scale.
-        lo = min(pts.min() for pts in grid_clouds[r])
-        hi = max(pts.max() for pts in grid_clouds[r])
-        pad = 0.05 * (hi - lo)
+        row_pts = [pts for pts in grid_clouds[r] if pts is not None]
+        if row_pts:
+            lo = min(pts.min() for pts in row_pts)
+            hi = max(pts.max() for pts in row_pts)
+            pad = 0.05 * (hi - lo)
         row_axes = []
         for c in range(n_cols):
             cell = (c / n_cols, (n_rows - 1 - r) * cell_h, 1.0 / n_cols, cell_h)
+            if grid_clouds[r][c] is None:
+                ax = fig.add_axes(cell)
+                ax.imshow(grid_data[r][c])
+                ax.set_axis_off()
+                row_axes.append((cell, ax, None))
+                continue
             ax = fig.add_axes(cell, projection="3d")
             ax.set_axis_off()
             try:
@@ -446,15 +497,47 @@ def main():
         for c in range(n_cols):
             cell, ax, edges = axes[r][c]
 
+            if titles and r == 0:
+                fig.text(cell[0] + cell[2] / 2, n_rows * cell_h + 0.12 / fig_h,
+                         titles[c], ha="center", va="bottom", fontsize=16)
+
+            if grid_clouds[r][c] is None:
+                # Image cell: --mark and --box are fractions of the image
+                # itself, drawn in pixel coordinates (origin top-left).
+                img = grid_data[r][c]
+                h_px, w_px = img.shape[:2]
+                for rect, mcolor, mstyle in marks:
+                    fx, fy, fw, fh = rect
+                    ax.add_patch(Rectangle((fx * w_px, fy * h_px),
+                                           fw * w_px, fh * h_px, fill=False,
+                                           edgecolor=mcolor, linestyle=mstyle,
+                                           linewidth=args.mark_width, zorder=10))
+                if have_region:
+                    fx, fy, fw, fh = boxes[r]
+                    x0, y0, w, h = fx * w_px, fy * h_px, fw * w_px, fh * h_px
+                    ax.add_patch(Rectangle((x0, y0), w, h, fill=False,
+                                           edgecolor=args.frame_color,
+                                           linewidth=max(1.5, args.frame_width * 0.45),
+                                           zorder=10))
+                    inset = fig.add_axes(cell_rect_to_fig(cell, *insets[r]))
+                    inset.imshow(img, interpolation="bilinear")
+                    inset.set_xlim(x0, x0 + w)
+                    inset.set_ylim(y0 + h, y0)  # inverted: image origin is top-left
+                    inset.set_xticks([])
+                    inset.set_yticks([])
+                    for spine in inset.spines.values():
+                        spine.set_edgecolor(args.frame_color)
+                        spine.set_linewidth(args.frame_width)
+                    print(f"{grid_files[r][c]}: image crop "
+                          f"x[{x0:.0f}:{x0 + w:.0f}] y[{y0:.0f}:{y0 + h:.0f}] px")
+                continue
+
             for rect, mcolor, mstyle in marks:
                 mx, my, mw, mh = cell_rect_to_fig(cell, *rect)
                 fig.add_artist(Rectangle((mx, my), mw, mh, transform=fig.transFigure,
                                          fill=False, edgecolor=mcolor,
                                          linewidth=args.mark_width,
                                          linestyle=mstyle, zorder=10))
-            if titles and r == 0:
-                fig.text(cell[0] + cell[2] / 2, n_rows * cell_h + 0.12 / fig_h,
-                         titles[c], ha="center", va="bottom", fontsize=16)
             if not have_region:
                 continue
 
