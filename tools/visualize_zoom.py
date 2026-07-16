@@ -191,6 +191,11 @@ def build_parser():
                     help="camera elevation, default 20; repeatable, one per row")
     ap.add_argument("--azim", type=float, action="append",
                     help="camera azimuth, default -60; repeatable, one per row")
+    ap.add_argument("--up", action="append", choices=["x", "y", "z"],
+                    help="which data axis points up on screen (default z; PUNet/"
+                         "ShapeNet-style models are usually y-up); repeatable, one per row")
+    ap.add_argument("--roll", type=float, action="append",
+                    help="camera roll in degrees, default 0; repeatable, one per row")
     ap.add_argument("--point-size", type=float, default=2.0, help="marker area in the main view")
     ap.add_argument("--max-zoom-scale", type=float, default=200.0,
                     help="cap on the marker-area magnification in the inset")
@@ -305,6 +310,8 @@ def main():
               for t in per_row(args.inset, n_rows, "inset", "0.52,0.50,0.44,0.44")]
     elevs = per_row(args.elev, n_rows, "elev", 20.0)
     azims = per_row(args.azim, n_rows, "azim", -60.0)
+    ups = per_row(args.up, n_rows, "up", "z")
+    rolls = per_row(args.roll, n_rows, "roll", 0.0)
 
     # Region selection: one style shared by all rows, values broadcastable.
     if args.box:
@@ -362,7 +369,8 @@ def main():
             cell = (c / n_cols, (n_rows - 1 - r) * cell_h, 1.0 / n_cols, cell_h)
             ax = fig.add_axes(cell, projection="3d")
             ax.set_axis_off()
-            ax.view_init(elev=elevs[r], azim=azims[r])
+            ax.view_init(elev=elevs[r], azim=azims[r], roll=rolls[r],
+                         vertical_axis=ups[r])
             for setter in (ax.set_xlim, ax.set_ylim, ax.set_zlim):
                 setter(lo - pad, hi + pad)
             ax.set_box_aspect((1, 1, 1))
