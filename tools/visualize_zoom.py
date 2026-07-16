@@ -36,6 +36,14 @@ Region selection (choose one style for all rows):
                      like --center, centered on point I of the row's 1st cloud
   --pick             click twice on an interactive window (single cloud only)
 
+Highlight boxes without insets (real-world scans with no clean mesh):
+  --mark FX,FY,FW,FH[:COLOR[:LINESTYLE]] draws a dashed rectangle at the same
+  relative position in every cell; repeat it for several boxes. Works alone
+  (no --box needed) or together with the inset options, e.g.
+  python tools/visualize_zoom.py noisy.xyz m1.xyz ours.xyz scene.png \
+      --color '#d95f57' --titles "Noisy,Method 1,Ours" \
+      --mark 0.05,0.1,0.3,0.5:#4a7bd0:dashed --mark 0.5,0.55,0.4,0.3:#4a8f5a:dashdot
+
 Typical single-figure usage:
   python tools/visualize_zoom.py denoised.xyz out.png \
       --mesh clean_mesh.off --box 0.12,0.35,0.22,0.22 --colorbar
@@ -183,6 +191,14 @@ def build_parser():
                     help="3D radius for --center/--index; repeatable, one per row")
     ap.add_argument("--pick", action="store_true",
                     help="pick the region interactively, 2 clicks (single cloud only)")
+    ap.add_argument("--mark", action="append",
+                    help="highlight rectangle drawn in EVERY cell (no inset), as cell "
+                         "fractions FX,FY,FW,FH[:COLOR[:LINESTYLE]] with top-left "
+                         "origin, e.g. 0.05,0.1,0.3,0.5:#4a7bd0:dashed ; linestyles: "
+                         "solid/dashed/dashdot/dotted; repeat for several boxes; can "
+                         "be used alone or together with --box/--center")
+    ap.add_argument("--mark-width", type=float, default=2.0,
+                    help="line width of --mark rectangles")
     ap.add_argument("--inset", action="append",
                     help="inset position as cell fractions FX,FY,FW,FH (default "
                          "lower-right); repeatable, one per row")
@@ -329,7 +345,16 @@ def main():
     ups = per_row(args.up, n_rows, "up", "z")
     rolls = per_row(args.roll, n_rows, "roll", 0.0)
 
+    marks = []
+    for text in args.mark or []:
+        parts = text.split(":")
+        rect = parse_floats(parts[0], 4, "mark")
+        color = parts[1] if len(parts) > 1 and parts[1] else args.frame_color
+        style = parts[2] if len(parts) > 2 and parts[2] else "dashed"
+        marks.append((rect, color, style))
+
     # Region selection: one style shared by all rows, values broadcastable.
+    have_region = bool(args.box or args.center or args.index is not None or args.pick)
     if args.box:
         boxes = [parse_floats(t, 4, "box") for t in per_row(args.box, n_rows, "box")]
         centers = None
@@ -343,8 +368,9 @@ def main():
                        for t in per_row(args.center, n_rows, "center")]
         else:
             centers = per_row(args.index, n_rows, "index")  # resolved to 3D below
-    elif not args.pick:
-        raise SystemExit("select a region with --box, --center/--radius, --index or --pick")
+    elif not args.pick and not marks:
+        raise SystemExit("select a region with --box, --center/--radius, --index or "
+                         "--pick, and/or draw highlight boxes with --mark")
 
     grid_data = [[load_points(p) for p in row] for row in grid_files]
     grid_clouds = [[d[:, :3] for d in row] for row in grid_data]
@@ -412,13 +438,26 @@ def main():
     # ---- zoom box + inset per cell ------------------------------------------
     for r in range(n_rows):
         center3d = None
-        if not args.box and not args.pick:
+        if have_region and not args.box and not args.pick:
             # --center is given in original coords; --index picks an already
             # rotated point, so only the former needs the display rotation.
             center3d = (to_z_up(centers[r][None, :], ups[r])[0] if args.center
                         else grid_clouds[r][0][centers[r]])
         for c in range(n_cols):
             cell, ax, edges = axes[r][c]
+
+            for rect, mcolor, mstyle in marks:
+                mx, my, mw, mh = cell_rect_to_fig(cell, *rect)
+                fig.add_artist(Rectangle((mx, my), mw, mh, transform=fig.transFigure,
+                                         fill=False, edgecolor=mcolor,
+                                         linewidth=args.mark_width,
+                                         linestyle=mstyle, zorder=10))
+            if titles and r == 0:
+                fig.text(cell[0] + cell[2] / 2, n_rows * cell_h + 0.12 / fig_h,
+                         titles[c], ha="center", va="bottom", fontsize=16)
+            if not have_region:
+                continue
+
             pts, cols, szs = grid_clouds[r][c], grid_colors[r][c], grid_sizes[r][c]
             px, py, pz = proj3d.proj_transform(
                 pts[:, 0], pts[:, 1], pts[:, 2], ax.get_proj())
@@ -487,9 +526,6 @@ def main():
                         coordsB=fig.transFigure,
                         color=args.frame_color, linewidth=1.0, zorder=9))
 
-            if titles and r == 0:
-                fig.text(cell[0] + cell[2] / 2, n_rows * cell_h + 0.12 / fig_h,
-                         titles[c], ha="center", va="bottom", fontsize=16)
             print(f"{grid_files[r][c]}: {int(mask.sum())} points in the inset, "
                   f"zoom x{zoom:.1f}")
 
