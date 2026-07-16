@@ -225,7 +225,8 @@ def build_parser():
                          "rows of a grid with a lone '+'")
     ap.add_argument("--box", action="append",
                     help="zoom region as cell fractions FX,FY,FW,FH (top-left origin); "
-                         "repeatable, one per row")
+                         "join several regions with ':' for multiple insets per cell "
+                         "(pair each with an --inset rect); repeatable, one per row")
     ap.add_argument("--center", action="append",
                     help="zoom region center in 3D coords X,Y,Z (with --radius); "
                          "repeatable, one per row")
@@ -246,7 +247,8 @@ def build_parser():
                     help="line width of --mark rectangles")
     ap.add_argument("--inset", action="append",
                     help="inset position as cell fractions FX,FY,FW,FH (default "
-                         "lower-right); repeatable, one per row")
+                         "lower-right); join with ':' to match multiple --box regions; "
+                         "repeatable, one per row")
     ap.add_argument("--mesh", action="append",
                     help="clean mesh (.off/.obj/.ply): color points by P2F distance; "
                          "repeatable, one per row")
@@ -294,7 +296,9 @@ def build_parser():
     ap.add_argument("--overlay", help="second cloud drawn on top, single input only (e.g. noise)")
     ap.add_argument("--overlay-color", default="#e2574c", help="color of the overlay cloud")
     ap.add_argument("--overlay-point-size", type=float, help="marker area of the overlay cloud")
-    ap.add_argument("--frame-color", default="#17798e", help="color of the box and inset frame")
+    ap.add_argument("--frame-color", default="#17798e",
+                    help="color of the box and inset frame; a comma-separated list "
+                         "cycles over the zoom regions (e.g. '#17798e,#4a8f5a')")
     ap.add_argument("--frame-width", type=float, default=4.0, help="inset frame line width")
     ap.add_argument("--connect", action="store_true", help="draw lines linking box and inset")
     ap.add_argument("--fit-percentile", type=float, default=100.0,
@@ -405,8 +409,9 @@ def main():
     meshes = per_row(args.mesh, n_rows, "mesh")
     if any(meshes) and not all(meshes):
         raise SystemExit("--mesh must be given for every row (or once for all rows)")
-    insets = [parse_floats(t, 4, "inset")
-              for t in per_row(args.inset, n_rows, "inset", "0.52,0.50,0.44,0.44")]
+    insets = [[parse_floats(t, 4, "inset") for t in spec.split(":")]
+              for spec in per_row(args.inset, n_rows, "inset", "0.52,0.50,0.44,0.44")]
+    frame_colors = [c.strip() for c in args.frame_color.split(",")]
     elevs = per_row(args.elev, n_rows, "elev", 20.0)
     azims = per_row(args.azim, n_rows, "azim", -60.0)
     ups = per_row(args.up, n_rows, "up", "z")
@@ -416,15 +421,21 @@ def main():
     for text in args.mark or []:
         parts = text.split(":")
         rect = parse_floats(parts[0], 4, "mark")
-        color = parts[1] if len(parts) > 1 and parts[1] else args.frame_color
+        color = parts[1] if len(parts) > 1 and parts[1] else frame_colors[0]
         style = parts[2] if len(parts) > 2 and parts[2] else "dashed"
         marks.append((rect, color, style))
 
     # Region selection: one style shared by all rows, values broadcastable.
     have_region = bool(args.box or args.center or args.index is not None or args.pick)
     if args.box:
-        boxes = [parse_floats(t, 4, "box") for t in per_row(args.box, n_rows, "box")]
+        boxes = [[parse_floats(t, 4, "box") for t in spec.split(":")]
+                 for spec in per_row(args.box, n_rows, "box")]
         centers = None
+        for r in range(n_rows):
+            if len(insets[r]) != len(boxes[r]):
+                raise SystemExit(
+                    f"row {r + 1} has {len(boxes[r])} zoom boxes but {len(insets[r])} "
+                    "insets: give one --inset rect per box, joined with ':'")
     elif args.center or args.index is not None:
         radii = per_row(args.radius, n_rows, "radius")
         if radii[0] is None:
@@ -564,23 +575,25 @@ def main():
                                            edgecolor=mcolor, linestyle=mstyle,
                                            linewidth=args.mark_width, zorder=10))
                 if have_region:
-                    fx, fy, fw, fh = boxes[r]
-                    x0, y0, w, h = fx * w_px, fy * h_px, fw * w_px, fh * h_px
-                    ax.add_patch(Rectangle((x0, y0), w, h, fill=False,
-                                           edgecolor=args.frame_color,
-                                           linewidth=max(1.5, args.frame_width * 0.45),
-                                           zorder=10))
-                    inset = fig.add_axes(cell_rect_to_fig(cell, *insets[r]))
-                    inset.imshow(img, interpolation="bilinear")
-                    inset.set_xlim(x0, x0 + w)
-                    inset.set_ylim(y0 + h, y0)  # inverted: image origin is top-left
-                    inset.set_xticks([])
-                    inset.set_yticks([])
-                    for spine in inset.spines.values():
-                        spine.set_edgecolor(args.frame_color)
-                        spine.set_linewidth(args.frame_width)
-                    print(f"{grid_files[r][c]}: image crop "
-                          f"x[{x0:.0f}:{x0 + w:.0f}] y[{y0:.0f}:{y0 + h:.0f}] px")
+                    for k, (fx, fy, fw, fh) in enumerate(boxes[r]):
+                        fcol = frame_colors[k % len(frame_colors)]
+                        x0, y0, w, h = fx * w_px, fy * h_px, fw * w_px, fh * h_px
+                        ax.add_patch(Rectangle((x0, y0), w, h, fill=False,
+                                               edgecolor=fcol,
+                                               linewidth=max(1.5,
+                                                             args.frame_width * 0.45),
+                                               zorder=10))
+                        inset = fig.add_axes(cell_rect_to_fig(cell, *insets[r][k]))
+                        inset.imshow(img, interpolation="bilinear")
+                        inset.set_xlim(x0, x0 + w)
+                        inset.set_ylim(y0 + h, y0)  # image origin is top-left
+                        inset.set_xticks([])
+                        inset.set_yticks([])
+                        for spine in inset.spines.values():
+                            spine.set_edgecolor(fcol)
+                            spine.set_linewidth(args.frame_width)
+                        print(f"{grid_files[r][c]}: image crop "
+                              f"x[{x0:.0f}:{x0 + w:.0f}] y[{y0:.0f}:{y0 + h:.0f}] px")
                 continue
 
             for rect, mcolor, mstyle in marks:
@@ -598,14 +611,16 @@ def main():
             disp = ax.transData.transform(np.column_stack([px, py]))
             frac = fig.transFigure.inverted().transform(disp)
 
-            mask = None
+            regions = []  # (bx, by, bw, bh, mask) in figure fractions
             if args.pick:
                 bx, by, bw, bh = pick_box(fig)
                 cx, cy, cw, ch = cell
                 print("picked region: --box %.3f,%.3f,%.3f,%.3f" % (
                     (bx - cx) / cw, 1.0 - (by - cy + bh) / ch, bw / cw, bh / ch))
+                regions.append((bx, by, bw, bh, None))
             elif args.box:
-                bx, by, bw, bh = cell_rect_to_fig(cell, *boxes[r])
+                for rect in boxes[r]:
+                    regions.append(cell_rect_to_fig(cell, *rect) + (None,))
             else:
                 mask = np.linalg.norm(pts - center3d, axis=1) <= radii[r]
                 if not mask.any():
@@ -615,53 +630,57 @@ def main():
                 bx, by = sel[:, 0].min() - margin, sel[:, 1].min() - margin
                 bw = sel[:, 0].max() - sel[:, 0].min() + 2 * margin
                 bh = sel[:, 1].max() - sel[:, 1].min() + 2 * margin
+                regions.append((bx, by, bw, bh, mask))
 
-            if mask is None:
-                mask = ((frac[:, 0] >= bx) & (frac[:, 0] <= bx + bw)
-                        & (frac[:, 1] >= by) & (frac[:, 1] <= by + bh))
-            if not mask.any():
-                raise SystemExit(f"{grid_files[r][c]}: the selected rectangle "
-                                 "contains no points")
+            for k, (bx, by, bw, bh, mask) in enumerate(regions):
+                fcol = frame_colors[k % len(frame_colors)]
+                if mask is None:
+                    mask = ((frac[:, 0] >= bx) & (frac[:, 0] <= bx + bw)
+                            & (frac[:, 1] >= by) & (frac[:, 1] <= by + bh))
+                if not mask.any():
+                    raise SystemExit(f"{grid_files[r][c]}: zoom box {k + 1} "
+                                     "contains no points")
 
-            fig.add_artist(Rectangle((bx, by), bw, bh, transform=fig.transFigure,
-                                     fill=False, edgecolor=args.frame_color,
-                                     linewidth=max(1.5, args.frame_width * 0.45),
-                                     zorder=10))
+                fig.add_artist(Rectangle((bx, by), bw, bh, transform=fig.transFigure,
+                                         fill=False, edgecolor=fcol,
+                                         linewidth=max(1.5, args.frame_width * 0.45),
+                                         zorder=10))
 
-            ix, iy, iw, ih = cell_rect_to_fig(cell, *insets[r])
-            inset = fig.add_axes([ix, iy, iw, ih], facecolor=args.bg)
-            inset.set_xticks([])
-            inset.set_yticks([])
-            for spine in inset.spines.values():
-                spine.set_edgecolor(args.frame_color)
-                spine.set_linewidth(args.frame_width)
+                ix, iy, iw, ih = cell_rect_to_fig(cell, *insets[r][k])
+                inset = fig.add_axes([ix, iy, iw, ih], facecolor=args.bg)
+                inset.set_xticks([])
+                inset.set_yticks([])
+                for spine in inset.spines.values():
+                    spine.set_edgecolor(fcol)
+                    spine.set_linewidth(args.frame_width)
 
-            # Inset limits in projected data coordinates = the rectangle drawn.
-            inv = ax.transData.inverted()
-            (dx0, dy0), (dx1, dy1) = inv.transform(
-                fig.transFigure.transform([[bx, by], [bx + bw, by + bh]]))
-            inset.set_xlim(dx0, dx1)
-            inset.set_ylim(dy0, dy1)
-            inset.set_aspect("equal", adjustable="datalim")
+                # Inset limits in projected data coordinates = the rectangle drawn.
+                inv = ax.transData.inverted()
+                (dx0, dy0), (dx1, dy1) = inv.transform(
+                    fig.transFigure.transform([[bx, by], [bx + bw, by + bh]]))
+                inset.set_xlim(dx0, dx1)
+                inset.set_ylim(dy0, dy1)
+                inset.set_aspect("equal", adjustable="datalim")
 
-            # Painter's algorithm: draw far points first, like mplot3d does.
-            order = np.flatnonzero(mask)[np.argsort(pz[mask])[::-1]]
-            zoom = min(iw / bw, ih / bh)
-            scale = min(zoom ** 2, args.max_zoom_scale)
-            inset_edges = edges[order] if isinstance(edges, np.ndarray) else edges
-            inset.scatter(px[order], py[order], c=cols[order], s=szs[order] * scale,
-                          edgecolors=inset_edges, linewidths=0.25 * np.sqrt(scale))
+                # Painter's algorithm: draw far points first, like mplot3d does.
+                order = np.flatnonzero(mask)[np.argsort(pz[mask])[::-1]]
+                zoom = min(iw / bw, ih / bh)
+                scale = min(zoom ** 2, args.max_zoom_scale)
+                inset_edges = edges[order] if isinstance(edges, np.ndarray) else edges
+                inset.scatter(px[order], py[order], c=cols[order],
+                              s=szs[order] * scale, edgecolors=inset_edges,
+                              linewidths=0.25 * np.sqrt(scale))
 
-            if args.connect:
-                for corner_y in (by, by + bh):
-                    fig.add_artist(ConnectionPatch(
-                        xyA=(bx + bw, corner_y), coordsA=fig.transFigure,
-                        xyB=(ix, iy if corner_y == by else iy + ih),
-                        coordsB=fig.transFigure,
-                        color=args.frame_color, linewidth=1.0, zorder=9))
+                if args.connect:
+                    for corner_y in (by, by + bh):
+                        fig.add_artist(ConnectionPatch(
+                            xyA=(bx + bw, corner_y), coordsA=fig.transFigure,
+                            xyB=(ix, iy if corner_y == by else iy + ih),
+                            coordsB=fig.transFigure,
+                            color=fcol, linewidth=1.0, zorder=9))
 
-            print(f"{grid_files[r][c]}: {int(mask.sum())} points in the inset, "
-                  f"zoom x{zoom:.1f}")
+                print(f"{grid_files[r][c]}: box {k + 1}: {int(mask.sum())} points "
+                      f"in the inset, zoom x{zoom:.1f}")
 
     # ---- Clean -> Noisy legend ----------------------------------------------
     if args.colorbar:
