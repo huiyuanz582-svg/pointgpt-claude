@@ -307,6 +307,10 @@ def build_parser():
                          "outliers make the model tiny")
     ap.add_argument("--figsize", type=float, default=8.0,
                     help="size of one square grid cell in inches")
+    ap.add_argument("--title-fontsize", type=float, default=24.0,
+                    help="font size of the per-column method titles (default 24)")
+    ap.add_argument("--legend-fontsize", type=float, default=24.0,
+                    help="font size of the Clean/Noisy colorbar labels (default 24)")
     ap.add_argument("--dpi", type=int, default=300, help="output resolution")
     ap.add_argument("--bg", default="white", help="background color")
     return ap
@@ -500,7 +504,10 @@ def main():
 
     # ---- figure layout: square cells + optional top strip ------------------
     cell_in = args.figsize
-    strip_in = (0.45 if titles else 0.0) + (0.55 if args.colorbar else 0.0)
+    # 标题/图例条高度随字号自适应放大，避免大字号被裁切（字号 / 72 ≈ 英寸高，留 2x 余量）
+    title_strip = (args.title_fontsize / 72.0 * 2.0 + 0.12) if titles else 0.0
+    cbar_strip = (args.legend_fontsize / 72.0 * 2.0 + 0.20) if args.colorbar else 0.0
+    strip_in = title_strip + cbar_strip
     fig_w, fig_h = n_cols * cell_in, n_rows * cell_in + strip_in
     fig = plt.figure(figsize=(fig_w, fig_h), facecolor=args.bg)
     cell_h = cell_in / fig_h
@@ -561,7 +568,8 @@ def main():
 
             if titles and r == 0:
                 fig.text(cell[0] + cell[2] / 2, n_rows * cell_h + 0.12 / fig_h,
-                         titles[c], ha="center", va="bottom", fontsize=16)
+                         titles[c], ha="center", va="bottom",
+                         fontsize=args.title_fontsize)
 
             if grid_clouds[r][c] is None:
                 # Image cell: --mark and --box are fractions of the image
@@ -695,9 +703,9 @@ def main():
         for spine in cax.spines.values():
             spine.set_linewidth(0.5)
         fig.text(bar_x - 0.08 / fig_w, bar_y + bar_h / 2, "Clean",
-                 ha="right", va="center", fontsize=16)
+                 ha="right", va="center", fontsize=args.legend_fontsize)
         fig.text(bar_x + bar_w + 0.08 / fig_w, bar_y + bar_h / 2, "Noisy",
-                 ha="left", va="center", fontsize=16)
+                 ha="left", va="center", fontsize=args.legend_fontsize)
 
     fig.savefig(output, dpi=args.dpi, facecolor=args.bg)
     print(f"saved {output}")
