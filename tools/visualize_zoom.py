@@ -695,7 +695,9 @@ def main():
         cmap = plt.get_cmap(args.cmap) if args.cmap else CLEAN_NOISY
         bar_w, bar_h = min(0.16, 1.6 / fig_w), 0.16 / fig_h
         bar_y = 1.0 - (0.36 / fig_h)
-        bar_x = 1.0 - bar_w - 0.9 / fig_w
+        # 右侧给 "Noisy" 预留空间，宽度随字号自适应，避免大字号顶到右边缘被裁切
+        noisy_in = 0.62 * len("Noisy") * args.legend_fontsize / 72.0
+        bar_x = 1.0 - bar_w - (0.10 + noisy_in + 0.15) / fig_w
         cax = fig.add_axes([bar_x, bar_y, bar_w, bar_h])
         cax.imshow(np.linspace(0, 1, 256)[None, :], aspect="auto", cmap=cmap)
         cax.set_xticks([])
