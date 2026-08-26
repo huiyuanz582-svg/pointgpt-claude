@@ -63,6 +63,7 @@ def main():
     lv_steps = int(getattr(lv, 'num_steps', 1)) if lv is not None else 1
     lv_step_size = float(getattr(lv, 'step_size', 1.0)) if lv is not None else 1.0
     lv_decay = float(getattr(lv, 'decay', 0.95)) if lv is not None else 0.95
+    inference_patch_size = int(getattr(config, 'inference_patch_size', 1024))
     test_patch_batch = int(getattr(config, 'test_patch_batch', 4))
     fuse_tau_ratio = float(getattr(config, 'fuse_tau_ratio', 0.5))
     if args.sor == 'config':
@@ -71,7 +72,8 @@ def main():
         sor_enable = (args.sor == 'on')
 
     print(f'[Config] Langevin: steps={lv_steps} step_size={lv_step_size} decay={lv_decay}')
-    print(f'[Config] test_patch_batch={test_patch_batch} fuse_tau_ratio={fuse_tau_ratio} '
+    print(f'[Config] inference_patch_size={inference_patch_size} '
+          f'test_patch_batch={test_patch_batch} fuse_tau_ratio={fuse_tau_ratio} '
           f'SOR={"on" if sor_enable else "off"}  noise_std(σ0)={args.noise_std}')
 
     # 建模 + 载权重（先下发消融开关，保证与训练该 ckpt 时的模型行为一致）
@@ -102,7 +104,7 @@ def main():
         with torch.no_grad():
             denoised = patch_based_denoise(
                 model, pcl_norm, float(args.noise_std),
-                patch_batch=test_patch_batch,
+                patch_size=inference_patch_size, patch_batch=test_patch_batch,
                 num_steps=lv_steps, step_size=lv_step_size, decay=lv_decay,
                 fuse_tau_ratio=fuse_tau_ratio,
             )                                                  # [N,3] 归一化空间

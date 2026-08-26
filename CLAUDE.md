@@ -14,7 +14,7 @@ Active development lives in `datasets/ScoreDenoiseDataset.py`, `datasets/scorede
 
 ## Entry point and command dispatch
 
-Everything goes through `main.py`. Dispatch (`main.py:85-91`, aliases resolved in `tools/__init__.py`):
+Training and the ordinary validation/test path go through `main.py`. Dispatch (`main.py:117-124`, aliases resolved in `tools/__init__.py`):
 
 | Flags | Runner |
 |---|---|
@@ -23,6 +23,8 @@ Everything goes through `main.py`. Dispatch (`main.py:85-91`, aliases resolved i
 | `--test` (requires `--ckpts <path>`) | `tools.runner_finetune.test_net` |
 
 `main_vis.py` is a separate entry that only supports `--test` and dispatches to `tools.runner.test_net` (the old upstream tester) — not the active denoising tester.
+
+Stage 0 teacher-trajectory analysis is another standalone entry: `tools/analyze_teacher_trajectory.py`. It loads the active test dataset and a frozen fine-tuned checkpoint, captures the current teacher's 30-step patch trajectory, and reports the 1/2/4/8/15/30 prefix quality/runtime curve. It does not train or modify weights. Full usage and metric semantics are documented in `docs/stage0_teacher_analysis.md`.
 
 Typical fine-tune run:
 ```bash
@@ -37,6 +39,13 @@ CUDA_VISIBLE_DEVICES=0 python main.py \
   --config cfgs/PointGPT-S/finetune_scoredenoise.yaml \
   --test --exp_name <name> \
   --ckpts experiments/finetune_scoredenoise/PointGPT-S/<name>/ckpt-best.pth
+```
+Typical Stage 0 run (same checkpoint, fixed `step_size=0.3` / `decay=0.95` teacher prefixes):
+```bash
+CUDA_VISIBLE_DEVICES=0 python tools/analyze_teacher_trajectory.py \
+  --config cfgs/PointGPT-L/finetune_scoredenoise.yaml \
+  --ckpt experiments/finetune_scoredenoise/PointGPT-L/<name>/ckpt-best.pth \
+  --run_name L_10k_1pct
 ```
 DDP: `--launcher pytorch` via `torchrun`/`torch.distributed.launch`. Single-GPU is `--launcher none` (default).
 
@@ -68,16 +77,18 @@ for t in range(num_steps):
 ```
 `num_steps=1, step_size=1.0` degenerates to single-step Tweedie. Hyperparameters come from `config.langevin` (calibrated optimum baked into the yamls: `num_steps=30, step_size=0.3, decay=0.95`; `step_size ≥ 0.5` overshoots/diverges).
 
-**Patch coverage is the recurring subtlety** — `group_divider` only covers ~`num_group·group_size / N` of the points, so feeding a full 10k cloud leaves ~80% of points with ε≈0 (unmoved). The fix is applied in three places that must stay consistent:
+**Patch coverage is the recurring subtlety** — `group_divider` only covers ~`num_group·group_size / N` of the points, so feeding a full 10k cloud directly leaves ~80% of points with ε≈0 (unmoved). The fix is applied in three places that must stay consistent:
 - **Train**: dataset cuts a single 1024-point KNN patch per sample → 64×32/1024 ≈ 200% coverage.
-- **Val**: `val_dataloader` uses `flag='train'` (same 1024-patch) so val CD reflects real denoising, not the noisy baseline.
+- **Val**: `val_dataloader` supplies full deterministic validation clouds; `validate()` sends them through the same overlapping-patch `patch_based_denoise` path as test, then computes full-cloud CD + P2M.
 - **Test**: `patch_based_denoise` tiles the full cloud into overlapping 1024-patches (FPS seeds + KNN), denoises each, and fuses overlapping predictions back with a **distance-to-seed Gaussian weight** (`fuse_tau_ratio` in the yaml, default 0.5): a point's contribution from a patch is weighted `exp(−d²/2τ²)`, τ = ratio·patch-radius, so each patch's boundary points are down-weighted and overlap-fusion doesn't blur curved surfaces (targets P2M). `fuse_tau_ratio ≤ 0` reverts to the old equal-weight averaging. Uncovered points fall back to noisy.
+
+`patch_based_denoise(..., return_trajectory=True)` is an opt-in Stage 0 diagnostic. The default remains the original `[N,3]` return and allocates no trajectory. Diagnostic mode additionally returns exact per-patch `patch_states` and per-step fused `global_states`. The latter are readouts made with fixed patch indices/weights and are **not fed back** into the next step; do not describe them as the teacher's full-cloud Markov states. Step labels use `update_step=0 ↔ teacher_t=30` (noisy) and `update_step=30 ↔ teacher_t=0` (full teacher).
 
 **Checkpoint-load output-head re-init (do not remove):** after `load_model_from_ckpt`, the runner re-initializes `generator_blocks.increase_dim[0]` to `std=0.1` weights / zero bias (`runner_finetune.py:run_net`). The pre-trained head generates *absolute coordinates*; reused directly it makes `x + σ·ε` drift wildly. `std=0.1` puts the initial ε magnitude (~2.0) near the target ε (~√3). The earlier `std=0.01` value left points barely moving — if "the model won't learn amplitude", check this.
 
 **Encoder is intentionally NOT frozen** during fine-tuning (ε-estimation needs encoder adaptation away from the autoregressive pre-training objective).
 
-**Post-processing (test only):** Statistical Outlier Removal (`sor_filter`, always on) and an optional local-PCA surface projection (`local_surface_projection`, gated by `config.surface_projection.enable`, default off — PCA normals proved unreliable).
+**Post-processing (test only):** Statistical Outlier Removal (`sor_filter`, gated by `config.sor_enable`, default on) and an optional local-PCA surface projection (`local_surface_projection`, gated by `config.surface_projection.enable`, default off — PCA normals proved unreliable). Stage 0 always analyzes raw/SOR-free states for point-correspondence dynamics and, by default, reports SOR as a separate quality variant; it does not apply `surface_projection`.
 
 ## Models
 
@@ -90,7 +101,8 @@ for t in range(num_steps):
 ## Metrics & checkpoint ranking
 
 - CD and P2M are both reported `×1e4` (normalized-space). `DenoiseMetrics.better_than` ranks by `cd + 0.3·p2m` — the `0.3` offsets the empirical scale gap (CD ≈ 1.7 vs P2M ≈ 5–7). **Re-scale them together if you re-scale either term.**
-- During training, `validate()` computes **CD only** (P2M is set to 0 because 1024-patches can't be aligned to a full mesh), so checkpoint selection is effectively CD-only. Full P2M is computed only in `test()`.
+- Current `validate()` runs the same full-cloud patch/Langevin/SOR path as test, computes both CD and P2M, and checkpoint ranking uses `cd + 0.3·p2m`. `VAL_NUM=0` uses the benchmark-style test split for validation; `VAL_NUM>0` uses held-out training shapes and their train meshes.
+- Stage 0 additionally reports symmetric Euclidean HD/HD95 and their squared `×1e4` forms. Its `cpu_cd_sq_x1e4` is only a SciPy KDTree cross-check; `cd_x1e4` remains the official CUDA Chamfer metric.
 
 ## Config system
 
@@ -98,7 +110,9 @@ YAML → `EasyDict` via `utils/config.py:cfg_from_yaml_file`, with recursive `_b
 
 Key denoising-specific yaml knobs (read at runtime; no code edit needed to change them):
 - `cfgs/dataset_configs/ScoreDenoise.yaml`: `NOISE_MIN/MAX` (0.005/0.020 — keep fixed for fair SOTA comparison), `NOISE_LOG_UNIFORM` (log-uniform σ sampling), `TEST_RESOLUTION` / `TEST_NOISY_DIR` / `TEST_NOISE` (switch 10k/50k and noise level here), `TEST_NOISY_PATH` (optional, generalization: point the noisy input at any folder of `.xyz`, overriding the default `examples/.../<TEST_NOISY_DIR>` — clean PUNet test + meshes stay the reference, so noisy files must match by name/resolution), `PATCH_SIZE` (1024, aligned with pre-train npoints), `TRAIN_OVERSAMPLE` (per-cloud patch resampling per epoch — 120 clouds is far too few steps/epoch without it).
-- Finetune yamls: `langevin`, `surface_projection`, `fuse_tau_ratio`, `p2m_weight`, `consistency` (iterative-training unroll: `enable`/`num_steps`/`step_size`/`decay`), `test_patch_batch`, `mem_check_interval`, `grad_norm_clip`, `cpu_threads` / `gpu_mem_fraction` (proactive resource caps, see Memory guards).
+- Finetune yamls: `langevin`, `surface_projection`, `inference_patch_size` (shared by val/test/folder inference/Stage 0), `fuse_tau_ratio`, `p2m_weight`, `consistency` (iterative-training unroll: `enable`/`num_steps`/`step_size`/`decay`), `stage0_audit` (standalone teacher audit only), `test_patch_batch`, `mem_check_interval`, `grad_norm_clip`, `cpu_threads` / `gpu_mem_fraction` (proactive resource caps, see Memory guards).
+- `stage0_audit.budgets=[1,2,4,8,15,30]` means prefixes of the same `langevin` schedule (`step_size=0.3`, `decay=0.95`). It is deliberately different from `ablation/abl_T1.yaml`, whose one-step Tweedie baseline uses `step_size=1.0`. Never sweep `abl_T1` to construct the Stage 0 prefix curve.
+- Without an explicit Stage 0 CLI override, `stage0_audit.max_steps` must equal `langevin.num_steps`; mismatch is an error, preventing a stale audit block from silently measuring a different teacher.
 - `val_interval` / `save_interval` in the yaml are inert — validation cadence uses `args.val_freq` (default 1) and `ckpt-last` is saved every epoch.
 
 ## Dataset wiring and on-disk layout
@@ -117,17 +131,23 @@ data/ScoreDenoise/examples/pointclouds/test/<TEST_NOISY_DIR>/<name>.xyz   # nois
 - **Test** (`PairedEvalDataset`) pairs clean `test/<TEST_RESOLUTION>` clouds with **pre-noised** clouds from `examples/.../<TEST_NOISY_DIR>`; normalization is taken from the clean cloud.
 - The data tuple through every collate path is `(noisy, clean, noise_std, center, scale, name)` (`denoise_collate_fn_test`). `noise_std` is `None` for the test set (no per-sample σ) and the runner falls back to `config...TEST_NOISE`.
 - Train/val patch alignment: KNN is computed in **noisy space** and the same indices index both clean and noisy, guaranteeing point correspondence (`PairedPatchDataset.__getitem__`).
-- **Mesh `.off` files are loaded at runtime** for both the training P2M loss (`utils/p2m_loss.py`, root overridable via the `PUNET_MESH_ROOT` env var, default `data/ScoreDenoise/PUNet/meshes`) and the test P2M (`compute_p2m`). Removing/renaming meshes breaks **fine-tuning**, not just metrics. `compute_mesh_normals_for_pcl` and the P2M loaders cache per `(name, split)` in module-level dicts (clear by restarting the process).
+- **Mesh `.off` files are loaded at runtime** for both the training P2M loss (`utils/p2m_loss.py`, root overridable via the `PUNET_MESH_ROOT` env var, default `data/ScoreDenoise/PUNet/meshes`) and the test P2M (`compute_p2m`). Removing/renaming meshes breaks **fine-tuning**, not just metrics. P2M caches CPU meshes per `(absolute mesh root, name, split)` and follows the prediction tensor's device; clear the module cache by restarting the process.
 
-## Output layout (auto-created by `utils/parser.py`)
+## Output layout
 
 ```
 experiments/<config_stem>/<parent_stem>/<exp_name>/
     ├── config.yaml, <timestamp>.log
     ├── ckpt-last.pth, ckpt-best.pth (, ckpt-best_vote.pth)
 experiments/<config_stem>/<parent_stem>/TFBoard/<exp_name>/{train,test}/
+
+experiments/stage0_teacher_analysis/<run_name>/
+    ├── manifest.json, effective_config.yaml, progress.json
+    ├── summary_by_budget.csv, per_shape_by_budget.csv, timing_runs.csv
+    ├── aggregate_per_step.csv, per_step_dynamics.csv
+    └── trajectories/<shape>/{trajectory.npz, metadata.json, *.xyz}
 ```
-`--test` prefixes `exp_name` with `test_`; `--mode <easy|median|hard>` suffixes it. `test()` also writes per-sample `.xyz` + colored `.ply` visualizations under a **hard-coded** path (`experiments/finetune_scoredenoise_L/PointGPT-Change/...` in `runner_finetune.py:test`) — independent of `exp_name`; edit it there if needed.
+`--test` prefixes `exp_name` with `test_`; `--mode <easy|median|hard>` suffixes it. Ordinary `test()` still uses the hard-coded outer path `experiments/finetune_scoredenoise_L/PointGPT-Change/`, but its inner directory is now separated by `exp_name`, so different test runs no longer overwrite one another. Stage 0 uses its own output root shown above and records the effective config, Git state, checkpoint metadata, schedule and device in `manifest.json`.
 
 ## Memory guards (look like "graceful OOM", not bugs)
 

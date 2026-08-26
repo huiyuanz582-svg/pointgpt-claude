@@ -59,8 +59,25 @@ for CFG in abl_T1 abl_equal_fusion abl_no_sor; do
 done
 ```
 
-加分项：把 `abl_T1.yaml` 的 `num_steps` 依次改 1/5/10/20/30 各测一次，
-画 CD/P2M vs 推理步数曲线（比表格单行更有说服力）。
+## 第 0 阶段教师前缀曲线（不要用 `abl_T1.yaml` 扫步数）
+
+`abl_T1.yaml` 是独立的单步 Tweedie 消融：`num_steps=1, step_size=1.0`。它回答“完整方法退化为单次 Tweedie 更新时表现如何”，不是 30 步教师的前缀。不要只改它的 `num_steps` 为 5/10/20/30；保留 `step_size=1.0` 做多步会改变教师日程，并可能过冲。
+
+第 0 阶段的 1/2/4/8/15/30 曲线统一使用完整方法 checkpoint 和 `step_size=0.3, decay=0.95`，由专用工具从同一次 30 步 rollout 中读取：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python tools/analyze_teacher_trajectory.py \
+  --config cfgs/PointGPT-L/finetune_scoredenoise.yaml \
+  --ckpt "$BEST" \
+  --run_name L_10k_1pct
+```
+
+这两组结果应分别保留：
+
+- `abl_T1`：论文消融表中的 Tweedie-1；
+- Stage 0：同一教师的固定日程前缀，用于分析步数冗余并决定后续蒸馏预算。
+
+Stage 0 会输出 CD/P2M/HD、逐步几何统计、独立耗时和代表样本完整轨迹。命令、输出字段与计时口径见 `docs/stage0_teacher_analysis.md`。
 
 ## 注意
 

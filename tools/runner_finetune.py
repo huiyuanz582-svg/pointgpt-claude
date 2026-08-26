@@ -154,7 +154,8 @@ def sor_filter(pts_tensor, nb_neighbors=20, std_ratio=2.0):
 def patch_based_denoise(base_model, pcl_noisy, noise_std_t, patch_size=1024,
                         seed_ratio=3, patch_batch=4,
                         num_steps=1, step_size=1.0, decay=0.95,
-                        fuse_tau_ratio=0.5):
+                        fuse_tau_ratio=0.5, return_trajectory=False,
+                        raise_on_memory_pressure=False):
     """
     完整点云的 patch-based 推理：把 N 点云切成覆盖全部点的重叠 1024-patch，
     逐 patch 去噪后按到种子点距离的高斯权重加权拼回完整点云。
@@ -175,9 +176,29 @@ def patch_based_denoise(base_model, pcl_noisy, noise_std_t, patch_size=1024,
     - num_steps=1, step_size=1.0 时退化为原单步 Tweedie：x̂ = x + σ·ε（fallback）
     - patch 内部做迭代（group_divider 是逐 patch 工作的），最后再拼回
 
-    返回 [N, 3] 去噪后完整点云。
+    默认返回 [N, 3] 去噪后完整点云。
+
+    return_trajectory=True 仅用于阶段 0 教师审计，额外返回一个轨迹字典：
+      - global_states: [num_steps+1, N, 3]，每一步按同一 patch_idx/fuse_w 融合的诊断整云；
+      - patch_states:  [num_steps+1, S, patch_size, 3]，教师真正执行的 patch 内状态；
+      - patch_idx / fuse_weights / coverage_count / seeds。
+    注意：global_states 只是诊断 readout，并没有回灌到下一步；真实教师仍是固定外层 patch、
+    patch 内独立 rollout、最后融合。默认关闭时不分配任何轨迹内存，既有 train/val/test 行为不变。
     """
+    if num_steps < 1:
+        raise ValueError(f'num_steps 必须 >= 1，当前为 {num_steps}')
+    if patch_batch < 1:
+        raise ValueError(f'patch_batch 必须 >= 1，当前为 {patch_batch}')
+    if patch_size < 1 or seed_ratio <= 0:
+        raise ValueError('patch_size 和 seed_ratio 必须 > 0')
+    if (not np.isfinite(step_size) or step_size <= 0 or
+            not np.isfinite(decay) or decay <= 0 or
+            not np.isfinite(fuse_tau_ratio)):
+        raise ValueError('step_size/decay 必须为有限正数，fuse_tau_ratio 必须为有限值')
+
     device = pcl_noisy.device
+    if pcl_noisy.ndim != 2 or pcl_noisy.shape[-1] != 3 or pcl_noisy.shape[0] == 0:
+        raise ValueError(f'pcl_noisy 必须为非空 [N, 3]，当前形状为 {tuple(pcl_noisy.shape)}')
     N = pcl_noisy.shape[0]
     patch_size = min(patch_size, N)
 
@@ -194,6 +215,16 @@ def patch_based_denoise(base_model, pcl_noisy, noise_std_t, patch_size=1024,
 
     sigma0 = noise_std_t.view(-1)[0] if torch.is_tensor(noise_std_t) else float(noise_std_t)
     sigma0 = float(sigma0)
+    if not np.isfinite(sigma0) or sigma0 <= 0:
+        raise ValueError(f'noise_std_t 必须为有限正数，当前为 {sigma0}')
+
+    patch_states = None
+    if return_trajectory:
+        # 精确缓存 patch 内状态，后续蒸馏不能只依赖融合整云，否则会把教师误写成全局 Markov 轨迹。
+        patch_states = torch.empty(
+            (num_steps + 1, patches.shape[0], patch_size, 3),
+            dtype=pcl_noisy.dtype, device='cpu')
+        patch_states[0].copy_(patches.detach().cpu())
 
     # 分批喂模型去噪
     denoised_patches = []
@@ -202,18 +233,23 @@ def patch_based_denoise(base_model, pcl_noisy, noise_std_t, patch_size=1024,
         if i > 0 and gpu_mem_ratio() > 0.90:
             torch.cuda.empty_cache()
             if gpu_mem_ratio() > 0.90:
-                print('[测试内存保护] patch 推理中 GPU 显存逼近上限，为防崩溃主动退出；'
-                      '请在 yaml 调小 test_patch_batch 后重跑')
+                message = ('[测试内存保护] patch 推理中 GPU 显存逼近上限；'
+                           '请在 yaml 调小 test_patch_batch 后重跑')
+                if raise_on_memory_pressure:
+                    raise RuntimeError(message)
+                print(message + '。为防崩溃主动退出')
                 sys.exit(0)
         x = patches[i:i + patch_batch]                            # [b, patch_size, 3]
         sigma_t = sigma0
-        for _ in range(num_steps):
+        for step_idx in range(num_steps):
             ns = torch.full((x.shape[0],), float(sigma_t), device=device)
             # 'val' 路径返回 x + σ_t·ε，反解出 ε 再按 step_size 走一小步
             out = base_model(x, None, 'val', '', noise_std=ns)    # [b, patch_size, 3]
             eps = (out - x) / sigma_t                             # 估计的 ε
             x = x + step_size * sigma_t * eps                     # Langevin 退火步
             sigma_t = sigma_t * decay                             # σ 逐步退火
+            if patch_states is not None:
+                patch_states[step_idx + 1, i:i + x.shape[0]].copy_(x.detach().cpu())
         denoised_patches.append(x.detach())
         del x, out, eps, ns
     denoised_patches = torch.cat(denoised_patches, dim=0)          # [S, patch_size, 3]
@@ -238,7 +274,52 @@ def patch_based_denoise(base_model, pcl_noisy, noise_std_t, patch_size=1024,
     uncovered = (wsum < 1e-8).squeeze(-1)
     denoised = accum / wsum.clamp(min=1e-8)
     denoised[uncovered] = pcl_noisy[uncovered]
-    return denoised
+
+    if not return_trajectory:
+        return denoised
+
+    coverage_count = torch.zeros(N, 1, dtype=torch.long, device=device)
+    coverage_count.index_add_(0, flat_idx, torch.ones_like(flat_idx).view(-1, 1))
+
+    # 阶段 0 的全局逐步轨迹在 CPU 上融合，避免把 31×50k 状态长期留在显存。
+    patch_idx_cpu = patch_idx.detach().cpu()
+    fuse_w_cpu = fuse_w.detach().cpu()
+    flat_idx_cpu = patch_idx_cpu.reshape(-1)
+    flat_w_cpu = fuse_w_cpu.reshape(-1, 1)
+    wsum_cpu = torch.zeros(N, 1, dtype=pcl_noisy.dtype)
+    wsum_cpu.index_add_(0, flat_idx_cpu, flat_w_cpu)
+    uncovered_cpu = (wsum_cpu < 1e-8).squeeze(-1)
+    noisy_cpu = pcl_noisy.detach().cpu()
+    global_states = torch.empty(
+        (num_steps + 1, N, 3), dtype=pcl_noisy.dtype, device='cpu')
+    global_states[0].copy_(noisy_cpu)
+    for step_idx in range(1, num_steps + 1):
+        step_accum = torch.zeros(N, 3, dtype=pcl_noisy.dtype)
+        step_accum.index_add_(
+            0, flat_idx_cpu,
+            patch_states[step_idx].reshape(-1, 3) * flat_w_cpu)
+        fused = step_accum / wsum_cpu.clamp_min(1e-8)
+        fused[uncovered_cpu] = noisy_cpu[uncovered_cpu]
+        global_states[step_idx].copy_(fused)
+
+    sigma_before = torch.tensor(
+        [sigma0 * (decay ** k) for k in range(num_steps)], dtype=torch.float64)
+    sigma_after = torch.tensor(
+        [sigma0] + [sigma0 * (decay ** k) for k in range(1, num_steps + 1)],
+        dtype=torch.float64)
+    trajectory = {
+        'global_states': global_states,
+        'patch_states': patch_states,
+        'patch_idx': patch_idx_cpu,
+        'fuse_weights': fuse_w_cpu,
+        'coverage_count': coverage_count.detach().cpu().squeeze(-1),
+        'seeds': seeds.detach().cpu(),
+        'sigma_before': sigma_before,
+        'sigma_after': sigma_after,
+        'logical_nfe': int(num_steps),
+        'patch_batches': int((patches.shape[0] + patch_batch - 1) // patch_batch),
+    }
+    return denoised, trajectory
 
 
 @torch.no_grad()
@@ -326,22 +407,20 @@ def check_memory_and_exit(base_model, optimizer, epoch, metrics, best_metrics, a
         sys.exit(0)
 
 
-def gpu_mem_ratio():
-    """返回当前 GPU(0) 显存使用率 [0,1]，读取失败返回 0.0。仅用于测试路径软监控（不退出）"""
+def gpu_mem_ratio(device=None):
+    """返回当前 CUDA 设备显存使用率 [0,1]，读取失败返回 0.0。"""
     if not torch.cuda.is_available():
         return 0.0
-    import subprocess
+    device = torch.cuda.current_device() if device is None else device
     try:
-        result = subprocess.check_output(
-            ['nvidia-smi', '--query-gpu=memory.used,memory.total',
-             '--format=csv,noheader,nounits', '--id=0'],
-            encoding='utf-8'
-        ).strip().split(',')
-        return int(result[0].strip()) / int(result[1].strip())
+        # cudaMemGetInfo 自动遵循 CUDA_VISIBLE_DEVICES 的逻辑→物理设备映射，
+        # 不会像硬编码 nvidia-smi --id=0 那样监控错卡。
+        free, total = torch.cuda.mem_get_info(device)
+        return (total - free) / total
     except Exception:
         try:
-            reserved = torch.cuda.memory_reserved(0)
-            total = torch.cuda.get_device_properties(0).total_memory
+            reserved = torch.cuda.memory_reserved(device)
+            total = torch.cuda.get_device_properties(device).total_memory
             return reserved / total
         except Exception:
             return 0.0
@@ -650,6 +729,7 @@ def validate(base_model, val_dataloader, epoch, val_writer, args, config, logger
     lv_steps = int(getattr(langevin, 'num_steps', 1)) if langevin is not None else 1
     lv_step_size = float(getattr(langevin, 'step_size', 1.0)) if langevin is not None else 1.0
     lv_decay = float(getattr(langevin, 'decay', 0.95)) if langevin is not None else 0.95
+    inference_patch_size = int(getattr(config, 'inference_patch_size', 1024))
     test_patch_batch = int(getattr(config, 'test_patch_batch', 4))
     fuse_tau_ratio = float(getattr(config, 'fuse_tau_ratio', 0.5))
     # SOR 后处理开关（默认 True 保持旧行为）。SOR 删边角点会抬高 face→point（P2M 双向项），
@@ -679,7 +759,7 @@ def validate(base_model, val_dataloader, epoch, val_writer, args, config, logger
             # 整云 patch-based 去噪（与 test 同款：多步 Langevin + 高斯拼接）
             denoised_full = patch_based_denoise(
                 base_model, pcl_noisy[0], noise_std_t,
-                patch_batch=test_patch_batch,
+                patch_size=inference_patch_size, patch_batch=test_patch_batch,
                 num_steps=lv_steps, step_size=lv_step_size, decay=lv_decay,
                 fuse_tau_ratio=fuse_tau_ratio,
             )  # [N, 3]
@@ -819,9 +899,11 @@ def test(base_model, test_dataloader, args, config, logger=None):
     print_log(f'[Inference] Langevin: num_steps={lv_steps}, step_size={lv_step_size}, decay={lv_decay}'
               + (' (单步 Tweedie fallback)' if lv_steps <= 1 else ''), logger=logger)
 
-    # 测试 patch_batch（从 config 读）：L 模型显存吃紧，10k 用 4、50k 建议 2，缺省 4
+    # 外层推理 patch 大小/批量（从 config 读）；默认 1024 与训练和预训练对齐。
+    inference_patch_size = int(getattr(config, 'inference_patch_size', 1024))
     test_patch_batch = int(getattr(config, 'test_patch_batch', 4))
-    print_log(f'[Inference] test_patch_batch={test_patch_batch}', logger=logger)
+    print_log(f'[Inference] inference_patch_size={inference_patch_size}, '
+              f'test_patch_batch={test_patch_batch}', logger=logger)
 
     # 跨 patch 拼接权重：到种子点距离的高斯权重 τ = fuse_tau_ratio · patch 半径
     # 边界点降权锐化表面（降 P2M）；<=0 退化为等权平均（旧行为）。从 config 读，缺省 0.5
@@ -909,10 +991,10 @@ def test(base_model, test_dataloader, args, config, logger=None):
             best_p2m = None
             best_denoised = None
             for _ in range(vote_times):
-                # patch-based 推理：完整点云切 1024-patch 逐个去噪再拼回，覆盖全部点
+                # patch-based 推理：完整点云切固定大小 patch 逐个去噪再拼回，覆盖全部点
                 denoised_full = patch_based_denoise(
                     base_model, pcl_noisy[0], noise_std_t,
-                    patch_batch=test_patch_batch,
+                    patch_size=inference_patch_size, patch_batch=test_patch_batch,
                     num_steps=lv_steps, step_size=lv_step_size, decay=lv_decay,
                     fuse_tau_ratio=fuse_tau_ratio,
                 )  # [N, 3]

@@ -52,12 +52,11 @@ _MESH_ROOT = os.environ.get(
     'PUNET_MESH_ROOT', 'data/ScoreDenoise/PUNet/meshes')
 
 def compute_p2m(pred_points, name, type):
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    # 跟随预测点所在设备。原先硬编码为默认 ``cuda``，当阶段 0 通过
+    # --device 选择非 0 号卡时会产生跨设备张量错误。
+    device = pred_points.device
     split = 'train' if type == 'train' else 'test'
-    off_path = os.path.join(_MESH_ROOT, split, name + ".off")
-    mesh = trimesh.load(off_path)
-    verts = torch.from_numpy(mesh.vertices.astype(np.float32)).to(device)
-    faces = torch.from_numpy(mesh.faces.astype(np.int64)).to(device)
+    verts, faces = _load_mesh_cached(name, split, device)
 
     loss = point_mesh_bidir_distance_single_unit_sphere(
         pred_points,
@@ -75,13 +74,15 @@ def compute_p2m(pred_points, name, type):
 # （绝大多数面远离小 patch），所以只用 point→face：每个预测点到最近 mesh 面的距离。
 # 用 pytorch3d 底层 point_face_distance，对预测点可微。
 # ============================================================================
-_train_mesh_cache = {}  # name -> (verts, faces) 缓存，避免每 batch 重复 trimesh.load
+_train_mesh_cache = {}  # (mesh_root, name, split) -> CPU (verts, faces)
 
 
 def _load_mesh_cached(name, split, device):
-    key = (name, split)
+    # 把 root 纳入 key：不同实验可能在同一进程中切换 TEST_MESH_ROOT。
+    mesh_root = os.path.abspath(_MESH_ROOT)
+    key = (mesh_root, name, split)
     if key not in _train_mesh_cache:
-        off_path = os.path.join(_MESH_ROOT, split, name + ".off")
+        off_path = os.path.join(mesh_root, split, name + ".off")
         mesh = trimesh.load(off_path)
         verts = torch.from_numpy(mesh.vertices.astype(np.float32))
         faces = torch.from_numpy(mesh.faces.astype(np.int64))

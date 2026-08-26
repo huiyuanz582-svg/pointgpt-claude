@@ -370,3 +370,70 @@ decay: 0.95 }`（step_size/decay 对齐推理 langevin）。L 单步已较慢，
 
 S/L finetune yaml 默认 `cpu_threads: 8`、`gpu_mem_fraction: 0.9`（均可调；设 0 或删行=不限制）。
 与被动退出互补：被动保存进度、主动防尖峰。
+
+---
+
+## Session: Stage 0 教师轨迹与步数冗余审计（2026-08-25）
+
+### 目的
+
+第二阶段正式做少步映射蒸馏前，先不训练新模型，重新刻画第一阶段冻结教师：
+
+- 用同一 checkpoint 测试 1/2/4/8/15/30 次更新的 CD、P2M、HD/HD95 和耗时；
+- 保存代表样本的 30 步完整轨迹；
+- 统计逐步位移、法向/切向分量、最近 clean 误差下降和局部邻域变化；
+- 判断 30 步后半段是否冗余，以及后续更适合 30→4、8→4 还是 8→2。
+
+### 实现
+
+1. `tools/runner_finetune.py:patch_based_denoise` 增加可选 `return_trajectory=False`：
+   - 默认关闭时仍返回原来的 `[N,3]`，普通 train/val/test/denoise_folder 调用不变；
+   - 开启时额外返回真实 patch 内 `patch_states`、固定 patch 索引/融合权重下的诊断 `global_states`、覆盖次数和 σ 日程；
+   - `global_states` 只用于评测/可视化，不回灌到下一步，真实教师仍是固定 patch 后各 patch 独立 rollout。
+2. 新增 `tools/analyze_teacher_trajectory.py`：
+   - 延迟加载 PyTorch/CUDA 重依赖，使缺 CUDA 的机器仍能查看 `--help`；
+   - 复用 active test dataset、消融开关注入、模型构建和 checkpoint 加载；
+   - 一次 max-step 捕获生成同一 patch 布局下的前缀质量曲线；
+   - 独立无轨迹捕获地重复计时，避免 NPZ/指标计算污染延迟；
+   - 每个 shape 后增量写 CSV/进度，失败时把错误和已有结果写入 manifest。
+3. 新增 `utils/trajectory_metrics.py`：
+   - SciPy KDTree 双向 HD/HD95 与 CPU CD 复核；
+   - clean kNN-PCA 法向置信度、法/切位移、kNN retention/churn 和局部边长变化；
+   - 对外部非对应点集显式禁用索引指标并写 NaN；
+   - 聚合时为每列保留有效值数量，避免缺 mesh/无对应关系被静默吞掉。
+4. S/L finetune YAML 增加 `stage0_audit`，默认 `max_steps=30`、`budgets=[1,2,4,8,15,30]`、保存三个代表轨迹并对三个 shape 各计时三次。该块只由 Stage 0 工具读取，不影响训练或普通测试。
+5. P2M 测试改为跟随预测张量所在 GPU，并按 `(mesh root, name, split)` 缓存 CPU mesh；Stage 0 启用 P2M 时不再吞掉缺 mesh、OOM 或实现错误，只有显式 `--no_p2m` 才允许跳过。
+6. 轨迹审计自动验证初始 patch/整云状态、最终 CPU/GPU 融合以及各预算“捕获/无捕获”输出一致性；默认最大绝对误差容差为 `1e-5`，超出即失败。
+7. 测试软显存监控改为查询当前 CUDA 设备（遵循 `CUDA_VISIBLE_DEVICES`），Stage 0 遇到内存保护会抛出非成功异常并把运行标记为 failed，不会以退出码 0 伪装成完整实验。
+8. 新增共享 `inference_patch_size=1024`，普通 val/test、文件夹推理和 Stage 0 统一读取；同时要求未使用 CLI 覆盖时 `stage0_audit.max_steps == langevin.num_steps`，防止配置漂移后审计错教师。
+9. Stage 0 在导入 NumPy/SciPy/Open3D/PyTorch 前先应用 YAML 中的 CPU 线程环境变量，并对旧 PyTorch/MIG 环境不支持显存比例限制的情况给出警告后继续，与主入口的兼容策略一致。
+
+### 关键实验口径
+
+Stage 0 的各预算是同一教师日程的前缀，固定：
+
+```text
+step_size = 0.3
+decay = 0.95
+budget = 1 / 2 / 4 / 8 / 15 / 30
+```
+
+`cfgs/PointGPT-L/ablation/abl_T1.yaml` 的 `num_steps=1, step_size=1.0` 是另一条 Tweedie-1 消融，不能通过只改 `num_steps` 来构造 Stage 0 曲线。原消融 README 中“改 abl_T1 扫多步”的建议已经改为专用 Stage 0 命令。
+
+逐步动力学一律使用 raw、SOR 前状态，因为 SOR 会删除点并破坏对应关系。质量表默认同时报告 raw 和 SOR 两个 variant；Stage 0 不应用 `surface_projection`。
+
+计时使用 CUDA 同步，质量轨迹先跑一次兼作 warmup。`denoise_seconds` 包含 patch 构造、patch 内 rollout 和融合；`end_to_end_seconds` 另加 SOR，但不含 DataLoader、指标、轨迹 copy、写盘和可视化。除逻辑 NFE 外还记录 `actual_forward_calls=budget×patch_batches`。
+
+### 输出与文档
+
+默认输出到：
+
+```text
+experiments/stage0_teacher_analysis/<run_name>/
+```
+
+主要产物为 `manifest.json`、`effective_config.yaml`、`summary_by_budget.csv`、`per_shape_by_budget.csv`、`timing_runs.csv`、`aggregate_per_step.csv`、`per_step_dynamics.csv` 和 `trajectories/<shape>/trajectory.npz`。完整运行说明见 `docs/stage0_teacher_analysis.md`；`CLAUDE.md` 与 PointGPT-L 消融 README 已同步入口和口径。
+
+### 验证状态与限制
+
+当前 Windows 工作区缺少 `data/`、`extensions/`、checkpoint 和 PyTorch，不能在本机运行真实模型。这里已完成 `--help`、Python 语法检查和 8 项 NumPy/SciPy 几何单元测试；真实 CD/P2M、GPU 轨迹数值一致性、显存和耗时仍必须回到原 Linux/CUDA 训练环境做单样本冒烟与全量验收。未在本记录中声称已经跑出 Stage 0 实验结果。

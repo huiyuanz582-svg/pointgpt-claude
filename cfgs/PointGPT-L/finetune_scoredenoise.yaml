@@ -44,16 +44,30 @@ model:
     weight_center: 1.0,
   }
 
-# Langevin 多步退火推理（仅 --test 生效），与 S 版同款经验最优超参
+# Langevin 多步退火推理（完整点云 val/test/folder/Stage 0 共用），与 S 版同款经验最优超参
 langevin:
   { num_steps: 30, step_size: 0.3, decay: 0.95 }
+
+# 第 0 阶段教师轨迹审计（仅 tools/analyze_teacher_trajectory.py 读取，不影响训练/普通 test）
+# budgets 是同一 30 步教师的前缀，始终沿用上面的 step_size=0.3 / decay=0.95。
+# abl_T1.yaml 的 step_size=1.0 属于另一条 Tweedie 单步基线，不能混入该曲线。
+stage0_audit:
+  { max_steps: 30, budgets: [1, 2, 4, 8, 15, 30], max_shapes: 0,
+    save_num_trajectories: 3, timing_shapes: 3, timing_repeats: 3,
+    stats_sample_points: 2048, knn_k: 16, normal_confidence_threshold: 0.05,
+    consistency_atol: 0.00001,
+    seed_ratio: 3, evaluate_sor: True, compute_p2m: True,
+    save_patch_trajectory: True, assume_correspondence: True,
+    save_xyz_steps: [0, 1, 2, 4, 8, 15, 30] }
 
 # 局部表面投影后处理（默认关闭，PCA 法向不可靠）
 surface_projection:
   { enable: False, k: 16, num_iters: 1, blend: 0.6 }
 
-# 跨 patch 拼接权重（仅 --test 生效）：到 patch 种子点距离的高斯权重 τ = fuse_tau_ratio · patch 半径
+# 完整点云推理共用的外层 patch 大小与拼接权重（val/test/folder/Stage 0）
+# 到 patch 种子点距离的高斯权重 τ = fuse_tau_ratio · patch 半径；
 # 边界点降权，避免重叠区等权平均把曲面磨平（降 P2M）；<=0 退化为等权平均（旧行为）
+inference_patch_size: 1024
 fuse_tau_ratio: 0.5
 
 # SOR 后处理开关（val/test 生效）。True=旧行为（删离群点）；False=不做任何后处理滤波。
