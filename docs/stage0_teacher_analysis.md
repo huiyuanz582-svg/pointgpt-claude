@@ -93,7 +93,7 @@ CLI 参数优先于 YAML。常用诊断开关如下：
 | `--max_shapes N` | 只跑前 N 个测试 shape；0 表示全部 |
 | `--max_steps N --budgets ... N` | 临时改变完整教师步数与需要汇总的前缀；budgets 必须包含 max_steps |
 | `--timing_shapes N --timing_repeats R` | 控制独立计时的 shape 数和重复次数 |
-| `--consistency_atol X` | 覆盖捕获/无捕获输出一致性检查容差 |
+| `--consistency_atol X` | 同一次捕获内部硬检查容差；独立 replay 超过它只提示和记录 |
 | `--save_num_trajectories N` | 未指定名字时保存前 N 个完整轨迹 |
 | `--trajectory_names ...` | 按不带扩展名的 shape 名保存代表性轨迹 |
 | `--no_patch_trajectory` | NPZ 不写入体积较大的精确 `patch_states`；仍会保存诊断整云轨迹 |
@@ -200,7 +200,9 @@ experiments/stage0_teacher_analysis/<run_name>/
 
 CSV 使用 UTF-8 BOM，便于直接用 Excel 打开。轨迹可能较大；`--no_patch_trajectory` 只减少 NPZ 落盘体积，并不取消捕获诊断整云所需的运行内存。
 
-工具还会检查三个轨迹不变量：初始 patch 必须等于 `noisy[patch_idx]`，`global_states[0]` 必须等于 noisy，CPU 重融合的最后一步必须与普通 GPU 融合输出一致。独立计时运行还会逐预算比较无捕获输出与已捕获前缀。最大绝对误差写入 CSV，超过 `stage0_audit.consistency_atol`（默认 `1e-5`）会直接失败，防止用错误轨迹继续做蒸馏。
+工具会严格检查三个同一次捕获内部的不变量：初始 patch 必须等于 `noisy[patch_idx]`，`global_states[0]` 必须等于 noisy，CPU 重融合的最后一步必须与同次 GPU 融合输出一致。它们超过 `stage0_audit.consistency_atol`（默认 `1e-5`）会直接失败，防止用错误轨迹继续做蒸馏。
+
+独立计时运行会重新执行 CUDA FPS、scatter 和 index-add。其浮点累加顺序可能不同，误差会随迭代步数累积，因此 fresh replay 与捕获前缀的差异不是硬不变量。工具会把 max/mean/RMS 差异写入 `timing_runs.csv`，超过 `consistency_atol` 时只输出提示；只有出现 NaN/Inf 才中止实验。
 
 ## 7. 指标口径
 
@@ -271,4 +273,4 @@ python -m py_compile tools/analyze_teacher_trajectory.py utils/trajectory_metric
 python -m unittest discover -s tests -p "test_trajectory_metrics.py" -v
 ```
 
-当前可用的无 PyTorch 环境已经完成 8 项 NumPy/SciPy 单元测试；本机仍不能证明真实 checkpoint 的 CD/P2M、GPU 轨迹一致性、显存和耗时正确。正式接受该功能前，必须在原训练环境完成单样本冒烟。工具会自动验证：同一 checkpoint 和 shape 下，Stage 0 捕获的第 k 步 raw 输出与普通 `patch_based_denoise(num_steps=k, step_size=0.3, decay=0.95)` 在给定容差内一致。
+当前可用的无 PyTorch 环境已经完成 8 项 NumPy/SciPy 单元测试；本机仍不能证明真实 checkpoint 的 CD/P2M、GPU 轨迹一致性、显存和耗时正确。正式接受该功能前，必须在原训练环境完成单样本冒烟。工具会严格验证同一次捕获的索引和融合不变量，并把独立 replay 的数值漂移作为诊断量记录。
