@@ -155,7 +155,8 @@ def patch_based_denoise(base_model, pcl_noisy, noise_std_t, patch_size=1024,
                         seed_ratio=3, patch_batch=4,
                         num_steps=1, step_size=1.0, decay=0.95,
                         fuse_tau_ratio=0.5, return_trajectory=False,
-                        raise_on_memory_pressure=False):
+                        raise_on_memory_pressure=False,
+                        teacher_indices=None, teacher_max_steps=30):
     """
     完整点云的 patch-based 推理：把 N 点云切成覆盖全部点的重叠 1024-patch，
     逐 patch 去噪后按到种子点距离的高斯权重加权拼回完整点云。
@@ -176,6 +177,10 @@ def patch_based_denoise(base_model, pcl_noisy, noise_std_t, patch_size=1024,
     - num_steps=1, step_size=1.0 时退化为原单步 Tweedie：x̂ = x + σ·ε（fallback）
     - patch 内部做迭代（group_divider 是逐 patch 工作的），最后再拼回
 
+    少步蒸馏学生可传 ``teacher_indices=[0,4,8,12,16]``。此时每个学生阶段
+    使用相应教师位置的 σ 和显式蒸馏条件，``step_size=1`` 表示一次执行完整跳步。
+    缺省 None，第一篇教师路径完全不变。
+
     默认返回 [N, 3] 去噪后完整点云。
 
     return_trajectory=True 仅用于阶段 0 教师审计，额外返回一个轨迹字典：
@@ -187,6 +192,17 @@ def patch_based_denoise(base_model, pcl_noisy, noise_std_t, patch_size=1024,
     """
     if num_steps < 1:
         raise ValueError(f'num_steps 必须 >= 1，当前为 {num_steps}')
+    if teacher_indices is not None:
+        teacher_indices = [int(x) for x in teacher_indices]
+        if (len(teacher_indices) != num_steps + 1 or teacher_indices[0] != 0 or
+                any(b <= a for a, b in zip(teacher_indices, teacher_indices[1:]))):
+            raise ValueError(
+                '蒸馏 teacher_indices 必须从 0 开始、严格递增，且长度等于 num_steps+1；'
+                f'当前 num_steps={num_steps}, teacher_indices={teacher_indices}')
+        if teacher_indices[-1] > int(teacher_max_steps):
+            raise ValueError('teacher_indices 终点不能超过 teacher_max_steps')
+        if return_trajectory:
+            raise ValueError('蒸馏学生日程暂不与 Stage 0 return_trajectory 混用')
     if patch_batch < 1:
         raise ValueError(f'patch_batch 必须 >= 1，当前为 {patch_batch}')
     if patch_size < 1 or seed_ratio <= 0:
@@ -240,14 +256,28 @@ def patch_based_denoise(base_model, pcl_noisy, noise_std_t, patch_size=1024,
                 print(message + '。为防崩溃主动退出')
                 sys.exit(0)
         x = patches[i:i + patch_batch]                            # [b, patch_size, 3]
-        sigma_t = sigma0
         for step_idx in range(num_steps):
+            teacher_step = (teacher_indices[step_idx]
+                            if teacher_indices is not None else step_idx)
+            sigma_t = sigma0 * (decay ** teacher_step)
             ns = torch.full((x.shape[0],), float(sigma_t), device=device)
             # 'val' 路径返回 x + σ_t·ε，反解出 ε 再按 step_size 走一小步
-            out = base_model(x, None, 'val', '', noise_std=ns)    # [b, patch_size, 3]
+            model_kwargs = {}
+            if teacher_indices is not None:
+                # 与 utils.trajectory_distill.make_distill_condition 保持同一字段顺序。
+                denom_stage = max(num_steps - 1, 1)
+                denom_teacher = max(int(teacher_max_steps), 1)
+                distill_condition = torch.stack([
+                    torch.log(ns / 0.01),
+                    torch.full_like(ns, float(step_idx) / denom_stage),
+                    torch.full_like(ns, float(teacher_step) / denom_teacher),
+                    torch.full_like(ns, float(teacher_indices[-1]) / denom_teacher),
+                ], dim=-1)
+                model_kwargs['distill_condition'] = distill_condition
+            out = base_model(
+                x, None, 'val', '', noise_std=ns, **model_kwargs)  # [b, patch_size, 3]
             eps = (out - x) / sigma_t                             # 估计的 ε
             x = x + step_size * sigma_t * eps                     # Langevin 退火步
-            sigma_t = sigma_t * decay                             # σ 逐步退火
             if patch_states is not None:
                 patch_states[step_idx + 1, i:i + x.shape[0]].copy_(x.detach().cpu())
         denoised_patches.append(x.detach())
@@ -729,6 +759,10 @@ def validate(base_model, val_dataloader, epoch, val_writer, args, config, logger
     lv_steps = int(getattr(langevin, 'num_steps', 1)) if langevin is not None else 1
     lv_step_size = float(getattr(langevin, 'step_size', 1.0)) if langevin is not None else 1.0
     lv_decay = float(getattr(langevin, 'decay', 0.95)) if langevin is not None else 0.95
+    lv_teacher_indices = (list(getattr(langevin, 'teacher_indices'))
+                          if langevin is not None and
+                          getattr(langevin, 'teacher_indices', None) is not None else None)
+    lv_teacher_max_steps = int(getattr(langevin, 'teacher_max_steps', 30)) if langevin is not None else 30
     inference_patch_size = int(getattr(config, 'inference_patch_size', 1024))
     test_patch_batch = int(getattr(config, 'test_patch_batch', 4))
     fuse_tau_ratio = float(getattr(config, 'fuse_tau_ratio', 0.5))
@@ -762,6 +796,8 @@ def validate(base_model, val_dataloader, epoch, val_writer, args, config, logger
                 patch_size=inference_patch_size, patch_batch=test_patch_batch,
                 num_steps=lv_steps, step_size=lv_step_size, decay=lv_decay,
                 fuse_tau_ratio=fuse_tau_ratio,
+                teacher_indices=lv_teacher_indices,
+                teacher_max_steps=lv_teacher_max_steps,
             )  # [N, 3]
             denoised_post = sor_filter(denoised_full) if sor_enable else denoised_full.cpu()
             denoised = denoised_post.unsqueeze(0).to(pcl_noisy.device)
@@ -894,9 +930,14 @@ def test(base_model, test_dataloader, args, config, logger=None):
         lv_steps = int(getattr(langevin, 'num_steps', 1))
         lv_step_size = float(getattr(langevin, 'step_size', 1.0))
         lv_decay = float(getattr(langevin, 'decay', 0.95))
+        lv_teacher_indices = (list(getattr(langevin, 'teacher_indices'))
+                              if getattr(langevin, 'teacher_indices', None) is not None else None)
+        lv_teacher_max_steps = int(getattr(langevin, 'teacher_max_steps', 30))
     else:
         lv_steps, lv_step_size, lv_decay = 1, 1.0, 0.95
+        lv_teacher_indices, lv_teacher_max_steps = None, 30
     print_log(f'[Inference] Langevin: num_steps={lv_steps}, step_size={lv_step_size}, decay={lv_decay}'
+              + (f', teacher_indices={lv_teacher_indices}' if lv_teacher_indices is not None else '')
               + (' (单步 Tweedie fallback)' if lv_steps <= 1 else ''), logger=logger)
 
     # 外层推理 patch 大小/批量（从 config 读）；默认 1024 与训练和预训练对齐。
@@ -997,6 +1038,8 @@ def test(base_model, test_dataloader, args, config, logger=None):
                     patch_size=inference_patch_size, patch_batch=test_patch_batch,
                     num_steps=lv_steps, step_size=lv_step_size, decay=lv_decay,
                     fuse_tau_ratio=fuse_tau_ratio,
+                    teacher_indices=lv_teacher_indices,
+                    teacher_max_steps=lv_teacher_max_steps,
                 )  # [N, 3]
                 denoised_10k = denoised_full.unsqueeze(0)
                 denoised_filtered = sor_filter(denoised_10k[0]) if sor_enable else denoised_10k[0].cpu()

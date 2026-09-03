@@ -1,0 +1,61 @@
+# 第二篇论文·第一阶段：固定 16 步教师轨迹蒸馏为 4 步同容量学生。
+# 顶层 _base_ 继承第一篇最终 L 配置；旧 finetune/test 配置不会受本文件影响。
+_base_: cfgs/PointGPT-L/finetune_scoredenoise.yaml
+
+optimizer:
+  { type: AdamW, kwargs: { lr: 0.00001, weight_decay: 0.05 } }
+
+scheduler:
+  { type: CosLR, kwargs: { epochs: 60, initial_epochs: 5 } }
+
+model:
+  distill_conditioning:
+    { enable: True, input_dim: 4, hidden_dim: 1024 }
+
+# 完整点云验证/测试时，4 次学生更新分别模拟教师的 0→4→8→12→16。
+# step_size=1 表示学生直接执行所预测的完整区间位移；σ 仍取教师 landmark 对应值。
+langevin:
+  { num_steps: 4, step_size: 1.0, decay: 0.95,
+    teacher_indices: [0, 4, 8, 12, 16], teacher_max_steps: 30 }
+
+distillation:
+  { enable: True,
+    teacher_endpoint: 16, student_steps: 4,
+    teacher_indices: [0, 4, 8, 12, 16], teacher_max_steps: 30,
+    teacher_step_size: 0.3, teacher_decay: 0.95,
+    teacher_forcing_epochs: 10,
+    jump_loss: smooth_l1,
+    jump_weight: 1.0,
+    trajectory_weight: 0.25,
+    endpoint_weight: 1.0,
+    clean_weight: 0.5 }
+
+# 第一阶段先隔离“步数压缩”变量：同容量 L 学生、raw 输出、无额外几何损失。
+sor_enable: False
+p2m_weight: 0.0
+consistency:
+  { enable: False, num_steps: 3, step_size: 0.3, decay: 0.95 }
+surface_projection:
+  { enable: False, k: 16, num_iters: 1, blend: 0.6 }
+
+# 4 步完整 BPTT 的激活显存高于原单步训练：batch=1，累计 8 次后更新。
+total_bs: 1
+step_per_update: 8
+max_epoch: 60
+grad_norm_clip: 1.0
+test_patch_batch: 2
+
+# 第二篇方法开发建议使用独立训练 shape 验证集；正式比较 baseline 时再另存协议配置。
+dataset:
+  train:
+    _base_:
+      # 在线教师每个样本最多需要 16 次前向，先降低每 epoch 的随机 patch 重采样量。
+      TRAIN_OVERSAMPLE: 5
+      VAL_NUM: 4
+      VAL_SPLIT_SEED: 2024
+      VAL_NOISE_LEVELS: [0.01, 0.02]
+  val:
+    _base_:
+      VAL_NUM: 4
+      VAL_SPLIT_SEED: 2024
+      VAL_NOISE_LEVELS: [0.01, 0.02]

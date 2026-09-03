@@ -637,6 +637,25 @@ class PointTransformer(nn.Module):
         self.num_group = config.num_group #点云被分成多少组（patch 数）
         self.encoder_dims = config.encoder_dims #encoder 输出通道数（要与 encoder 模块对应）。
 
+        # 第二篇第一阶段：少步轨迹蒸馏条件。原教师只在输出端乘 σ，Transformer 主体并
+        # 不知道当前 σ/学生阶段；跳步学生必须显式区分 0→4、4→8 等不同映射。
+        # 缺省关闭，保证第一篇模型、旧 checkpoint 和普通 finetune 路径完全不变。
+        distill_cond_cfg = getattr(config, 'distill_conditioning', None)
+        self.distill_conditioning = bool(
+            getattr(distill_cond_cfg, 'enable', False)) if distill_cond_cfg is not None else False
+        self.distill_condition_dim = int(
+            getattr(distill_cond_cfg, 'input_dim', 4)) if distill_cond_cfg is not None else 4
+        if self.distill_conditioning:
+            hidden_dim = int(getattr(distill_cond_cfg, 'hidden_dim', self.encoder_dims))
+            self.distill_condition_mlp = nn.Sequential(
+                nn.Linear(self.distill_condition_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, self.encoder_dims),
+            )
+            # 零初始化最后一层：载入教师权重后，学生初始前向严格退化为原教师行为。
+            nn.init.zeros_(self.distill_condition_mlp[-1].weight)
+            nn.init.zeros_(self.distill_condition_mlp[-1].bias)
+
 # 局部分组（patch）模块  一个把整张点云分成若干局部 patch 的模块（通常实现为按中心采样 + KNN / 半径搜索把邻域点取出来）。
         self.group_divider = Group(
             num_group=self.num_group, group_size=self.group_size)
@@ -805,7 +824,9 @@ class PointTransformer(nn.Module):
             group_size=self.group_size,
         )
 
-    def forward(self, noisy_pts, clean_pts=None, type='val', name='', epoch=0, max_epoch=None, noise_std=None):
+    def forward(self, noisy_pts, clean_pts=None, type='val', name='', epoch=0,
+                max_epoch=None, noise_std=None, distill_condition=None,
+                return_pred_score=False):
         """
         ε-prediction 去噪框架（等价于 DDPM ε-parameterization）：
         - generator 输出 ε = (clean - noisy) / σ，量级 O(1)，N(0,1) 分布
@@ -814,6 +835,21 @@ class PointTransformer(nn.Module):
         """
         neighborhood_noisy, center_noisy, patch_idx = self.group_divider(noisy_pts)
         group_input_tokens = self.encoder(neighborhood_noisy)  # B G C
+
+        if self.distill_conditioning:
+            if distill_condition is None:
+                raise ValueError(
+                    'distill_conditioning 已启用，但 forward 未收到 distill_condition')
+            if (distill_condition.ndim != 2 or
+                    distill_condition.shape[0] != noisy_pts.shape[0] or
+                    distill_condition.shape[1] != self.distill_condition_dim):
+                raise ValueError(
+                    'distill_condition 应为 [B, %d]，当前为 %s' %
+                    (self.distill_condition_dim, tuple(distill_condition.shape)))
+            cond = self.distill_condition_mlp(
+                distill_condition.to(device=noisy_pts.device,
+                                     dtype=group_input_tokens.dtype))
+            group_input_tokens = group_input_tokens + cond.unsqueeze(1)
 
         B, L, _ = group_input_tokens.shape
 
@@ -864,6 +900,11 @@ class PointTransformer(nn.Module):
             num_points=noisy_pts.shape[1],
             uniform=self.abl_fusion_uniform,
         )
+
+        # 蒸馏 runner 直接监督“跨教师区间的归一化位移场”，避免先构造
+        # x + σ·ε 再反解造成不必要的数值误差。旧调用不传该开关，行为不变。
+        if return_pred_score:
+            return pred_score_global
 
         if type == 'train':
             assert noise_std is not None, 'ε-prediction training requires noise_std'

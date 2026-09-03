@@ -59,6 +59,11 @@ def get_args():
         default=False, 
         help = 'training modelnet from scratch')
     parser.add_argument(
+        '--distill_model',
+        action='store_true',
+        default=False,
+        help='train a few-step point-cloud denoising student from --ckpts teacher')
+    parser.add_argument(
         '--mode', 
         choices=['easy', 'median', 'hard', None],
         default=None,
@@ -87,6 +92,13 @@ def get_args():
     if args.finetune_model and args.ckpts is None:
         print(
             'training from scratch')
+
+    if args.distill_model and args.ckpts is None:
+        raise ValueError('--distill_model requires --ckpts <teacher checkpoint>')
+
+    if args.distill_model and (args.finetune_model or args.scratch_model or args.test):
+        raise ValueError(
+            '--distill_model cannot be combined with --finetune_model/--scratch_model/--test')
 
     if 'LOCAL_RANK' not in os.environ:
         os.environ['LOCAL_RANK'] = str(args.local_rank)

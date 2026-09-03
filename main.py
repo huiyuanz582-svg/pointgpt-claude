@@ -1,5 +1,6 @@
 from tools import pretrain_run_net as pretrain
 from tools import finetune_run_net as finetune
+from tools import distill_run_net as distill
 from tools import test_run_net as test_net
 from utils import parser, dist_utils, misc
 from utils.logger import *
@@ -118,7 +119,9 @@ def main():
     if args.test:
         test_net(args, config)
     else:
-        if args.finetune_model or args.scratch_model:
+        if args.distill_model:
+            distill(args, config, train_writer, val_writer)
+        elif args.finetune_model or args.scratch_model:
             finetune(args, config, train_writer, val_writer)
         else:
             pretrain(args, config, train_writer, val_writer)

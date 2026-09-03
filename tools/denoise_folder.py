@@ -63,6 +63,10 @@ def main():
     lv_steps = int(getattr(lv, 'num_steps', 1)) if lv is not None else 1
     lv_step_size = float(getattr(lv, 'step_size', 1.0)) if lv is not None else 1.0
     lv_decay = float(getattr(lv, 'decay', 0.95)) if lv is not None else 0.95
+    lv_teacher_indices = (list(getattr(lv, 'teacher_indices'))
+                          if lv is not None and getattr(lv, 'teacher_indices', None) is not None
+                          else None)
+    lv_teacher_max_steps = int(getattr(lv, 'teacher_max_steps', 30)) if lv is not None else 30
     inference_patch_size = int(getattr(config, 'inference_patch_size', 1024))
     test_patch_batch = int(getattr(config, 'test_patch_batch', 4))
     fuse_tau_ratio = float(getattr(config, 'fuse_tau_ratio', 0.5))
@@ -71,7 +75,8 @@ def main():
     else:
         sor_enable = (args.sor == 'on')
 
-    print(f'[Config] Langevin: steps={lv_steps} step_size={lv_step_size} decay={lv_decay}')
+    print(f'[Config] Langevin: steps={lv_steps} step_size={lv_step_size} decay={lv_decay}'
+          + (f' teacher_indices={lv_teacher_indices}' if lv_teacher_indices is not None else ''))
     print(f'[Config] inference_patch_size={inference_patch_size} '
           f'test_patch_batch={test_patch_batch} fuse_tau_ratio={fuse_tau_ratio} '
           f'SOR={"on" if sor_enable else "off"}  noise_std(σ0)={args.noise_std}')
@@ -107,6 +112,8 @@ def main():
                 patch_size=inference_patch_size, patch_batch=test_patch_batch,
                 num_steps=lv_steps, step_size=lv_step_size, decay=lv_decay,
                 fuse_tau_ratio=fuse_tau_ratio,
+                teacher_indices=lv_teacher_indices,
+                teacher_max_steps=lv_teacher_max_steps,
             )                                                  # [N,3] 归一化空间
             if sor_enable:
                 denoised = sor_filter(denoised)                # 返回 CPU tensor（点数可能变少）
