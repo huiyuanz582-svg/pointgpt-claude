@@ -94,9 +94,12 @@ def _evaluate_initial_baselines(student, teacher, val_dataloader, args, config,
         eval_config.langevin.num_steps = int(steps)
         eval_config.langevin.step_size = teacher_step_size
         eval_config.langevin.decay = teacher_decay
-        for key in ('teacher_indices', 'teacher_max_steps'):
-            if key in eval_config.langevin:
-                del eval_config.langevin[key]
+        # 不使用 ``del``：部分 EasyDict 版本删除 mapping 键后，属性缓存仍可能
+        # 返回原值。显式设为 None 可保证 validate() 走普通教师连续步日程。
+        eval_config.langevin.teacher_indices = None
+        eval_config.langevin.teacher_max_steps = int(steps)
+        if getattr(eval_config.langevin, 'teacher_indices', None) is not None:
+            raise RuntimeError('教师基线评估未能关闭蒸馏 teacher_indices 日程')
         teacher_metrics = validate(
             teacher, val_dataloader, -int(steps), None, args, eval_config,
             logger=logger)
