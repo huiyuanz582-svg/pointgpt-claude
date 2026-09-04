@@ -60,14 +60,16 @@ def _build_models(config, checkpoint_path, device, logger,
     return teacher, student
 
 
-def _rollout_probability(epoch, teacher_forcing_epochs, rollout_ramp_epochs):
-    """纯 teacher-forced 后线性增加 rollout batch 比例。"""
+def _rollout_probability(epoch, teacher_forcing_epochs, rollout_ramp_epochs,
+                         max_rollout_probability=1.0):
+    """纯 teacher-forced 后线性增加 rollout 比例，并保留教师状态锚点。"""
     if epoch < teacher_forcing_epochs:
         return 0.0
     if rollout_ramp_epochs <= 0:
-        return 1.0
+        return float(max_rollout_probability)
     progress = (epoch - teacher_forcing_epochs + 1) / float(rollout_ramp_epochs)
-    return min(max(progress, 0.0), 1.0)
+    progress = min(max(progress, 0.0), 1.0)
+    return float(max_rollout_probability) * progress
 
 
 def _meter_avg(meter):
@@ -154,7 +156,11 @@ def run_net(args, config, train_writer=None, val_writer=None):
     teacher_max_steps = int(_cfg_value(distill_cfg, 'teacher_max_steps', 30))
     teacher_forcing_epochs = int(_cfg_value(distill_cfg, 'teacher_forcing_epochs', 10))
     rollout_ramp_epochs = int(_cfg_value(distill_cfg, 'rollout_ramp_epochs', 0))
+    max_rollout_probability = float(
+        _cfg_value(distill_cfg, 'max_rollout_probability', 1.0))
     jump_loss_type = str(_cfg_value(distill_cfg, 'jump_loss', 'smooth_l1'))
+    rollout_jump_target = str(
+        _cfg_value(distill_cfg, 'rollout_jump_target', 'teacher_delta'))
     jump_weight = float(_cfg_value(distill_cfg, 'jump_weight', 1.0))
     trajectory_weight = float(_cfg_value(distill_cfg, 'trajectory_weight', 0.25))
     endpoint_weight = float(_cfg_value(distill_cfg, 'endpoint_weight', 1.0))
@@ -168,6 +174,10 @@ def run_net(args, config, train_writer=None, val_writer=None):
         raise ValueError('teacher_forcing_epochs 必须位于 [0, max_epoch]')
     if rollout_ramp_epochs < 0:
         raise ValueError('rollout_ramp_epochs 必须 >= 0')
+    if not 0 < max_rollout_probability <= 1:
+        raise ValueError('max_rollout_probability 必须位于 (0, 1]')
+    if rollout_jump_target not in ('teacher_delta', 'corrective'):
+        raise ValueError('rollout_jump_target 仅支持 teacher_delta/corrective')
     if teacher_step_size <= 0 or not 0 < teacher_decay <= 1:
         raise ValueError('teacher_step_size 必须 > 0，teacher_decay 必须位于 (0, 1]')
     if min(jump_weight, trajectory_weight, endpoint_weight, clean_weight) < 0:
@@ -205,9 +215,10 @@ def run_net(args, config, train_writer=None, val_writer=None):
     print_log(
         '[Distill] 固定轨迹: teacher_indices=%s, teacher step_size=%.4f, decay=%.4f, '
         'student_steps=%d, teacher-forcing epochs=%d, rollout-ramp epochs=%d, '
-        'normalize-state=%s, accumulation=%d' %
+        'max-rollout=%.3f, rollout-target=%s, normalize-state=%s, accumulation=%d' %
         (teacher_indices, teacher_step_size, teacher_decay,
          len(teacher_indices) - 1, teacher_forcing_epochs, rollout_ramp_epochs,
+         max_rollout_probability, rollout_jump_target,
          normalize_state_losses, accumulation),
         logger=logger)
 
@@ -236,7 +247,8 @@ def run_net(args, config, train_writer=None, val_writer=None):
         }
         stage_jump_meters = [AverageMeter() for _ in range(len(teacher_indices) - 1)]
         rollout_probability = _rollout_probability(
-            epoch, teacher_forcing_epochs, rollout_ramp_epochs)
+            epoch, teacher_forcing_epochs, rollout_ramp_epochs,
+            max_rollout_probability=max_rollout_probability)
         teacher_forced_batches = 0
         rollout_batches = 0
         accumulated = 0
@@ -287,7 +299,8 @@ def run_net(args, config, train_writer=None, val_writer=None):
                         clean_weight=clean_weight,
                         jump_loss_type=jump_loss_type,
                         normalize_state_losses=normalize_state_losses,
-                        state_scale_floor=state_scale_floor)
+                        state_scale_floor=state_scale_floor,
+                        rollout_jump_target=rollout_jump_target)
                     jump_value = terms['jump'].item()
                     component_values = {
                         'trajectory': terms['trajectory'].item(),
@@ -350,8 +363,7 @@ def run_net(args, config, train_writer=None, val_writer=None):
         averages = {key: _meter_avg(meter) for key, meter in meters.items()}
         stage_averages = [_meter_avg(meter) for meter in stage_jump_meters]
         phase = ('teacher-forced' if rollout_probability == 0 else
-                 'student-rollout' if rollout_probability == 1 else
-                 'mixed')
+                 'student-rollout' if rollout_probability == 1 else 'mixed')
         print_log(
             '[Distill] EPOCH %d/%d phase=%s rollout_p=%.3f batches(tf=%d,rollout=%d) '
             'time=%.1fs total=%.6f jump=%.6f trajectory=%.6f endpoint=%.6f '

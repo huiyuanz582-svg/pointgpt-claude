@@ -1,0 +1,26 @@
+# 阶段 1 第三版：rollout 纠偏目标 + 永久保留 teacher-forced 锚点。
+_base_: cfgs/PointGPT-L/distill_fixed16_to4_curriculum.yaml
+
+# 从第二版 epoch 10 最佳学生继续时降低学习率，避免快速破坏已有的 4 步能力。
+optimizer:
+  { type: AdamW, kwargs: { lr: 0.000005, weight_decay: 0.05 } }
+
+scheduler:
+  { type: CosLR, kwargs: { epochs: 30, initial_epochs: 2 } }
+
+max_epoch: 30
+
+distillation:
+  {
+    # 已从第二版最佳学生初始化，只保留 1 epoch 教师状态预热；随后 8 epoch 渐进混合。
+    teacher_forcing_epochs: 1,
+    rollout_ramp_epochs: 8,
+
+    # rollout 输入来自学生自身，目标改为“当前学生状态 → 下一教师节点”，
+    # 从而显式纠正前序步骤积累的偏差。
+    rollout_jump_target: corrective,
+
+    # 第二版在 rollout=100% 后明显退化；上限设为 75%，始终保留 25% 教师状态锚点。
+    max_rollout_probability: 0.75,
+  }
+

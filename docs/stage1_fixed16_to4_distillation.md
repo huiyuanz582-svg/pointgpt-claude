@@ -155,3 +155,25 @@ CUDA_VISIBLE_DEVICES=0 python main.py \
 
 程序会在训练前使用同一个留出验证集分别评估：学生初值、教师 4 步和教师 16 步，
 并把学生初值保存为 `ckpt-init.pth` 和初始 `ckpt-best.pth`。
+
+## 十二、第三版：rollout 纠偏与教师状态锚点
+
+第二版在 rollout 比例约为 0.67 时得到更好的结果，但 rollout 提高到 1 后再次退化。
+第三版做两项修改：
+
+- rollout 的 jump 目标由“教师当前节点到教师下一节点”改为“当前学生状态到教师下一节点”，
+  让每一步主动消除前面累计的轨迹偏差。
+- rollout 概率最高为 0.75，始终保留约 25% teacher-forced 样本，防止学生遗忘教师状态上的
+  正确区间映射。
+
+从第二版 epoch 10 的最佳学生启动第三版实验：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python main.py \
+  --config cfgs/PointGPT-L/distill_fixed16_to4_corrective.yaml \
+  --distill_model \
+  --ckpts experiments/finetune_scoredenoise/done-best/L_consistency_plus/ckpt-best.pth \
+  --start_ckpts experiments/distill_fixed16_to4_curriculum/PointGPT-L/L_T16_S4_curriculum_v2/ckpt-best.pth \
+  --exp_name L_T16_S4_corrective_v3 \
+  --val_freq 5
+```

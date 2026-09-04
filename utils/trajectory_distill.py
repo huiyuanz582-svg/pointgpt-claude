@@ -178,7 +178,8 @@ def rollout_distill_loss(student_states, student_fields, teacher_states,
                          trajectory_weight=0.25, endpoint_weight=1.0,
                          clean_weight=0.5, jump_loss_type='smooth_l1',
                          normalize_state_losses=False,
-                         state_scale_floor=1e-4):
+                         state_scale_floor=1e-4,
+                         rollout_jump_target='teacher_delta'):
     """计算完整学生 rollout 的跳步、轨迹、教师端点和 clean 锚定损失。"""
     indices = validate_teacher_indices(teacher_indices)
     if len(student_states) != len(indices):
@@ -190,8 +191,20 @@ def rollout_distill_loss(student_states, student_fields, teacher_states,
     for stage_idx, pred in enumerate(student_fields):
         left, right = indices[stage_idx], indices[stage_idx + 1]
         sigma_t = teacher_sigma(sigma0, left, teacher_decay).to(pred.device)
-        target = teacher_jump_target(
-            teacher_states[left], teacher_states[right], sigma_t)
+        if rollout_jump_target == 'teacher_delta':
+            # 第一/二版行为：模仿教师在教师状态上的区间位移。
+            target = teacher_jump_target(
+                teacher_states[left], teacher_states[right], sigma_t)
+        elif rollout_jump_target == 'corrective':
+            # 学生 rollout 已偏离教师轨迹时，教师原位移不能消除累计误差。
+            # 改为从“当前学生状态”直接指向下一个教师 landmark；detach 防止
+            # target 本身跟随学生状态移动，梯度仍会经 pred 回传到前序学生步。
+            target = teacher_jump_target(
+                student_states[stage_idx].detach(), teacher_states[right], sigma_t)
+        else:
+            raise ValueError(
+                'rollout_jump_target 仅支持 teacher_delta/corrective，当前为 '
+                f'{rollout_jump_target}')
         if jump_loss_type == 'mse':
             jump_terms.append(F.mse_loss(pred, target))
         elif jump_loss_type == 'smooth_l1':
