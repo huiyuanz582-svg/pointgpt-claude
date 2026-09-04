@@ -1,0 +1,24 @@
+# Stage 1 official comparison configuration.
+# Keep the corrective 16-to-4 distillation method, but restore the dataset
+# split and validation protocol used by the first paper:
+#   - train on all 40 PUNet train shapes at 10k/30k/50k;
+#   - keep the original 50x dynamic patch sampling per shape and epoch;
+#   - validate on the 20 PUNet test shapes at 10k / 1% noise;
+#   - use the same SOR post-processing as the first-paper configuration.
+#
+# This file is intentionally separate from the v3 development configuration,
+# whose 4-shape held-out validation results should remain reproducible.
+_base_: cfgs/PointGPT-L/distill_fixed16_to4_corrective.yaml
+
+dataset:
+  train:
+    _base_:
+      TRAIN_OVERSAMPLE: 50
+      VAL_NUM: 0
+      VAL_NOISE_LEVELS: [0.01]
+  val:
+    _base_:
+      VAL_NUM: 0
+      VAL_NOISE_LEVELS: [0.01]
+
+sor_enable: True
