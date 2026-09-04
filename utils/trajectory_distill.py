@@ -176,7 +176,9 @@ def rollout_distill_loss(student_states, student_fields, teacher_states,
                          clean_patch, sigma0, teacher_indices,
                          teacher_decay=0.95, jump_weight=1.0,
                          trajectory_weight=0.25, endpoint_weight=1.0,
-                         clean_weight=0.5, jump_loss_type='smooth_l1'):
+                         clean_weight=0.5, jump_loss_type='smooth_l1',
+                         normalize_state_losses=False,
+                         state_scale_floor=1e-4):
     """计算完整学生 rollout 的跳步、轨迹、教师端点和 clean 锚定损失。"""
     indices = validate_teacher_indices(teacher_indices)
     if len(student_states) != len(indices):
@@ -198,20 +200,33 @@ def rollout_distill_loss(student_states, student_fields, teacher_states,
             raise ValueError(f'不支持的 jump loss: {jump_loss_type}')
     jump = torch.stack(jump_terms).mean()
 
+    def state_loss(prediction, target):
+        if not normalize_state_losses:
+            return F.smooth_l1_loss(prediction, target)
+        # 点坐标位于单位球空间，未经归一化时状态误差通常比 jump loss 小
+        # 3～4 个数量级。按每个样本的初始噪声 σ0 归一化后，不同噪声等级
+        # 的监督具有可比尺度，也避免靠极大的经验权重补偿单位差异。
+        scale = sigma0.reshape(-1, 1, 1).to(
+            device=prediction.device, dtype=prediction.dtype)
+        scale = scale.clamp_min(float(state_scale_floor))
+        residual = (prediction - target) / scale
+        return F.smooth_l1_loss(residual, torch.zeros_like(residual))
+
     intermediate = [
-        F.smooth_l1_loss(student_states[j], teacher_states[indices[j]])
+        state_loss(student_states[j], teacher_states[indices[j]])
         for j in range(1, len(indices) - 1)
     ]
     trajectory = (torch.stack(intermediate).mean() if intermediate
                   else student_states[-1].new_zeros(()))
-    endpoint = F.smooth_l1_loss(student_states[-1], teacher_states[indices[-1]])
-    clean = F.smooth_l1_loss(student_states[-1], clean_patch)
+    endpoint = state_loss(student_states[-1], teacher_states[indices[-1]])
+    clean = state_loss(student_states[-1], clean_patch)
     total = (float(jump_weight) * jump +
              float(trajectory_weight) * trajectory +
              float(endpoint_weight) * endpoint +
              float(clean_weight) * clean)
     terms = {
         'jump': jump,
+        'jump_per_stage': jump_terms,
         'trajectory': trajectory,
         'endpoint': endpoint,
         'clean': clean,

@@ -130,3 +130,28 @@ CUDA_VISIBLE_DEVICES=0 python main.py \
 ```
 
 训练时传入的 `--ckpts` 是冻结教师；测试时传入的 `--ckpts` 是已经训练好的学生。
+
+## 十一、第一版试跑后的第二版课程
+
+第一版在纯 teacher-forced 阶段结束后直接切到完整 rollout，出现验证退化；同时，
+未经尺度归一化的轨迹、终点和 clean 损失远小于 jump loss。第二版配置
+`distill_fixed16_to4_curriculum.yaml` 做了两项修正：
+
+- 按每个样本的初始噪声尺度归一化状态损失。
+- 用 12 个 epoch 逐渐把 rollout batch 比例从 0 增加到 1。
+
+可以使用第一版保存的 epoch 5 最佳学生作为初始化，但冻结教师仍然使用第一篇论文的
+最终 checkpoint：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python main.py \
+  --config cfgs/PointGPT-L/distill_fixed16_to4_curriculum.yaml \
+  --distill_model \
+  --ckpts experiments/finetune_scoredenoise/done-best/L_consistency_plus/ckpt-best.pth \
+  --start_ckpts experiments/distill_fixed16_to4/PointGPT-L/L_T16_S4_baseline/ckpt-best.pth \
+  --exp_name L_T16_S4_curriculum_v2 \
+  --val_freq 5
+```
+
+程序会在训练前使用同一个留出验证集分别评估：学生初值、教师 4 步和教师 16 步，
+并把学生初值保存为 `ckpt-init.pth` 和初始 `ckpt-best.pth`。

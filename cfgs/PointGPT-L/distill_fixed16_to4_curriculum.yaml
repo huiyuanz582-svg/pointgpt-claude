@@ -1,0 +1,31 @@
+# 阶段 1 第二版：修复第一版 rollout 硬切换和状态损失量级失衡。
+_base_: cfgs/PointGPT-L/distill_fixed16_to4.yaml
+
+optimizer:
+  { type: AdamW, kwargs: { lr: 0.00001, weight_decay: 0.05 } }
+
+scheduler:
+  { type: CosLR, kwargs: { epochs: 40, initial_epochs: 3 } }
+
+max_epoch: 40
+
+distillation:
+  {
+    # 先进行 3 epoch 纯 teacher-forced；随后用 12 epoch 将 rollout batch
+    # 概率线性增加到 1，避免第一版在 epoch 10 突然切换输入分布。
+    teacher_forcing_epochs: 3,
+    rollout_ramp_epochs: 12,
+
+    # 状态误差除以每个样本的初始噪声 σ0，使其与归一化 jump loss 同量级。
+    normalize_state_losses: True,
+    state_scale_floor: 0.0001,
+    jump_weight: 1.0,
+    trajectory_weight: 0.25,
+    endpoint_weight: 0.25,
+    clean_weight: 0.05,
+
+    # 开训前在同一留出验证集上记录学生初值、教师 4 步和教师 16 步。
+    evaluate_initial_baselines: True,
+    baseline_teacher_steps: [4, 16],
+  }
+
