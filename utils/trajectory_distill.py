@@ -205,10 +205,13 @@ def rollout_distill_loss(student_states, student_fields, teacher_states,
             raise ValueError(
                 'rollout_jump_target 仅支持 teacher_delta/corrective，当前为 '
                 f'{rollout_jump_target}')
+        # 权重为 0 时仍保留数值用于日志，但不把这条监督接入反向图。
+        pred_for_loss = pred if float(jump_weight) > 0 else pred.detach()
+        target_for_loss = target if float(jump_weight) > 0 else target.detach()
         if jump_loss_type == 'mse':
-            jump_terms.append(F.mse_loss(pred, target))
+            jump_terms.append(F.mse_loss(pred_for_loss, target_for_loss))
         elif jump_loss_type == 'smooth_l1':
-            jump_terms.append(F.smooth_l1_loss(pred, target))
+            jump_terms.append(F.smooth_l1_loss(pred_for_loss, target_for_loss))
         else:
             raise ValueError(f'不支持的 jump loss: {jump_loss_type}')
     jump = torch.stack(jump_terms).mean()
@@ -226,13 +229,22 @@ def rollout_distill_loss(student_states, student_fields, teacher_states,
         return F.smooth_l1_loss(residual, torch.zeros_like(residual))
 
     intermediate = [
-        state_loss(student_states[j], teacher_states[indices[j]])
+        state_loss(
+            student_states[j] if float(trajectory_weight) > 0
+            else student_states[j].detach(),
+            teacher_states[indices[j]])
         for j in range(1, len(indices) - 1)
     ]
     trajectory = (torch.stack(intermediate).mean() if intermediate
                   else student_states[-1].new_zeros(()))
-    endpoint = state_loss(student_states[-1], teacher_states[indices[-1]])
-    clean = state_loss(student_states[-1], clean_patch)
+    endpoint = state_loss(
+        student_states[-1] if float(endpoint_weight) > 0
+        else student_states[-1].detach(),
+        teacher_states[indices[-1]])
+    clean = state_loss(
+        student_states[-1] if float(clean_weight) > 0
+        else student_states[-1].detach(),
+        clean_patch)
     total = (float(jump_weight) * jump +
              float(trajectory_weight) * trajectory +
              float(endpoint_weight) * endpoint +

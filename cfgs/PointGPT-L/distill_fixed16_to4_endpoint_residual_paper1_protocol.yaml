@@ -1,0 +1,20 @@
+# Stage 1 v4 official training budget. Run only after the 5x quick verification
+# has produced a ckpt-best that is better than the initialization baseline.
+_base_: cfgs/PointGPT-L/distill_fixed16_to4_endpoint_residual.yaml
+
+scheduler:
+  { type: CosLR, kwargs: { epochs: 30, initial_epochs: 2 } }
+
+max_epoch: 30
+
+distillation:
+  {
+    progress_log_interval: 500,
+    early_stop_patience: 5,
+  }
+
+dataset:
+  train:
+    _base_:
+      TRAIN_OVERSAMPLE: 50
+

@@ -1,0 +1,40 @@
+# Stage 1 v4 quick verification: preserve the strong zero-shot 4-step sampler.
+# Use the first-paper validation protocol, but only 5x dynamic sampling while
+# checking whether endpoint-focused residual conditioning can beat ckpt-init.
+_base_: cfgs/PointGPT-L/distill_fixed16_to4_corrective_paper1_protocol.yaml
+
+optimizer:
+  { type: AdamW, kwargs: { lr: 0.000005, weight_decay: 0.05 } }
+
+scheduler:
+  { type: CosLR, kwargs: { epochs: 10, initial_epochs: 1 } }
+
+max_epoch: 10
+
+distillation:
+  {
+    # The copied PointGPT backbone already gives a strong 4-step result. Keep it
+    # fixed and learn only the zero-initialized conditional residual pathway.
+    student_trainable: conditioning_only,
+
+    # Do not force the student through T4/T8/T12. Let its own useful 4-step path
+    # remain free and supervise the final result against T16 and clean points.
+    teacher_forcing_epochs: 0,
+    rollout_ramp_epochs: 0,
+    max_rollout_probability: 1.0,
+    jump_weight: 0.0,
+    trajectory_weight: 0.0,
+    endpoint_weight: 1.0,
+    clean_weight: 0.1,
+
+    # Make long epochs observable and stop quickly when the strong initialization
+    # cannot be improved.
+    progress_log_interval: 100,
+    early_stop_patience: 3,
+  }
+
+dataset:
+  train:
+    _base_:
+      TRAIN_OVERSAMPLE: 5
+

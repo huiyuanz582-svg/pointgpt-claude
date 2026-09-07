@@ -76,6 +76,44 @@ def _meter_avg(meter):
     return meter.avg() if meter.count() > 0 else 0.0
 
 
+def _configure_student_trainable_scope(student, scope, logger=None):
+    """限制蒸馏时可训练参数，保护已经很强的教师初始化主干。"""
+    scope = str(scope).lower()
+    module = student.module if isinstance(student, nn.DataParallel) else student
+    if scope == 'all':
+        module.requires_grad_(True)
+    elif scope == 'conditioning_only':
+        if not hasattr(module, 'distill_condition_mlp'):
+            raise ValueError(
+                'student_trainable=conditioning_only 要求模型启用 distill_conditioning')
+        module.requires_grad_(False)
+        module.distill_condition_mlp.requires_grad_(True)
+    else:
+        raise ValueError(
+            'student_trainable 仅支持 all/conditioning_only，当前为 '
+            f'{scope}')
+
+    trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in module.parameters())
+    if trainable <= 0:
+        raise RuntimeError('学生模型没有可训练参数')
+    print_log(
+        '[Distill] 学生可训练范围=%s，参数=%d/%d (%.4f%%)' %
+        (scope, trainable, total, 100.0 * trainable / total),
+        logger=logger)
+    return scope
+
+
+def _set_student_train_mode(student, trainable_scope):
+    """冻结主干时保持其确定性推理行为，只开启条件 MLP 的训练模式。"""
+    if trainable_scope == 'conditioning_only':
+        student.eval()
+        module = student.module if isinstance(student, nn.DataParallel) else student
+        module.distill_condition_mlp.train()
+    else:
+        student.train()
+
+
 def _evaluate_initial_baselines(student, teacher, val_dataloader, args, config,
                                 distill_cfg, logger):
     """用同一验证集和后处理协议测学生初值及教师截断轨迹。"""
@@ -170,6 +208,12 @@ def run_net(args, config, train_writer=None, val_writer=None):
     state_scale_floor = float(_cfg_value(distill_cfg, 'state_scale_floor', 1e-4))
     evaluate_initial_baselines = bool(
         _cfg_value(distill_cfg, 'evaluate_initial_baselines', False))
+    student_trainable = str(
+        _cfg_value(distill_cfg, 'student_trainable', 'all')).lower()
+    progress_log_interval = int(
+        _cfg_value(distill_cfg, 'progress_log_interval', 0))
+    early_stop_patience = int(
+        _cfg_value(distill_cfg, 'early_stop_patience', 0))
     if not 0 <= teacher_forcing_epochs <= int(config.max_epoch):
         raise ValueError('teacher_forcing_epochs 必须位于 [0, max_epoch]')
     if rollout_ramp_epochs < 0:
@@ -188,6 +232,8 @@ def run_net(args, config, train_writer=None, val_writer=None):
         raise ValueError('teacher-forced 阶段要求 jump_weight > 0')
     if state_scale_floor <= 0:
         raise ValueError('state_scale_floor 必须 > 0')
+    if progress_log_interval < 0 or early_stop_patience < 0:
+        raise ValueError('progress_log_interval/early_stop_patience 必须 >= 0')
 
     train_sampler, train_dataloader = builder.dataset_builder(args, config.dataset.train)
     _, val_dataloader = builder.dataset_builder(args, config.dataset.val)
@@ -195,6 +241,8 @@ def run_net(args, config, train_writer=None, val_writer=None):
     teacher, student = _build_models(
         config, args.ckpts, device, logger,
         student_checkpoint_path=args.start_ckpts)
+    student_trainable = _configure_student_trainable_scope(
+        student, student_trainable, logger=logger)
     optimizer, scheduler = builder.build_opti_sche(student, config)
 
     start_epoch = 0
@@ -221,6 +269,10 @@ def run_net(args, config, train_writer=None, val_writer=None):
          max_rollout_probability, rollout_jump_target,
          normalize_state_losses, accumulation),
         logger=logger)
+    print_log(
+        '[Distill] progress-log=%d batches，early-stop-patience=%d validations' %
+        (progress_log_interval, early_stop_patience),
+        logger=logger)
 
     if evaluate_initial_baselines and not args.resume:
         metrics = _evaluate_initial_baselines(
@@ -235,10 +287,11 @@ def run_net(args, config, train_writer=None, val_writer=None):
             'ckpt-best', args, logger=logger)
 
     student.zero_grad(set_to_none=True)
+    bad_validation_count = 0
     for epoch in range(start_epoch, config.max_epoch + 1):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
-        student.train()
+        _set_student_train_mode(student, student_trainable)
         teacher.eval()
         epoch_start = time.time()
         meters = {
@@ -342,6 +395,16 @@ def run_net(args, config, train_writer=None, val_writer=None):
                 n_itr = epoch * len(train_dataloader) + idx
                 train_writer.add_scalar('Distill/Batch/Total', loss.item(), n_itr)
                 train_writer.add_scalar('Distill/Batch/LR', optimizer.param_groups[0]['lr'], n_itr)
+            if (progress_log_interval > 0 and
+                    ((idx + 1) % progress_log_interval == 0 or
+                     idx + 1 == len(train_dataloader))):
+                print_log(
+                    '[Distill/Progress] epoch=%d batch=%d/%d tf=%d rollout=%d '
+                    'total_avg=%.6f elapsed=%.1fs' %
+                    (epoch, idx + 1, len(train_dataloader),
+                     teacher_forced_batches, rollout_batches,
+                     _meter_avg(meters['total']), time.time() - epoch_start),
+                    logger=logger)
 
         # 不丢弃 epoch 末尾不足 accumulation 的有效梯度。
         if accumulated > 0:
@@ -383,19 +446,32 @@ def run_net(args, config, train_writer=None, val_writer=None):
                 train_writer.add_scalar(
                     f'Distill/Epoch/JumpStage{stage_idx}', value, epoch)
 
+        should_stop = False
         if epoch % args.val_freq == 0 and epoch != 0:
             torch.cuda.empty_cache()
             metrics = validate(
                 student, val_dataloader, epoch, val_writer, args, config, logger=logger)
             if metrics.better_than(best_metrics):
                 best_metrics = metrics
+                bad_validation_count = 0
                 builder.save_checkpoint(
                     student, optimizer, epoch, metrics, best_metrics,
                     'ckpt-best', args, logger=logger)
+            else:
+                bad_validation_count += 1
+                if (early_stop_patience > 0 and
+                        bad_validation_count >= early_stop_patience):
+                    should_stop = True
 
         builder.save_checkpoint(
             student, optimizer, epoch, metrics, best_metrics,
             'ckpt-last', args, logger=logger)
+        if should_stop:
+            print_log(
+                '[Distill] 连续 %d 次验证未改善，提前停止；保留 ckpt-best.pth' %
+                bad_validation_count,
+                logger=logger)
+            break
 
     if train_writer is not None:
         train_writer.close()
