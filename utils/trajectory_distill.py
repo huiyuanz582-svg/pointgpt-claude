@@ -179,7 +179,8 @@ def rollout_distill_loss(student_states, student_fields, teacher_states,
                          clean_weight=0.5, jump_loss_type='smooth_l1',
                          normalize_state_losses=False,
                          state_scale_floor=1e-4,
-                         rollout_jump_target='teacher_delta'):
+                         rollout_jump_target='teacher_delta',
+                         chamfer_weight=0.0, chamfer_metric=None):
     """计算完整学生 rollout 的跳步、轨迹、教师端点和 clean 锚定损失。"""
     indices = validate_teacher_indices(teacher_indices)
     if len(student_states) != len(indices):
@@ -245,15 +246,40 @@ def rollout_distill_loss(student_states, student_fields, teacher_states,
         student_states[-1] if float(clean_weight) > 0
         else student_states[-1].detach(),
         clean_patch)
+
+    # The point-wise endpoint/clean losses can reduce point-to-surface error while
+    # still allowing uneven point coverage.  A bidirectional Chamfer term directly
+    # supervises the metric that showed this failure on full-cloud validation.
+    # Divide coordinates by each sample's noise scale so the term has comparable
+    # magnitude across the log-uniform 0.5%--2% training noise distribution.
+    if float(chamfer_weight) > 0:
+        if chamfer_metric is None:
+            raise ValueError('chamfer_weight > 0 requires chamfer_metric')
+        if normalize_state_losses:
+            chamfer_scale = sigma0.reshape(-1, 1, 1).to(
+                device=student_states[-1].device,
+                dtype=student_states[-1].dtype)
+            chamfer_scale = chamfer_scale.clamp_min(float(state_scale_floor))
+            chamfer_prediction = student_states[-1] / chamfer_scale
+            chamfer_target = clean_patch / chamfer_scale
+        else:
+            chamfer_prediction = student_states[-1]
+            chamfer_target = clean_patch
+        chamfer = chamfer_metric(chamfer_prediction.contiguous(),
+                                 chamfer_target.contiguous())
+    else:
+        chamfer = student_states[-1].new_zeros(())
     total = (float(jump_weight) * jump +
              float(trajectory_weight) * trajectory +
              float(endpoint_weight) * endpoint +
-             float(clean_weight) * clean)
+             float(clean_weight) * clean +
+             float(chamfer_weight) * chamfer)
     terms = {
         'jump': jump,
         'jump_per_stage': jump_terms,
         'trajectory': trajectory,
         'endpoint': endpoint,
         'clean': clean,
+        'chamfer': chamfer,
     }
     return total, terms

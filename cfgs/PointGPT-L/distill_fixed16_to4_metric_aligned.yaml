@@ -1,0 +1,19 @@
+# Stage 1 v6 quick verification: align training with the bidirectional CD metric.
+#
+# V5 improved P2M but degraded CD, showing that point-wise endpoint regression
+# alone does not preserve point coverage.  This version adds normalized L2
+# Chamfer supervision at the four-step endpoint.
+_base_: cfgs/PointGPT-L/distill_fixed16_to4_decoder_residual.yaml
+
+distillation:
+  {
+    # Teacher T16 remains the main target.  Reduce point-wise clean regression
+    # and add a metric-aligned, bidirectional clean-cloud coverage term.
+    endpoint_weight: 1.0,
+    clean_weight: 0.02,
+    chamfer_weight: 0.01,
+
+    progress_log_interval: 100,
+    early_stop_patience: 4,
+  }
+

@@ -222,6 +222,7 @@ def run_net(args, config, train_writer=None, val_writer=None):
     trajectory_weight = float(_cfg_value(distill_cfg, 'trajectory_weight', 0.25))
     endpoint_weight = float(_cfg_value(distill_cfg, 'endpoint_weight', 1.0))
     clean_weight = float(_cfg_value(distill_cfg, 'clean_weight', 0.5))
+    chamfer_weight = float(_cfg_value(distill_cfg, 'chamfer_weight', 0.0))
     normalize_state_losses = bool(
         _cfg_value(distill_cfg, 'normalize_state_losses', False))
     state_scale_floor = float(_cfg_value(distill_cfg, 'state_scale_floor', 1e-4))
@@ -243,9 +244,11 @@ def run_net(args, config, train_writer=None, val_writer=None):
         raise ValueError('rollout_jump_target 仅支持 teacher_delta/corrective')
     if teacher_step_size <= 0 or not 0 < teacher_decay <= 1:
         raise ValueError('teacher_step_size 必须 > 0，teacher_decay 必须位于 (0, 1]')
-    if min(jump_weight, trajectory_weight, endpoint_weight, clean_weight) < 0:
+    if min(jump_weight, trajectory_weight, endpoint_weight,
+           clean_weight, chamfer_weight) < 0:
         raise ValueError('所有蒸馏损失权重都必须 >= 0')
-    if jump_weight + trajectory_weight + endpoint_weight + clean_weight <= 0:
+    if (jump_weight + trajectory_weight + endpoint_weight + clean_weight +
+            chamfer_weight <= 0):
         raise ValueError('至少需要启用一个蒸馏损失')
     if teacher_forcing_epochs > 0 and jump_weight <= 0:
         raise ValueError('teacher-forced 阶段要求 jump_weight > 0')
@@ -262,6 +265,14 @@ def run_net(args, config, train_writer=None, val_writer=None):
         student_checkpoint_path=args.start_ckpts)
     student_trainable = _configure_student_trainable_scope(
         student, student_trainable, logger=logger)
+    student_module = student.module if isinstance(student, nn.DataParallel) else student
+    chamfer_metric = None
+    if chamfer_weight > 0:
+        chamfer_metric = getattr(student_module, 'loss_func_p2', None)
+        if chamfer_metric is None:
+            raise ValueError(
+                'chamfer_weight > 0 requires model.loss=cdl12 '
+                '(ChamferDistanceL2)')
     optimizer, scheduler = builder.build_opti_sche(student, config)
 
     start_epoch = 0
@@ -315,7 +326,8 @@ def run_net(args, config, train_writer=None, val_writer=None):
         epoch_start = time.time()
         meters = {
             key: AverageMeter()
-            for key in ('total', 'jump', 'trajectory', 'endpoint', 'clean')
+            for key in ('total', 'jump', 'trajectory', 'endpoint', 'clean',
+                        'chamfer')
         }
         stage_jump_meters = [AverageMeter() for _ in range(len(teacher_indices) - 1)]
         rollout_probability = _rollout_probability(
@@ -372,12 +384,15 @@ def run_net(args, config, train_writer=None, val_writer=None):
                         jump_loss_type=jump_loss_type,
                         normalize_state_losses=normalize_state_losses,
                         state_scale_floor=state_scale_floor,
-                        rollout_jump_target=rollout_jump_target)
+                        rollout_jump_target=rollout_jump_target,
+                        chamfer_weight=chamfer_weight,
+                        chamfer_metric=chamfer_metric)
                     jump_value = terms['jump'].item()
                     component_values = {
                         'trajectory': terms['trajectory'].item(),
                         'endpoint': terms['endpoint'].item(),
                         'clean': terms['clean'].item(),
+                        'chamfer': terms['chamfer'].item(),
                     }
                     stage_values = [item.item() for item in terms['jump_per_stage']]
 
@@ -449,11 +464,12 @@ def run_net(args, config, train_writer=None, val_writer=None):
         print_log(
             '[Distill] EPOCH %d/%d phase=%s rollout_p=%.3f batches(tf=%d,rollout=%d) '
             'time=%.1fs total=%.6f jump=%.6f trajectory=%.6f endpoint=%.6f '
-            'clean=%.6f stage_jump=%s' %
+            'clean=%.6f chamfer=%.6f stage_jump=%s' %
             (epoch, config.max_epoch, phase, rollout_probability,
              teacher_forced_batches, rollout_batches, time.time() - epoch_start,
              averages['total'], averages['jump'], averages['trajectory'],
              averages['endpoint'], averages['clean'],
+             averages['chamfer'],
              '[' + ', '.join('%.6f' % value for value in stage_averages) + ']'),
             logger=logger)
         if train_writer is not None:

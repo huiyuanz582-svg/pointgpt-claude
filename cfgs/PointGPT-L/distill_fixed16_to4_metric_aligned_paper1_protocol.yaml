@@ -1,0 +1,20 @@
+# Stage 1 v6 official budget.  Use only after the quick configuration improves
+# both CD and P2M over the V5 initialization.
+_base_: cfgs/PointGPT-L/distill_fixed16_to4_metric_aligned.yaml
+
+scheduler:
+  { type: CosLR, kwargs: { epochs: 30, initial_epochs: 2 } }
+
+max_epoch: 30
+
+distillation:
+  {
+    progress_log_interval: 500,
+    early_stop_patience: 5,
+  }
+
+dataset:
+  train:
+    _base_:
+      TRAIN_OVERSAMPLE: 50
+
