@@ -76,21 +76,38 @@ def _meter_avg(meter):
     return meter.avg() if meter.count() > 0 else 0.0
 
 
+def _distill_trainable_modules(module, scope):
+    """Return the modules that are allowed to adapt for a frozen-backbone scope."""
+    if not hasattr(module, 'distill_condition_mlp'):
+        raise ValueError(
+            f'student_trainable={scope} requires model.distill_conditioning.enable=True')
+
+    trainable_modules = [module.distill_condition_mlp]
+    if scope == 'conditioning_and_decoder':
+        # The condition MLP only adds one patch-shared vector before the frozen
+        # extractor.  Letting the pretrained generator adapt gives the student
+        # point-dependent correction capacity while the 24-layer extractor and
+        # local point encoder remain protected.
+        trainable_modules.append(module.generator_blocks)
+        if hasattr(module, 'fc_decoder_head'):
+            trainable_modules.append(module.fc_decoder_head)
+    return trainable_modules
+
+
 def _configure_student_trainable_scope(student, scope, logger=None):
     """限制蒸馏时可训练参数，保护已经很强的教师初始化主干。"""
     scope = str(scope).lower()
     module = student.module if isinstance(student, nn.DataParallel) else student
     if scope == 'all':
         module.requires_grad_(True)
-    elif scope == 'conditioning_only':
-        if not hasattr(module, 'distill_condition_mlp'):
-            raise ValueError(
-                'student_trainable=conditioning_only 要求模型启用 distill_conditioning')
+    elif scope in ('conditioning_only', 'conditioning_and_decoder'):
         module.requires_grad_(False)
-        module.distill_condition_mlp.requires_grad_(True)
+        for trainable_module in _distill_trainable_modules(module, scope):
+            trainable_module.requires_grad_(True)
     else:
         raise ValueError(
-            'student_trainable 仅支持 all/conditioning_only，当前为 '
+            'student_trainable 仅支持 all/conditioning_only/'
+            'conditioning_and_decoder，当前为 '
             f'{scope}')
 
     trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
@@ -105,11 +122,13 @@ def _configure_student_trainable_scope(student, scope, logger=None):
 
 
 def _set_student_train_mode(student, trainable_scope):
-    """冻结主干时保持其确定性推理行为，只开启条件 MLP 的训练模式。"""
-    if trainable_scope == 'conditioning_only':
+    """冻结主干时保持其确定性推理行为，只开启允许更新的模块。"""
+    if trainable_scope in ('conditioning_only', 'conditioning_and_decoder'):
         student.eval()
         module = student.module if isinstance(student, nn.DataParallel) else student
-        module.distill_condition_mlp.train()
+        for trainable_module in _distill_trainable_modules(
+                module, trainable_scope):
+            trainable_module.train()
     else:
         student.train()
 

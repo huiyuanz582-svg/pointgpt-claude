@@ -1,0 +1,41 @@
+# Stage 1 v5 quick verification: add controlled point-dependent capacity.
+#
+# V4 proved that endpoint-only training no longer destroys the strong zero-shot
+# four-step initialization, but conditioning_only improved the official score by
+# only about 0.14%.  The condition MLP emits one vector shared by every patch
+# token, so it is too restrictive for the remaining spatial correction.
+_base_: cfgs/PointGPT-L/distill_fixed16_to4_endpoint_residual.yaml
+
+optimizer:
+  # The pretrained generator is now trainable.  Use a conservative learning
+  # rate (5x lower than V4) so that the initial four-step sampler is not erased.
+  { type: AdamW, kwargs: { lr: 0.000001, weight_decay: 0.05 } }
+
+scheduler:
+  { type: CosLR, kwargs: { epochs: 12, initial_epochs: 1 } }
+
+max_epoch: 12
+
+distillation:
+  {
+    # Freeze the local encoder and the 24-layer GPT extractor.  Train only the
+    # stage/noise condition MLP and the 4-layer point generator/decoder.
+    student_trainable: conditioning_and_decoder,
+
+    # Keep V4's stable endpoint-residual objective and validation safeguards.
+    teacher_forcing_epochs: 0,
+    rollout_ramp_epochs: 0,
+    max_rollout_probability: 1.0,
+    jump_weight: 0.0,
+    trajectory_weight: 0.0,
+    endpoint_weight: 1.0,
+    clean_weight: 0.1,
+    progress_log_interval: 100,
+    early_stop_patience: 3,
+  }
+
+dataset:
+  train:
+    _base_:
+      TRAIN_OVERSAMPLE: 5
+
