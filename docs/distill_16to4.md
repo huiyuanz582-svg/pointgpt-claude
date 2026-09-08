@@ -18,9 +18,32 @@ python tools/runner_distill.py --mode train \
 
 冒烟可附加 `--epochs 1 --max_patch_batches 1`（一个 baseline DataLoader batch），
 并使用不同输出目录。`--max_shapes` 在训练时限制 patch 样本数，测试时限制整云数。
-每 epoch 保存 `ckpt-last.pth`（包含优化器状态和固定日程）、`train.jsonl`，
-`manifest.json` 记录配置、checkpoint 路径和命令参数。不按训练损失冒充验证最优，
-不做自动长训练、调参或下一阶段训练。已有非空输出目录会被拒绝。
+只保存两份 checkpoint：每 epoch 更新 `ckpt-last.pth`（包含优化器状态，可续训），
+仅在验证指标改善时更新 `ckpt-best.pth`，不再保存逐 epoch 的独立权重文件。
+`train.jsonl` 每 epoch 记录训练 loss、验证 loss、best epoch；`manifest.json` 记录运行参数。
+best 文件只保存模型权重及元数据，不重复保存优化器状态。非空输出目录仍拒绝覆盖。
+
+best 的标准是**固定验证 patch 上四阶段 teacher-forced trajectory loss 的均值**，越小越好；
+不是训练 loss，也不代表 CD/P2M 或连续四步去噪质量一定最好。
+验证沿用原 `ScoreDenoise.val_dataloader()`：`VAL_NUM=0` 时仍使用原 test split，
+`VAL_NUM>0` 时使用已从训练中排除的 shape；没有新增训练划分。
+验证噪声固定，每个整云以 `validation_seed=2024` 固定抽取 4 个 patch，Teacher targets
+只生成一次并缓存到 CPU；`validation_manifest.json` 记录样本和种子点。
+Student 验证使用 eval/no_grad，结束后恢复训练模式，不更新 BN 或梯度；不修改训练 loss。
+
+已启动的旧进程不会自动应用保存逻辑。等它生成 `ckpt-last.pth` 后，可在更新代码后续跑：
+
+```bash
+python tools/runner_distill.py --mode train \
+  --config cfgs/PointGPT-L/distill_16to4.yaml \
+  --teacher_ckpt /path/to/PointGPT-L/ckpt-best.pth \
+  --resume experiments/distill_16to4/train/ckpt-last.pth \
+  --output_dir experiments/distill_16to4/train_resumed
+```
+
+续跑恢复 Student、optimizer 和 epoch（`--epochs` 指目标总 epoch 数），Teacher 仍加载原
+去噪 checkpoint。新目录会先保留并验证恢复时的权重，再与后续 epoch 比较。
+旧进程已覆盖的历史权重无法恢复；该续跑不是随机数状态逐位复现。
 
 训练直接调用原 `ScoreDenoise.train_dataloader()`，使用 `PairedPatchDataset` 的
 train split、验证 shape 排除规则、三种分辨率和 `TRAIN_OVERSAMPLE=50`。
@@ -61,7 +84,7 @@ Chamfer/PyTorch3D 的历史依赖），但这些几何损失不会被调用。
 ```bash
 python tools/runner_distill.py --mode test \
   --config cfgs/PointGPT-L/distill_16to4.yaml \
-  --student_ckpt experiments/distill_16to4/train/ckpt-last.pth \
+  --student_ckpt experiments/distill_16to4/train/ckpt-best.pth \
   --output_dir experiments/distill_16to4/test --save_trajectory
 ```
 

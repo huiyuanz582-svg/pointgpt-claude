@@ -167,6 +167,7 @@ class DistillationTests(unittest.TestCase):
         config = SimpleNamespace(
             model={}, learning_rate=0.01, weight_decay=0.0,
             teacher_patch_batch=2, student_patch_batch=1, total_bs=2,
+            test_patch_batch=2,
             inference_patch_size=4, seed_ratio=2, fuse_tau_ratio=0.5,
             epochs=1, grad_norm_clip=1.0)
         args = SimpleNamespace(epochs=1, max_shapes=0, max_patch_batches=1)
@@ -180,7 +181,10 @@ class DistillationTests(unittest.TestCase):
                 self.teacher.weight.fill_(0.7)  # 区别于构造默认值，检查确实使用 checkpoint。
             expected = copy.deepcopy(self.teacher.state_dict())
             torch.save(dict(base_model=expected), teacher_path)
-            with patch.object(runner, '_train_loader', return_value=loader):
+            bank = [(runner.capture_teacher(self.teacher, self.noisy[:4][None], self.sigma0),
+                     torch.tensor([self.sigma0]))]
+            with patch.object(runner, '_train_loader', return_value=loader), \
+                    patch.object(runner, '_validation_bank', return_value=(bank, {'split': 'synthetic'})):
                 runner.train(args, config, SimpleNamespace(model_builder=build, load_model=load),
                              torch.device('cpu'), teacher_path, output)
             checkpoint = torch.load(output / 'ckpt-last.pth', weights_only=True)
@@ -189,11 +193,81 @@ class DistillationTests(unittest.TestCase):
             self.assertEqual(checkpoint['teacher_checkpoint'], str(teacher_path))
             self.assertIn('optimizer', checkpoint)
             self.assertTrue((output / 'train.jsonl').is_file())
+            self.assertEqual(list(output.glob('ckpt-epoch*.pth')), [])
+            self.assertEqual(torch.load(output / 'ckpt-best.pth', weights_only=True)['epoch'], 1)
             self.assertEqual(len(created), 1)  # Student 来自加载后的 Teacher deepcopy。
             for key, value in created[0].state_dict().items():
                 torch.testing.assert_close(value, expected[key], rtol=0, atol=0)
             self.assertFalse(torch.equal(checkpoint['base_model']['weight'], expected['weight']))
             self.assertTrue(all(not p.requires_grad and p.grad is None for p in created[0].parameters()))
+            # 旧版 last（没有 selection 字段）也可续训，恢复 optimizer 和 epoch。
+            checkpoint.pop('selection', None)
+            old_last = output / 'old-last.pth'
+            torch.save(checkpoint, old_last)
+            continued = output / 'continued'
+            continued.mkdir()
+            args.resume, args.epochs = str(old_last), 2
+            with patch.object(runner, '_train_loader', return_value=loader), \
+                    patch.object(runner, '_validation_bank', return_value=(bank, {'split': 'synthetic'})):
+                runner.train(args, config, SimpleNamespace(model_builder=build, load_model=load),
+                             torch.device('cpu'), teacher_path, continued)
+            self.assertEqual(torch.load(continued / 'ckpt-last.pth', weights_only=True)['epoch'], 2)
+            self.assertEqual({path.name for path in continued.glob('*.pth')},
+                             {'ckpt-last.pth', 'ckpt-best.pth'})
+            self.assertTrue((continued / 'ckpt-best.pth').is_file())
+
+    def test_best_selection_saves_only_last_and_best(self):
+        config = SimpleNamespace(model={})
+        optimizer = torch.optim.AdamW(self.student.parameters())
+        best_loss, best_epoch = float('inf'), None
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            for epoch, value in enumerate([0.3, 0.2, 0.4], start=1):
+                with torch.no_grad():
+                    self.student.weight.fill_(epoch)
+                best_loss, best_epoch, improved = runner.save_epoch_checkpoints(
+                    output, self.student, optimizer, epoch, Path('teacher.pth'), config,
+                    {'val_loss_traj': value}, best_loss, best_epoch)
+                self.assertEqual(improved, epoch < 3)
+            best = torch.load(output / 'ckpt-best.pth', weights_only=True)
+            last = torch.load(output / 'ckpt-last.pth', weights_only=True)
+            self.assertEqual(best['epoch'], 2)
+            self.assertEqual(float(best['base_model']['weight']), 2)
+            self.assertEqual(last['epoch'], 3)
+            self.assertEqual(best['selection']['best_value'], 0.2)
+            self.assertIn('optimizer', last)
+            self.assertEqual({path.name for path in output.iterdir()},
+                             {'ckpt-last.pth', 'ckpt-best.pth'})
+            with self.assertRaises(FloatingPointError):
+                runner.save_epoch_checkpoints(output, self.student, optimizer, 4, Path('teacher.pth'),
+                                              config, {'val_loss_traj': float('nan')}, best_loss, best_epoch)
+            self.assertEqual(torch.load(output / 'ckpt-last.pth', weights_only=True)['epoch'], 3)
+            self.assertEqual(torch.load(output / 'ckpt-best.pth', weights_only=True)['epoch'], 2)
+
+    def test_validation_preserves_batchnorm_gradients_and_train_mode(self):
+        class BatchNormModel(ToyEpsilonModel):
+            def __init__(self):
+                super().__init__()
+                self.bn = torch.nn.BatchNorm1d(3)
+
+            def forward(self, x, clean=None, type='val', name='', noise_std=None):
+                x = self.bn(x.transpose(1, 2)).transpose(1, 2)
+                return super().forward(x, clean, type, name, noise_std)
+
+        student = BatchNormModel().train()
+        bank = [(self.capture(), torch.full((4,), self.sigma0))]
+        before = copy.deepcopy(student.state_dict())
+        for parameter in student.parameters():
+            parameter.grad = torch.ones_like(parameter)
+        first = runner.validate_trajectory(student, bank, 2)
+        second = runner.validate_trajectory(student, bank, 2)
+        self.assertEqual(first, second)
+        self.assertTrue(student.training)
+        self.assertTrue(all(not call['grad'] and not call['training'] for call in student.calls))
+        for name, value in student.state_dict().items():
+            torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+        self.assertTrue(all(torch.equal(p.grad, torch.ones_like(p)) for p in student.parameters()))
+        self.assertEqual(first['val_patches'], 4)
 
     def test_same_patch_order_and_individual_sigma_teacher_schedule(self):
         patches = torch.randn(3, 7, 3)
@@ -240,7 +314,7 @@ class DistillationTests(unittest.TestCase):
         for source, names in (
             ('datasets/scoredenoise/transforms.py', {'NormalizeUnitSphere', 'AddNoise'}),
             ('datasets/ScoreDenoiseDataset.py', {'PointCloudDataset', 'PairedPatchDataset',
-                                                'ScoreDenoise', 'denoise_collate_fn_test'}),
+                                                'ScoreDenoise', 'HeldOutValDataset', 'denoise_collate_fn_test'}),
         ):
             tree = ast.parse((ROOT / source).read_text(encoding='utf-8'))
             nodes = [node for node in tree.body if isinstance(node, (ast.ClassDef, ast.FunctionDef))
@@ -257,8 +331,10 @@ class DistillationTests(unittest.TestCase):
                 ROOT=directory, DATASET='PUNet', RESOLUTIONS=['res_a', 'res_b'],
                 NOISE_MIN=0.005, NOISE_MAX=0.02, NOISE_LOG_UNIFORM=True,
                 PATCH_SIZE=1024, NUM_PATCHES=1, TRAIN_BATCH_SIZE=32, NUM_WORKERS=0,
-                VAL_NOISE=0.01, AUG_ROTATE=True, TRAIN_OVERSAMPLE=50, VAL_NUM=1)
-            config = SimpleNamespace(dataset=SimpleNamespace(_base_=cfg), total_bs=8)
+                VAL_NOISE=0.01, AUG_ROTATE=True, TRAIN_OVERSAMPLE=50, VAL_NUM=1,
+                VAL_RESOLUTION='res_a')
+            config = SimpleNamespace(dataset=SimpleNamespace(_base_=cfg), total_bs=8,
+                                     teacher_patch_batch=2, validation_patches_per_cloud=2)
             with patch.dict(sys.modules, {'datasets.ScoreDenoiseDataset': SimpleNamespace(ScoreDenoise=cls)}):
                 loader = runner._train_loader(config)
             self.assertEqual(cfg.TRAIN_BATCH_SIZE, 32)  # 不修改共享 dataset 配置。
@@ -282,6 +358,14 @@ class DistillationTests(unittest.TestCase):
             self.assertEqual(tuple(actual[0].shape), (8, 1024, 3))
             self.assertEqual(actual[5], expected[5])
             self.assertTrue(((actual[2] >= 0.005) & (actual[2] <= 0.02)).all())
+            state_before = torch.get_rng_state().clone()
+            with patch.dict(sys.modules, {'datasets.ScoreDenoiseDataset': SimpleNamespace(ScoreDenoise=cls)}):
+                bank, metadata = runner._validation_bank(config, self.teacher)
+                repeated, repeat_metadata = runner._validation_bank(config, self.teacher)
+            torch.testing.assert_close(torch.get_rng_state(), state_before, rtol=0, atol=0)
+            self.assertEqual(metadata, repeat_metadata)
+            self.assertEqual(metadata['split'], 'held_out_train')
+            torch.testing.assert_close(bank[0][0], repeated[0][0], rtol=0, atol=0)
 
 
 if __name__ == '__main__':

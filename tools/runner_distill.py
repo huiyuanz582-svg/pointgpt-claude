@@ -144,14 +144,107 @@ def _train_loader(config):
     return loader
 
 
-def _save_checkpoint(path, student, optimizer, epoch, teacher_path, config):
+def _validation_bank(config, teacher):
+    """固定验证 noisy/patch/Teacher target，跨 epoch 使用同一份 CPU 缓存。"""
+    import torch
+    from datasets.ScoreDenoiseDataset import ScoreDenoise
+    cfg = copy.deepcopy(config.dataset._base_)
+    data_module = ScoreDenoise(argparse.Namespace(distributed=False), cfg)
+    seed = int(getattr(config, 'validation_seed', 2024))
+    patches_per_cloud = int(getattr(config, 'validation_patches_per_cloud', 4))
+    if patches_per_cloud < 1:
+        raise ValueError('validation_patches_per_cloud 必须为正整数')
+    device = next(teacher.parameters()).device
+    cuda_devices = [device.index] if device.type == 'cuda' else []
+    bank, samples = [], []
+    # 验证准备不能推进训练采样所使用的 RNG。
+    with torch.random.fork_rng(devices=cuda_devices):
+        _, loader = data_module.val_dataloader()
+        for index in range(len(loader.dataset)):
+            sample = loader.dataset[index]
+            noisy = sample['pcl_noisy']
+            sigma0 = float(sample['noise_std'])
+            generator = torch.Generator().manual_seed(seed + index)
+            seeds = torch.randint(len(noisy), (patches_per_cloud,), generator=generator)
+            patch_size = min(int(cfg.PATCH_SIZE), len(noisy))
+            indices = ((noisy[None] - noisy[seeds, None]) ** 2).sum(-1).topk(
+                patch_size, dim=-1, largest=False).indices
+            nodes = capture_teacher(teacher, noisy[indices], sigma0,
+                                    int(config.teacher_patch_batch))
+            bank.append((nodes, torch.full((patches_per_cloud,), sigma0)))
+            samples.append(dict(name=sample['name'], sigma0=sigma0,
+                                seed_indices=seeds.tolist(), patch_size=patch_size))
+    if not bank:
+        raise ValueError('验证集为空，无法选择 best checkpoint')
+    metadata = dict(metric='val_loss_traj', teacher_forced=True, seed=seed,
+                    patches_per_cloud=patches_per_cloud, samples=samples,
+                    split='held_out_train' if data_module.val_num > 0 else 'test',
+                    schedule=schedule())
+    return bank, metadata
+
+
+def validate_trajectory(student, bank, patch_batch):
+    """只评固定验证状态对的 L_traj；不更新梯度或 BatchNorm running statistics。"""
+    import torch
+    if patch_batch < 1:
+        raise ValueError('validation patch_batch 必须为正数')
+    device = next(student.parameters()).device
+    was_training = student.training
+    student.eval()
+    totals, count = [0.0] * 4, 0
+    try:
+        with torch.no_grad():
+            for nodes, sigma0 in bank:
+                sigmas = _sigma_batch(sigma0, nodes.shape[1], device, nodes.dtype)
+                for offset in range(0, nodes.shape[1], patch_batch):
+                    batch_nodes = nodes[:, offset:offset + patch_batch].detach().to(device)
+                    size = batch_nodes.shape[1]
+                    for stage, start in enumerate(TEACHER_NODES[:-1]):
+                        sigma = sigmas[offset:offset + size] * TEACHER_DECAY ** start
+                        prediction = student(batch_nodes[stage], None, 'val', '', noise_std=sigma)
+                        loss = (prediction - batch_nodes[stage + 1]).square().sum(-1).mean()
+                        if not torch.isfinite(loss):
+                            raise FloatingPointError('验证 trajectory loss 非有限，不选择 best')
+                        totals[stage] += float(loss) * size
+                    count += size
+    finally:
+        student.train(was_training)
+    if not count:
+        raise ValueError('验证 patch 数为零')
+    means = [value / count for value in totals]
+    return dict(val_loss_traj=sum(means) / 4, val_stage_losses=means, val_patches=count)
+
+
+def _save_checkpoint(path, student, optimizer, epoch, teacher_path, config, selection=None):
     import torch
     temporary = path.with_suffix('.tmp')
-    torch.save(dict(
-        base_model=student.state_dict(), optimizer=optimizer.state_dict(),
+    payload = dict(
+        base_model=student.state_dict(),
         epoch=epoch, distillation=schedule(), teacher_checkpoint=str(teacher_path),
-        model_config=dict(config.model)), temporary)
+        model_config=dict(config.model), selection=selection)
+    if optimizer is not None:
+        payload['optimizer'] = optimizer.state_dict()
+    torch.save(payload, temporary)
     temporary.replace(path)
+
+
+def save_epoch_checkpoints(output, student, optimizer, epoch, teacher_path, config,
+                           validation, best_loss, best_epoch):
+    value = float(validation['val_loss_traj'])
+    if not math.isfinite(value):
+        raise FloatingPointError('验证 loss 非有限，不能保存为 best')
+    improved = value < best_loss
+    if improved:
+        best_loss, best_epoch = value, epoch
+    selection = dict(metric='val_loss_traj', value=value,
+                     best_value=best_loss, best_epoch=best_epoch)
+    # 只保留 last 和 best；last 含 optimizer，best 仅在验证指标改善时更新。
+    _save_checkpoint(output / 'ckpt-last.pth', student, optimizer, epoch,
+                     teacher_path, config, selection)
+    if improved:
+        _save_checkpoint(output / 'ckpt-best.pth', student, None, epoch,
+                         teacher_path, config, selection)
+    return best_loss, best_epoch, improved
 
 
 def train(args, config, builder, device, checkpoint_path, output):
@@ -166,15 +259,38 @@ def train(args, config, builder, device, checkpoint_path, output):
     student.train()
     optimizer = torch.optim.AdamW(student.parameters(), lr=float(config.learning_rate),
                                  weight_decay=float(config.weight_decay))
+    start_epoch = 1
+    if getattr(args, 'resume', None):
+        resumed = torch.load(args.resume, map_location='cpu')
+        if resumed.get('distillation') != schedule() or 'optimizer' not in resumed:
+            raise ValueError('--resume 需要相同日程且包含 optimizer 的 ckpt-last.pth')
+        student.load_state_dict(resumed['base_model'], strict=True)
+        optimizer.load_state_dict(resumed['optimizer'])
+        start_epoch = int(resumed['epoch']) + 1
+        del resumed
     loader = _train_loader(config)
     batch_size = int(config.student_patch_batch)
     epochs = args.epochs or int(config.epochs)
+    if start_epoch > epochs:
+        raise ValueError('epochs 是目标总 epoch 数，必须大于已完成的 resume epoch')
+    validation_bank, validation_metadata = _validation_bank(config, teacher)
+    with (output / 'validation_manifest.json').open('w', encoding='utf-8') as handle:
+        json.dump(validation_metadata, handle, indent=2, ensure_ascii=False)
+    print(f'[validation] fixed_patches={sum(nodes.shape[1] for nodes, _ in validation_bank)} '
+          f'split={validation_metadata["split"]} metric=val_loss_traj', flush=True)
+    best_loss, best_epoch = float('inf'), None
+    if start_epoch > 1:
+        # 新输出目录：先保留并评估已有权重，让继续训练也不会丢掉这个候选模型。
+        initial_validation = validate_trajectory(student, validation_bank, int(config.test_patch_batch))
+        best_loss, best_epoch, _ = save_epoch_checkpoints(
+            output, student, optimizer, start_epoch - 1, checkpoint_path, config,
+            initial_validation, best_loss, best_epoch)
     gradient_checked = False
     print(f'[sampling] dataset_patches={len(loader.dataset)} '
           f'effective_patches={len(loader) * loader.batch_size} '
           f'batch_size={loader.batch_size} drop_last={loader.drop_last}', flush=True)
     with (output / 'train.jsonl').open('w', encoding='utf-8') as log:
-        for epoch in range(1, epochs + 1):
+        for epoch in range(start_epoch, epochs + 1):
             totals = np.zeros(4, dtype=np.float64)
             seen = 0
             for batch_index, (noisy, clean, sigmas, _centers, _scales, _names) in enumerate(loader):
@@ -212,12 +328,15 @@ def train(args, config, builder, device, checkpoint_path, output):
             if not seen:
                 raise RuntimeError('没有执行任何 Student 更新')
             means = (totals / seen).tolist()
+            validation = validate_trajectory(student, validation_bank, int(config.test_patch_batch))
+            best_loss, best_epoch, improved = save_epoch_checkpoints(
+                output, student, optimizer, epoch, checkpoint_path, config,
+                validation, best_loss, best_epoch)
             record = dict(epoch=epoch, patches=seen, stage_losses=means,
-                          loss_traj=sum(means) / 4)
+                          loss_traj=sum(means) / 4, **validation,
+                          best_val_loss_traj=best_loss, best_epoch=best_epoch, is_best=improved)
             log.write(json.dumps(record) + '\n')
             log.flush()
-            _save_checkpoint(output / 'ckpt-last.pth', student, optimizer, epoch,
-                             checkpoint_path, config)
             print(json.dumps(record), flush=True)
 
 
@@ -266,6 +385,7 @@ def _build_parser():
     parser.add_argument('--mode', choices=['train', 'test'], required=True)
     parser.add_argument('--teacher_ckpt', help='训练必填：最佳 PointGPT-L 去噪 checkpoint')
     parser.add_argument('--student_ckpt', help='测试必填：蒸馏后的 Student checkpoint')
+    parser.add_argument('--resume', help='训练续跑已有 ckpt-last.pth；仍需 teacher_ckpt，使用新输出目录')
     parser.add_argument('--output_dir', required=True, help='新的输出目录，拒绝覆盖已有文件')
     parser.add_argument('--device', type=int, default=0)
     parser.add_argument('--seed', type=int, default=0)
@@ -284,6 +404,12 @@ def main():
     if args.max_shapes < 0 or args.max_patch_batches < 0 or (args.epochs is not None and args.epochs < 1):
         raise ValueError('epochs 必须为正数，冒烟限制必须非负')
     checkpoint_path = Path(checkpoint_arg).expanduser().resolve()
+    if args.resume:
+        if args.mode != 'train':
+            raise ValueError('--resume 仅用于训练')
+        args.resume = str(Path(args.resume).expanduser().resolve())
+        if not Path(args.resume).is_file():
+            raise FileNotFoundError(args.resume)
     config_path = Path(args.config).expanduser().resolve()
     output = Path(args.output_dir).expanduser().resolve()
     if not checkpoint_path.is_file():
