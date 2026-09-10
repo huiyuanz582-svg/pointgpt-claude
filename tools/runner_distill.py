@@ -2,6 +2,7 @@
 
 import argparse
 import copy
+import csv
 import json
 import math
 import os
@@ -340,6 +341,59 @@ def train(args, config, builder, device, checkpoint_path, output):
             print(json.dumps(record), flush=True)
 
 
+def baseline_metric_ops(config, device):
+    """直接复用第一篇 baseline 测试所调用的度量与后处理实现。"""
+    from extensions.chamfer_dist import ChamferDistanceL2
+    from tools.runner_finetune import normalize_unit_sphere, sor_filter, local_surface_projection
+    import utils.p2m_loss as p2m
+    mesh_root = config.dataset._base_.get('TEST_MESH_ROOT', None)
+    if mesh_root:
+        p2m._MESH_ROOT = mesh_root
+    return dict(cd=ChamferDistanceL2().to(device), p2m=p2m.compute_p2m,
+                normalize=normalize_unit_sphere, sor=sor_filter,
+                project=local_surface_projection, mesh_root=str(p2m._MESH_ROOT))
+
+
+def evaluate_baseline_metrics(prediction, clean, center, scale, name, config, ops):
+    """与 runner_finetune.test 相同：后处理 -> 世界坐标 -> 各自度量的归一化。"""
+    import torch
+    device = prediction.device
+    sp = getattr(config, 'surface_projection', None) or {}
+    with torch.no_grad():
+        filtered = ops['sor'](prediction) if getattr(config, 'sor_enable', True) else prediction.cpu()
+        if sp.get('enable', False):
+            filtered = ops['project'](filtered, k=int(sp.get('k', 16)),
+                                      num_iters=int(sp.get('num_iters', 1)), blend=float(sp.get('blend', 1.0)))
+        if filtered.ndim != 2 or filtered.shape[0] == 0 or filtered.shape[-1] != 3:
+            raise ValueError('后处理产生空点云或非法 shape，无法计算 CD/P2M')
+        center = torch.as_tensor(center, device=device)
+        scale = torch.as_tensor(scale, device=device)
+        world = filtered.unsqueeze(0).to(device) * scale + center
+        clean_world = clean.to(device) * scale + center
+        # P2M 必须调用测试用双向实现；不能换成训练用单向 compute_p2m_train。
+        p2m_value = ops['p2m'](world[0], name, 'test') * 1e4
+        _, metric_center, metric_scale = ops['normalize'](clean_world)
+        cd_value = ops['cd']((world - metric_center) / metric_scale,
+                             (clean_world - metric_center) / metric_scale) * 1e4
+        metrics = dict(cd_x1e4=float(cd_value), p2m_x1e4=float(p2m_value))
+        if not all(math.isfinite(value) for value in metrics.values()):
+            raise FloatingPointError(f'{name}: CD/P2M 非有限')
+        return world[0].detach().cpu(), metrics
+
+
+def write_test_summary(output, rows, protocol, expected_shapes, dataset_shapes):
+    """按整云等权平均，单样本冒烟不会标记成全量评估。"""
+    summary = dict(protocol=protocol, processed_shapes=len(rows), expected_shapes=expected_shapes,
+                   dataset_shapes=dataset_shapes, complete=len(rows) == expected_shapes,
+                   full_dataset=expected_shapes == dataset_shapes,
+                   mean_cd_x1e4=sum(r['cd_x1e4'] for r in rows) / len(rows),
+                   mean_p2m_x1e4=sum(r['p2m_x1e4'] for r in rows) / len(rows))
+    temporary = output / 'test_summary.tmp'
+    temporary.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding='utf-8')
+    temporary.replace(output / 'test_summary.json')
+    return summary
+
+
 def test(args, config, builder, device, checkpoint_path, output):
     import numpy as np
     import torch
@@ -351,32 +405,64 @@ def test(args, config, builder, device, checkpoint_path, output):
     _, loader = builder.dataset_builder(
         argparse.Namespace(distributed=False, local_rank=0), dataset_config)
     options = _patch_options(config, config.test_patch_batch)
-    for index, (noisy, _clean, noise_std, centers, scales, names) in enumerate(loader):
-        if args.max_shapes and index >= args.max_shapes:
-            break
-        sigma0 = (float(noise_std.reshape(-1)[0]) if noise_std is not None
-                  else float(config.dataset._base_.get('TEST_NOISE', 0.01)))
-        result = infer_student(student, noisy[0].to(device), sigma0, options,
-                               return_trajectory=args.save_trajectory)
-        if args.save_trajectory:
-            prediction, trajectory = result
-        else:
-            prediction = result
-        center = torch.as_tensor(centers[0]).cpu().numpy()
-        scale = torch.as_tensor(scales[0]).cpu().numpy()
-        name = Path(str(names[0])).name
-        world = prediction.detach().cpu().numpy() * scale + center
-        np.savetxt(output / f'{name}.xyz', world, fmt='%.8f')
-        if args.save_trajectory:
-            np.savez_compressed(
-                output / f'{name}_trajectory.npz',
-                global_states=trajectory['global_states'].numpy(),
-                patch_states=trajectory['patch_states'].numpy(),
-                patch_idx=trajectory['patch_idx'].numpy(),
-                fuse_weights=trajectory['fuse_weights'].numpy(),
-                sigma_before=trajectory['sigma_before'].numpy(),
-                center=center, scale=scale)
-        print(f'[test] {name}: Student 连续 4 步，sigma0={sigma0}; raw XYZ 已保存', flush=True)
+    ops = baseline_metric_ops(config, device)
+    protocol = dict(mode='student_continuous_4_step_rollout', reference='tools/runner_finetune.py::test',
+                    cd='ChamferDistanceL2; clean-cloud unit sphere; x1e4',
+                    p2m='compute_p2m(test); bidirectional mesh unit sphere; x1e4',
+                    aggregation='equal weight per cloud', vote_times=1, mesh_root=ops['mesh_root'],
+                    sor_enable=bool(getattr(config, 'sor_enable', True)),
+                    surface_projection=dict(getattr(config, 'surface_projection', None) or {}))
+    expected = min(args.max_shapes, len(loader)) if args.max_shapes else len(loader)
+    if expected == 0:
+        raise ValueError('测试数据集为空')
+    rows = []
+    with (output / 'test_metrics.csv').open('w', newline='', encoding='utf-8') as csv_file, \
+            (output / 'test.log').open('w', encoding='utf-8') as log:
+        writer = csv.DictWriter(csv_file, fieldnames=['name', 'sigma0', 'input_points', 'output_points',
+                                                     'cd_x1e4', 'p2m_x1e4'])
+        writer.writeheader()
+        log.write(json.dumps(protocol, ensure_ascii=False) + '\n')
+        log.flush()
+        for index, (noisy, clean, noise_std, centers, scales, names) in enumerate(loader):
+            if index >= expected:
+                break
+            sigma0 = (float(noise_std.reshape(-1)[0]) if noise_std is not None
+                      else float(config.dataset._base_.get('TEST_NOISE', 0.01)))
+            result = infer_student(student, noisy[0].to(device), sigma0, options,
+                                   return_trajectory=args.save_trajectory)
+            if args.save_trajectory:
+                prediction, trajectory = result
+            else:
+                prediction = result
+            center = torch.as_tensor(centers[0]).cpu().numpy()
+            scale = torch.as_tensor(scales[0]).cpu().numpy()
+            name = Path(str(names[0])).name
+            world, metrics = evaluate_baseline_metrics(prediction, clean, centers[0], scales[0],
+                                                       str(names[0]), config, ops)
+            np.savetxt(output / f'{name}.xyz', world.numpy(), fmt='%.8f')
+            raw_world = prediction.detach().cpu().numpy() * scale + center
+            np.savetxt(output / f'{name}_raw.xyz', raw_world, fmt='%.8f')
+            if args.save_trajectory:
+                np.savez_compressed(
+                    output / f'{name}_trajectory.npz',
+                    global_states=trajectory['global_states'].numpy(),
+                    patch_states=trajectory['patch_states'].numpy(),
+                    patch_idx=trajectory['patch_idx'].numpy(),
+                    fuse_weights=trajectory['fuse_weights'].numpy(),
+                    sigma_before=trajectory['sigma_before'].numpy(),
+                    center=center, scale=scale, postprocessed=False)
+            row = dict(name=name, sigma0=sigma0, input_points=noisy.shape[1],
+                       output_points=world.shape[0], **metrics)
+            rows.append(row)
+            writer.writerow(row)
+            csv_file.flush()
+            summary = write_test_summary(output, rows, protocol, expected, len(loader))
+            message = (f'[test] {index + 1}/{expected} {name}: CD={metrics["cd_x1e4"]:.6f} '
+                       f'P2M={metrics["p2m_x1e4"]:.6f} (x1e4); '
+                       f'mean CD={summary["mean_cd_x1e4"]:.6f} P2M={summary["mean_p2m_x1e4"]:.6f}')
+            print(message, flush=True)
+            log.write(message + '\n')
+            log.flush()
 
 
 def _build_parser():

@@ -93,9 +93,61 @@ python tools/runner_distill.py --mode test \
 decay=0.95**4`，每个固定外层 patch 内真实连续运行 S0→S1→S2→S3→S4，
 sigma 分别为 sigma0×0.95^[0,4,8,12]，四步后才融合整云。模型内部每步仍重新 FPS/KNN/group。
 
-输出 raw 去噪世界坐标 `.xyz`；不做 SOR/表面投影或 CD/P2M 评估。
-`--save_trajectory` 保存 S0..S4 的 patch/global 状态、索引、融合权重和 sigma 到 NPZ。
-NPZ 状态在归一化空间，用其 `center` / `scale` 还原世界坐标。
+正常测试现在与 `tools/runner_finetune.py::test` 共用同一评估口径：
+先按配置做 SOR（默认开启）和局部表面投影（默认关闭），还原世界坐标；
+CD 使用 clean 整云的单位球变换和原 `ChamferDistanceL2`，结果乘 `1e4`；
+P2M 使用原 `compute_p2m(..., 'test')` 的 mesh 单位球归一化和双向距离，结果乘 `1e4`。
+不调用训练用的单向 P2M；支持原 `TEST_MESH_ROOT`/`PUNET_MESH_ROOT`，缺 mesh 会报错。
+若第一篇实验用了不同的 SOR/投影开关，测试时需使用同样配置；指标公式不变。
+
+每个点云输出 `name.xyz`（实际计算指标的后处理结果）和 `name_raw.xyz`（原始四步输出）。
+`test_metrics.csv` 保存逐整云 CD/P2M，`test_summary.json` 保存按整云等权均值，
+`test.log` 同步记录进度；每处理一个点云就刷新。`--max_shapes 1` 的均值只是单样本结果，
+summary 会标记是否完成所请求样本及是否覆盖全测试集。
+`--save_trajectory` 的 NPZ 仍保存 S0..S4 的 **raw、后处理前** patch/global 状态，
+保持点索引与数量；这些状态在归一化空间，用 `center` / `scale` 还原世界坐标。
+此改动只作用于正常 rollout 测试，不修改训练 loss 或 best 选择指标。
+
+## Curriculum difficulty 原始指标分析（只读）
+
+独立入口 `tools/analyze_curriculum_difficulty.py`，加载已有 Teacher 和第一阶段 best Student，
+两者均 eval/frozen/no_grad；没有 optimizer、backward、curriculum 权重或 corrective training。
+数据直接使用 baseline 训练 patch DataLoader（原 split、50 倍采样、归一化和 Gaussian 噪声）。
+每个 noisy/clean 1024-point patch 先生成并暂存完整 T0..T16，四个 Student 输入分别是
+T0、T4、T8、T12；任何阶段都不会使用前一个 Student 输出。
+
+```bash
+python tools/analyze_curriculum_difficulty.py \
+  --config cfgs/PointGPT-L/distill_16to4.yaml \
+  --teacher_ckpt experiments/L_consistency_plus/ckpt-best.pth \
+  --student_ckpt experiments/distill_16to4/train1/ckpt-best.pth \
+  --output_dir experiments/distill_16to4/difficulty1 \
+  --max_samples 64 --save_trajectories 3
+```
+
+`distance(A,B) = mean_points sum_xyz (A-B)^2`，使用逐点对应索引和原归一化坐标，
+与 L_traj 同定义；不乘 `1e4`，不使用 CD/P2M、不应用 SOR。
+分别计算 `D_move=distance(T_start,T_target)`、`D_remain=distance(T_start,clean)`、
+`E_imit=distance(Student(T_start),T_target)` 和 `R_relative=D_move/(D_remain+1e-12)`。
+Student 仍使用 `sigma_start=sigma0*0.95**[0,4,8,12]`、eta=1。
+
+输出 `per_sample_stage.csv`（每样本四行原始指标）、`stage_summary.csv`（逐阶段均值）、
+`manifest.json` 和 `analysis.log`。R_relative 先按样本计算再取均值。
+`--save_trajectories 3` 保存前 3 个 patch 的完整 `teacher_states[17,N,3]`、
+独立 `student_stage_outputs[4,N,3]` 和 clean 到 NPZ；四个 Student 输出不是连续 rollout。
+`--max_samples 0` 分析原训练 DataLoader 一个完整采样 epoch，默认配置为 6000 个 patch；
+这仅运行推理，不更新任何权重。相同 shape 的重复 patch 由唯一 sample_id 区分。
+
+两条评估可用脚本独立输出到不同子目录（默认正常测试全量、difficulty 64 个 patch）：
+
+```bash
+bash scripts/test_distill_stage1.sh \
+  experiments/L_consistency_plus/ckpt-best.pth \
+  experiments/distill_16to4/train1/ckpt-best.pth \
+  experiments/distill_16to4/stage1_checks
+```
+
+设置 `TEST_MAX_SHAPES=1 ANALYSIS_MAX_SAMPLES=8` 可先做小样本检查，输出目录需为空或不存在。
 
 ## 检查
 

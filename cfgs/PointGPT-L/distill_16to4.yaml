@@ -45,3 +45,9 @@ gpu_mem_fraction: 0.9
 # 沿用原 val split（VAL_NUM=0 时为 test split），不改变训练采样或训练损失。
 validation_seed: 2024
 validation_patches_per_cloud: 4
+
+# 正常 Student rollout 测试与第一篇 PointGPT-L baseline 使用相同后处理/指标口径。
+# 仅 mode=test 使用；不改变训练 loss 或 validation best 选择。
+sor_enable: True
+surface_projection:
+  { enable: False, k: 16, num_iters: 1, blend: 0.6 }
