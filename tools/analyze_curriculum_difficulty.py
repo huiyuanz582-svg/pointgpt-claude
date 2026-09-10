@@ -17,10 +17,98 @@ for path in (ROOT, ROOT / 'tools'):
 from runner_distill import TEACHER_NODES, TEACHER_DECAY, TEACHER_ETA, _sigma_batch, freeze_teacher
 
 METRICS = ('D_move', 'D_remain', 'E_imit', 'R_relative')
+DATA_FIELDS = ('dataset', 'resolution', 'noise_type', 'noise_level', 'noisy_path', 'sigma0')
+
+
+def test_data_metadata(dataset, config):
+    """Record the same resolved noisy directory used by test_dataloader()."""
+    sigma0 = float(config.TEST_NOISE)
+    if not math.isfinite(sigma0) or sigma0 <= 0:
+        raise ValueError('TEST_NOISE must be finite and positive')
+    noisy_path = dataset.test_noisy_path or os.path.join(
+        dataset.root, 'examples', 'pointclouds', 'test', dataset.test_noisy_dir)
+    return dict(dataset=str(config.DATASET), resolution=str(dataset.test_resolution),
+                noise_type='Gaussian', noise_level=sigma0,
+                noisy_path=str(Path(noisy_path).resolve()), sigma0=sigma0)
+
+
+def capture_teacher_cloud(teacher, noisy, sigma0, patch_options, denoise_fn=None):
+    """Run the original whole-cloud Teacher, retaining its actual patch states."""
+    import torch
+    if denoise_fn is None:
+        from tools.runner_finetune import patch_based_denoise
+        denoise_fn = patch_based_denoise
+    freeze_teacher(teacher)
+    device = next(teacher.parameters()).device
+    with torch.no_grad():
+        _, trajectory = denoise_fn(
+            teacher, noisy.detach().to(device), sigma0, **patch_options,
+            num_steps=16, step_size=TEACHER_ETA, decay=TEACHER_DECAY,
+            return_trajectory=True, raise_on_memory_pressure=True)
+    for key, value in trajectory.items():
+        if torch.is_tensor(value):
+            trajectory[key] = value.detach().cpu()
+            if not torch.isfinite(trajectory[key]).all():
+                raise FloatingPointError(f'Nonfinite Teacher trajectory: {key}')
+    return trajectory
+
+
+def fuse_cloud_patches(patches, trajectory):
+    """Same weighted fusion/uncovered-point fallback as baseline trajectory readout."""
+    import torch
+    noisy = trajectory['global_states'][0]
+    indices = trajectory['patch_idx'].reshape(-1)
+    weights = trajectory['fuse_weights'].reshape(-1, 1)
+    accum = torch.zeros_like(noisy)
+    wsum = torch.zeros_like(noisy[:, :1])
+    accum.index_add_(0, indices, patches.reshape(-1, 3) * weights)
+    wsum.index_add_(0, indices, weights)
+    fused = accum / wsum.clamp_min(1e-8)
+    uncovered = (wsum < 1e-8).squeeze(-1)
+    fused[uncovered] = noisy[uncovered]
+    return fused
+
+
+def analyze_cloud_stages(student, trajectory, clean, sigma0, patch_batch=1,
+                         denominator_eps=1e-12):
+    """Teacher-forced patch forwards, then metrics over all N fused cloud points.
+
+    Baseline evolves fixed outer patches independently. Fused Teacher states are
+    readouts, so do not re-extract patches from them or feed them into the Teacher.
+    """
+    import torch
+    states = trajectory['global_states']
+    patch_states = trajectory['patch_states']
+    indices = trajectory['patch_idx']
+    clean = clean.detach().cpu()
+    if (states.shape != (17, *clean.shape) or clean.ndim != 2 or
+            clean.shape[-1] != 3 or patch_batch < 1 or indices.shape[0] < 1):
+        raise ValueError('Expected paired whole-cloud [N,3] and a 17-state Teacher trajectory')
+    stage_batches = []
+    for offset in range(0, indices.shape[0], patch_batch):
+        end = offset + patch_batch
+        # Clean uses exactly the noisy patch's original point indices.
+        _, outputs = analyze_stages(student, patch_states[:, offset:end],
+                                   clean[indices[offset:end]], sigma0, denominator_eps)
+        stage_batches.append(outputs)
+    patch_predictions = torch.cat(stage_batches, dim=1)
+    predictions = torch.stack([fuse_cloud_patches(p, trajectory) for p in patch_predictions])
+    rows = []
+    for stage, (start, end) in enumerate(zip(TEACHER_NODES[:-1], TEACHER_NODES[1:])):
+        move = (states[start] - states[end]).square().sum(-1).mean()
+        remain = (states[start] - clean).square().sum(-1).mean()
+        imitation = (predictions[stage] - states[end]).square().sum(-1).mean()
+        values = torch.stack([move, remain, imitation, move / (remain + denominator_eps)])
+        if not torch.isfinite(values).all():
+            raise FloatingPointError('Nonfinite whole-cloud difficulty metrics')
+        rows.append(dict(stage=stage, teacher_start=start, teacher_target=end,
+                         sigma_start=float(sigma0) * TEACHER_DECAY ** start,
+                         **dict(zip(METRICS, values.tolist()))))
+    return rows, predictions, patch_predictions
 
 
 def capture_full_teacher(teacher, noisy, sigma0, patch_batch=1):
-    """同一个已采好的训练 patch，保存 T0..T16；公式与原 Teacher patch 内迭代一致。"""
+    """同一个已采好的测试 patch，保存 T0..T16；公式与原 Teacher patch 内迭代一致。"""
     import torch
     if noisy.ndim != 3 or noisy.shape[-1] != 3 or noisy.shape[0] < 1 or patch_batch < 1:
         raise ValueError('需要 noisy [B,N,3] 和正数 patch_batch')
@@ -105,7 +193,7 @@ def _build_parser():
     parser.add_argument('--output_dir', required=True)
     parser.add_argument('--device', type=int, default=0)
     parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--max_samples', type=int, default=0, help='分析训练 patch 数；0=原 DataLoader 一个 epoch')
+    parser.add_argument('--max_samples', type=int, default=0, help='完整测试点云数上限；0=全部测试点云')
     parser.add_argument('--save_trajectories', type=int, default=1, help='前 N 个样本保存完整 T0..T16；0=不落盘')
     parser.add_argument('--denominator_eps', type=float, default=1e-12)
     return parser
@@ -134,7 +222,8 @@ def main():
     import numpy as np
     import torch
     from utils.config import cfg_from_yaml_file
-    from runner_distill import _train_loader, schedule
+    from runner_distill import schedule, _patch_options
+    from datasets.ScoreDenoiseDataset import ScoreDenoise
     config = cfg_from_yaml_file(str(config_path))
     if dict(config.distillation) != schedule():
         raise ValueError('分析只支持第一阶段固定 16→4 日程')
@@ -155,52 +244,78 @@ def main():
     builder.load_model(student, str(student_path))
     freeze_teacher(teacher)
     freeze_teacher(student)
-    loader = _train_loader(config)
-    available = len(loader) * loader.batch_size
+    dataset_config = config.dataset._base_
+    dataset = ScoreDenoise(argparse.Namespace(distributed=False, local_rank=0), dataset_config)
+    metadata = test_data_metadata(dataset, dataset_config)
+    _, loader = dataset.test_dataloader()
+    patch_options = _patch_options(config, config.test_patch_batch)
+    available = len(loader.dataset)
     expected = min(args.max_samples, available) if args.max_samples else available
+    if expected == 0:
+        raise ValueError('Test dataset is empty')
     output.mkdir(parents=True, exist_ok=True)
-    manifest = dict(analysis='independent_teacher_forced_stages', dataset_split='baseline_train_patches',
+    manifest = dict(analysis='independent_teacher_forced_stages', dataset_split='test', **metadata,
+                    noise_level_units='fraction (0.01 = 1%); precomputed Gaussian noisy files',
+                    patch_sampling='baseline patch_based_denoise FPS/KNN and weighted full-cloud fusion',
+                    patch_options=patch_options, metric_scope='all N points after fusion; equal weight per cloud',
+                    teacher_state='fixed outer patch trajectories; global states are fused readouts only',
+                    student_state='independent Teacher patch starts; same indices and weights for fusion',
+                    postprocessing='none for trajectory distances; normal rollout CD/P2M remains separate',
                     teacher_checkpoint=str(teacher_path), student_checkpoint=str(student_path),
                     distance='mean over corresponding points of squared L2; normalized coordinates; no x1e4',
                     ratio='D_move / (D_remain + denominator_eps); per sample, then aggregate',
                     denominator_eps=args.denominator_eps, schedule=schedule(), expected_samples=expected,
                     processed_samples=0, complete=False, config=config, arguments=vars(args))
     (output / 'manifest.json').write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding='utf-8')
-    fields = ['sample_id', 'name', 'sigma0', 'stage', 'teacher_start', 'teacher_target', 'sigma_start', *METRICS]
+    fields = ['sample_id', 'name', *DATA_FIELDS, 'num_points', 'num_patches', 'uncovered_points',
+              'stage', 'teacher_start', 'teacher_target', 'sigma_start', *METRICS]
     all_rows, count = [], 0
     with (output / 'per_sample_stage.csv').open('w', newline='', encoding='utf-8') as handle, \
             (output / 'analysis.log').open('w', encoding='utf-8') as log:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
-        for noisy, clean, sigmas, centers, scales, names in loader:
+        message = '[test-data] ' + json.dumps(metadata, ensure_ascii=False)
+        print(message, flush=True)
+        log.write(message + '\n')
+        log.flush()
+        for noisy, clean, _, centers, scales, names in loader:
             if count >= expected:
                 break
-            size = min(len(noisy), expected - count)
-            full = capture_full_teacher(teacher, noisy[:size], sigmas[:size], int(config.teacher_patch_batch))
-            for offset in range(0, size, int(config.student_patch_batch)):
-                end = min(size, offset + int(config.student_patch_batch))
-                rows, predictions = analyze_stages(student, full[:, offset:end], clean[offset:end],
-                                                   sigmas[offset:end], args.denominator_eps)
-                for row in rows:
-                    index = offset + row.pop('batch_sample')
-                    row.update(sample_id=count + index, name=str(names[index]), sigma0=float(sigmas[index]))
-                    writer.writerow(row)
-                    all_rows.append(row)
-                for index in range(offset, end):
-                    if count + index < args.save_trajectories:
-                        folder = output / 'trajectories'
-                        folder.mkdir(exist_ok=True)
-                        np.savez_compressed(folder / f'sample_{count + index:06d}.npz',
-                                            teacher_states=full[:, index].numpy(),
-                                            student_stage_outputs=predictions[:, index - offset].numpy(),
-                                            clean=clean[index].numpy(), sigma0=float(sigmas[index]),
-                                            teacher_nodes=np.asarray(TEACHER_NODES),
-                                            center=torch.as_tensor(centers[index]).numpy(),
-                                            scale=torch.as_tensor(scales[index]).numpy())
-            count += size
+            if (noisy.ndim != 3 or noisy.shape[0] != 1 or noisy.shape[-1] != 3 or
+                    noisy.shape != clean.shape):
+                raise ValueError('Test data must be paired whole clouds [1,N,3]')
+            if not torch.isfinite(noisy).all() or not torch.isfinite(clean).all():
+                raise ValueError('Test noisy/clean points must be finite')
+            trajectory = capture_teacher_cloud(teacher, noisy[0], metadata['sigma0'], patch_options)
+            rows, predictions, patch_predictions = analyze_cloud_stages(
+                student, trajectory, clean[0], metadata['sigma0'],
+                int(config.test_patch_batch), args.denominator_eps)
+            cloud_info = dict(num_points=noisy.shape[1], num_patches=trajectory['patch_idx'].shape[0],
+                              uncovered_points=int((trajectory['coverage_count'] == 0).sum()))
+            for row in rows:
+                row.update(sample_id=count, name=str(names[0]), **metadata, **cloud_info)
+                writer.writerow(row)
+                all_rows.append(row)
+            if count < args.save_trajectories:
+                folder = output / 'trajectories'
+                folder.mkdir(exist_ok=True)
+                np.savez_compressed(folder / f'sample_{count:06d}.npz',
+                                    teacher_states=trajectory['global_states'].numpy(),
+                                    teacher_patch_states=trajectory['patch_states'].numpy(),
+                                    student_stage_outputs=predictions.numpy(),
+                                    student_stage_patch_outputs=patch_predictions.numpy(),
+                                    clean=clean[0].numpy(), name=str(names[0]), **metadata,
+                                    patch_indices=trajectory['patch_idx'].numpy(),
+                                    fuse_weights=trajectory['fuse_weights'].numpy(),
+                                    coverage_count=trajectory['coverage_count'].numpy(),
+                                    teacher_nodes=np.asarray(TEACHER_NODES),
+                                    center=torch.as_tensor(centers[0]).numpy(),
+                                    scale=torch.as_tensor(scales[0]).numpy())
+            count += 1
             handle.flush()
             write_stage_summary(output, all_rows)
-            message = f'[difficulty] {count}/{expected} patches; 4 independent Teacher-forced stages per patch'
+            message = (f'[difficulty] {count}/{expected} clouds; {names[0]}; '
+                       f'{cloud_info}; 4 independent Teacher-forced stages; whole-cloud metrics')
             print(message, flush=True)
             log.write(message + '\n')
             log.flush()
