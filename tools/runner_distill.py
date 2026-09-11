@@ -282,13 +282,15 @@ def validate_rollout(student, config):
                 val_rollout_score=score, val_rollout_clouds=count)
 
 
-def _save_checkpoint(path, student, optimizer, epoch, teacher_path, config, selection=None):
+def _save_checkpoint(path, student, optimizer, epoch, teacher_path, config, selection=None,
+                     best_val_rollout_score=float('inf'), best_epoch=None):
     import torch
     temporary = path.with_suffix('.tmp')
     payload = dict(
         base_model=student.state_dict(),
         epoch=epoch, distillation=schedule(), teacher_checkpoint=str(teacher_path),
-        model_config=dict(config.model), selection=selection)
+        model_config=dict(config.model), selection=selection,
+        best_val_rollout_score=best_val_rollout_score, best_epoch=best_epoch)
     if optimizer is not None:
         payload['optimizer'] = optimizer.state_dict()
     torch.save(payload, temporary)
@@ -311,10 +313,12 @@ def save_epoch_checkpoints(output, student, optimizer, epoch, teacher_path, conf
                      best_epoch=best_epoch)
     # 只保留 last 和 best；last 含 optimizer，best 仅在验证指标改善时更新。
     _save_checkpoint(output / 'ckpt-last.pth', student, optimizer, epoch,
-                     teacher_path, config, selection)
+                     teacher_path, config, selection,
+                     best_val_rollout_score=best_score, best_epoch=best_epoch)
     if improved:
         _save_checkpoint(output / 'ckpt-best.pth', student, None, epoch,
-                         teacher_path, config, selection)
+                         teacher_path, config, selection,
+                         best_val_rollout_score=best_score, best_epoch=best_epoch)
     return best_score, best_epoch, improved
 
 
@@ -331,6 +335,7 @@ def train(args, config, builder, device, checkpoint_path, output):
     optimizer = torch.optim.AdamW(student.parameters(), lr=float(config.learning_rate),
                                  weight_decay=float(config.weight_decay))
     start_epoch = 1
+    best_score, best_epoch = float('inf'), None
     if getattr(args, 'resume', None):
         resumed = torch.load(args.resume, map_location='cpu')
         if resumed.get('distillation') != schedule() or 'optimizer' not in resumed:
@@ -338,6 +343,8 @@ def train(args, config, builder, device, checkpoint_path, output):
         student.load_state_dict(resumed['base_model'], strict=True)
         optimizer.load_state_dict(resumed['optimizer'])
         start_epoch = int(resumed['epoch']) + 1
+        best_score = float(resumed.get('best_val_rollout_score', float('inf')))
+        best_epoch = resumed.get('best_epoch', None)
         del resumed
     loader = _train_loader(config)
     batch_size = int(config.student_patch_batch)
@@ -353,13 +360,6 @@ def train(args, config, builder, device, checkpoint_path, output):
     print(f'[validation] fixed_patches={sum(nodes.shape[1] for nodes, _ in validation_bank)} '
           f'split={validation_metadata["split"]} diagnostic=val_loss_traj '
           f'best_metric=val_rollout_score', flush=True)
-    best_score, best_epoch = float('inf'), None
-    if start_epoch > 1:
-        # 新输出目录先保留恢复权重为 last；仅 trajectory 诊断不能产生 best。
-        initial_validation = validate_trajectory(student, validation_bank, int(config.test_patch_batch))
-        best_score, best_epoch, _ = save_epoch_checkpoints(
-            output, student, optimizer, start_epoch - 1, checkpoint_path, config,
-            initial_validation, best_score, best_epoch)
     gradient_checked = False
     print(f'[sampling] dataset_patches={len(loader.dataset)} '
           f'effective_patches={len(loader) * loader.batch_size} '

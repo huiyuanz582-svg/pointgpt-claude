@@ -193,6 +193,8 @@ class DistillationTests(unittest.TestCase):
             self.assertEqual(checkpoint['epoch'], 1)
             self.assertEqual(checkpoint['teacher_checkpoint'], str(teacher_path))
             self.assertIn('optimizer', checkpoint)
+            self.assertEqual(checkpoint['best_val_rollout_score'], float('inf'))
+            self.assertIsNone(checkpoint['best_epoch'])
             self.assertTrue((output / 'train.jsonl').is_file())
             self.assertEqual(list(output.glob('ckpt-epoch*.pth')), [])
             self.assertFalse((output / 'ckpt-best.pth').exists())  # No rollout before epoch 5.
@@ -201,8 +203,10 @@ class DistillationTests(unittest.TestCase):
                 torch.testing.assert_close(value, expected[key], rtol=0, atol=0)
             self.assertFalse(torch.equal(checkpoint['base_model']['weight'], expected['weight']))
             self.assertTrue(all(not p.requires_grad and p.grad is None for p in created[0].parameters()))
-            # 旧版 last（没有 selection 字段）也可续训，恢复 optimizer 和 epoch。
+            # 旧版 last 缺少历史 best 字段也可续训，恢复 optimizer 和 epoch。
             checkpoint.pop('selection', None)
+            checkpoint.pop('best_val_rollout_score')
+            checkpoint.pop('best_epoch')
             old_last = output / 'old-last.pth'
             torch.save(checkpoint, old_last)
             continued = output / 'continued'
@@ -216,6 +220,9 @@ class DistillationTests(unittest.TestCase):
             self.assertEqual({path.name for path in continued.glob('*.pth')},
                              {'ckpt-last.pth'})
             self.assertFalse((continued / 'ckpt-best.pth').exists())
+            legacy_resumed = torch.load(continued / 'ckpt-last.pth', weights_only=True)
+            self.assertEqual(legacy_resumed['best_val_rollout_score'], float('inf'))
+            self.assertIsNone(legacy_resumed['best_epoch'])
 
     def test_best_selection_saves_only_last_and_best(self):
         config = SimpleNamespace(model={})
@@ -248,6 +255,10 @@ class DistillationTests(unittest.TestCase):
             self.assertIsNone(last['selection']['value'])
             self.assertEqual(last['selection']['best_epoch'], 10)
             self.assertEqual(last['selection']['best_value'], 0.2)
+            self.assertEqual(best['best_val_rollout_score'], 0.2)
+            self.assertEqual(last['best_val_rollout_score'], 0.2)
+            self.assertEqual(best['best_epoch'], 10)
+            self.assertEqual(last['best_epoch'], 10)
             self.assertIn('optimizer', last)
             self.assertEqual({path.name for path in output.iterdir()},
                              {'ckpt-last.pth', 'ckpt-best.pth'})
@@ -256,6 +267,49 @@ class DistillationTests(unittest.TestCase):
                                               config, {'val_rollout_score': float('nan')}, best_score, best_epoch)
             self.assertEqual(torch.load(output / 'ckpt-last.pth', weights_only=True)['epoch'], 21)
             self.assertEqual(torch.load(output / 'ckpt-best.pth', weights_only=True)['epoch'], 10)
+
+    def test_resume_preserves_historical_best_without_reevaluation(self):
+        config = SimpleNamespace(model={}, learning_rate=.001, weight_decay=0.,
+                                 teacher_patch_batch=1, student_patch_batch=8, total_bs=8,
+                                 test_patch_batch=1, epochs=16, grad_norm_clip=1.)
+        samples = [(self.noisy[:4], self.noisy[:4], .01, torch.zeros(1, 3),
+                    torch.ones(1, 1), 'cloud') for _ in range(8)]
+        loader = torch.utils.data.DataLoader(samples, batch_size=8, drop_last=True)
+        bank = [(self.capture(), torch.full((4,), self.sigma0))]
+        builder = SimpleNamespace(model_builder=lambda _: ToyEpsilonModel(), load_model=lambda *_: None)
+        optimizer = torch.optim.AdamW(self.student.parameters(), lr=.001, weight_decay=0.)
+        with tempfile.TemporaryDirectory() as directory:
+            resume_path = Path(directory) / 'previous-last.pth'
+            torch.save(dict(base_model=self.student.state_dict(), optimizer=optimizer.state_dict(),
+                            epoch=9, distillation=runner.schedule(),
+                            best_val_rollout_score=1.2, best_epoch=5), resume_path)
+            original_checkpoint = resume_path.read_bytes()
+            output = Path(directory) / 'continued'
+            output.mkdir()
+            args = SimpleNamespace(resume=str(resume_path), epochs=None, max_shapes=0, max_patch_batches=0)
+            with patch.object(runner, '_train_loader', return_value=loader), \
+                    patch.object(runner, '_validation_bank', return_value=(bank, {'split': 'synthetic'})), \
+                    patch.object(runner, 'validate_trajectory', side_effect=[dict(
+                        val_loss_traj=1. / epoch, val_stage_losses=[1. / epoch] * 4,
+                        val_patches=4) for epoch in range(10, 17)]) as trajectory, \
+                    patch.object(runner, 'validate_rollout', side_effect=[dict(
+                        val_rollout_cd=cd, val_rollout_p2m=1., val_rollout_score=cd + .3)
+                        for cd in (1.5, .5)]) as rollout:
+                runner.train(args, config, builder, torch.device('cpu'), Path('teacher.pth'), output)
+            self.assertEqual(trajectory.call_count, 7)  # Only new epochs 10..16, no resume evaluation.
+            self.assertEqual(rollout.call_count, 2)  # Only scheduled epochs 10 and 15.
+            records = [json.loads(line) for line in (output / 'train.jsonl').read_text().splitlines()]
+            self.assertEqual([row['epoch'] for row in records], list(range(10, 17)))
+            for row in records[:5]:
+                self.assertEqual(row['best_val_rollout_score'], 1.2)
+                self.assertEqual(row['best_epoch'], 5)
+                self.assertFalse(row['is_best'])
+            self.assertEqual([row['epoch'] for row in records if row['is_best']], [15])
+            for filename in ('ckpt-last.pth', 'ckpt-best.pth'):
+                checkpoint = torch.load(output / filename, weights_only=True)
+                self.assertEqual(checkpoint['best_val_rollout_score'], .8)
+                self.assertEqual(checkpoint['best_epoch'], 15)
+            self.assertEqual(resume_path.read_bytes(), original_checkpoint)
 
     def test_validation_preserves_batchnorm_gradients_and_train_mode(self):
         class BatchNormModel(ToyEpsilonModel):
