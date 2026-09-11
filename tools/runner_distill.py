@@ -216,6 +216,72 @@ def validate_trajectory(student, bank, patch_batch):
     return dict(val_loss_traj=sum(means) / 4, val_stage_losses=means, val_patches=count)
 
 
+def _rollout_validation_loader(config):
+    """Reuse baseline's complete validation clouds, fixed noise and normalization."""
+    from datasets.ScoreDenoiseDataset import ScoreDenoise
+    cfg = copy.deepcopy(config.dataset._base_)
+    data_module = ScoreDenoise(argparse.Namespace(distributed=False), cfg)
+    _, loader = data_module.val_dataloader()
+    mesh_split = 'train' if data_module.val_num > 0 else 'test'
+    return loader, mesh_split
+
+
+def validate_rollout(student, config):
+    """Diagnostic whole-cloud Student rollout using the existing test pipeline.
+
+    infer_student runs four consecutive updates inside each overlapping patch,
+    then baseline patch_based_denoise fuses them. No Teacher states are involved.
+    """
+    import numpy as np
+    import torch
+    device = next(student.parameters()).device
+    cuda_devices = [device.index] if device.type == 'cuda' else []
+    was_training = student.training
+    python_state, numpy_state = random.getstate(), np.random.get_state()
+    seed = int(getattr(config, 'validation_seed', 2024))
+    total_cd, total_p2m, count = 0.0, 0.0, 0
+    student.eval()
+    try:
+        # Fixed evaluation randomness without advancing subsequent training RNGs.
+        with torch.random.fork_rng(devices=cuda_devices), torch.no_grad():
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.random.default_generator.manual_seed(seed)
+            if device.type == 'cuda':
+                with torch.cuda.device(device):
+                    torch.cuda.manual_seed(seed)
+            loader, mesh_split = _rollout_validation_loader(config)
+            options = _patch_options(config, config.test_patch_batch)
+            ops = baseline_metric_ops(config, device)
+            for noisy, clean, sigmas, centers, scales, names in loader:
+                if (noisy.ndim != 3 or noisy.shape[0] != 1 or noisy.shape[-1] != 3 or
+                        noisy.shape != clean.shape or sigmas is None):
+                    raise ValueError('Rollout validation requires complete paired [1,N,3] clouds and sigma')
+                sigma0 = float(sigmas.reshape(-1)[0])
+                prediction = infer_student(student, noisy[0].to(device), sigma0, options)
+                _, metrics = evaluate_baseline_metrics(
+                    prediction, clean, centers[0], scales[0], str(names[0]), config, ops,
+                    mesh_split=mesh_split)
+                total_cd += metrics['cd_x1e4']
+                total_p2m += metrics['p2m_x1e4']
+                count += 1
+                print(f'[rollout-validation] {count}/{len(loader)} {names[0]}: '
+                      f'CD={metrics["cd_x1e4"]:.6f} P2M={metrics["p2m_x1e4"]:.6f} (x1e4)',
+                      flush=True)
+    finally:
+        student.train(was_training)
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+    if not count:
+        raise ValueError('Rollout validation dataset is empty')
+    cd, p2m = total_cd / count, total_p2m / count
+    score = cd + 0.3 * p2m
+    if not all(math.isfinite(value) for value in (cd, p2m, score)):
+        raise FloatingPointError('Nonfinite rollout validation metrics')
+    return dict(val_rollout_cd=cd, val_rollout_p2m=p2m,
+                val_rollout_score=score, val_rollout_clouds=count)
+
+
 def _save_checkpoint(path, student, optimizer, epoch, teacher_path, config, selection=None):
     import torch
     temporary = path.with_suffix('.tmp')
@@ -230,22 +296,26 @@ def _save_checkpoint(path, student, optimizer, epoch, teacher_path, config, sele
 
 
 def save_epoch_checkpoints(output, student, optimizer, epoch, teacher_path, config,
-                           validation, best_loss, best_epoch):
-    value = float(validation['val_loss_traj'])
-    if not math.isfinite(value):
-        raise FloatingPointError('验证 loss 非有限，不能保存为 best')
-    improved = value < best_loss
+                           validation, best_score, best_epoch):
+    # Missing/None means no rollout was evaluated this epoch. Never substitute L_traj.
+    value = validation.get('val_rollout_score')
+    if value is not None:
+        value = float(value)
+        if not math.isfinite(value):
+            raise FloatingPointError('验证 rollout score 非有限，不能保存为 best')
+    improved = value is not None and value < best_score
     if improved:
-        best_loss, best_epoch = value, epoch
-    selection = dict(metric='val_loss_traj', value=value,
-                     best_value=best_loss, best_epoch=best_epoch)
+        best_score, best_epoch = value, epoch
+    selection = dict(metric='val_rollout_score', value=value,
+                     best_value=best_score if math.isfinite(best_score) else None,
+                     best_epoch=best_epoch)
     # 只保留 last 和 best；last 含 optimizer，best 仅在验证指标改善时更新。
     _save_checkpoint(output / 'ckpt-last.pth', student, optimizer, epoch,
                      teacher_path, config, selection)
     if improved:
         _save_checkpoint(output / 'ckpt-best.pth', student, None, epoch,
                          teacher_path, config, selection)
-    return best_loss, best_epoch, improved
+    return best_score, best_epoch, improved
 
 
 def train(args, config, builder, device, checkpoint_path, output):
@@ -271,6 +341,9 @@ def train(args, config, builder, device, checkpoint_path, output):
         del resumed
     loader = _train_loader(config)
     batch_size = int(config.student_patch_batch)
+    rollout_interval = int(getattr(config, 'rollout_val_interval', 5))
+    if rollout_interval < 1:
+        raise ValueError('rollout_val_interval 必须为正整数')
     epochs = args.epochs or int(config.epochs)
     if start_epoch > epochs:
         raise ValueError('epochs 是目标总 epoch 数，必须大于已完成的 resume epoch')
@@ -278,14 +351,15 @@ def train(args, config, builder, device, checkpoint_path, output):
     with (output / 'validation_manifest.json').open('w', encoding='utf-8') as handle:
         json.dump(validation_metadata, handle, indent=2, ensure_ascii=False)
     print(f'[validation] fixed_patches={sum(nodes.shape[1] for nodes, _ in validation_bank)} '
-          f'split={validation_metadata["split"]} metric=val_loss_traj', flush=True)
-    best_loss, best_epoch = float('inf'), None
+          f'split={validation_metadata["split"]} diagnostic=val_loss_traj '
+          f'best_metric=val_rollout_score', flush=True)
+    best_score, best_epoch = float('inf'), None
     if start_epoch > 1:
-        # 新输出目录：先保留并评估已有权重，让继续训练也不会丢掉这个候选模型。
+        # 新输出目录先保留恢复权重为 last；仅 trajectory 诊断不能产生 best。
         initial_validation = validate_trajectory(student, validation_bank, int(config.test_patch_batch))
-        best_loss, best_epoch, _ = save_epoch_checkpoints(
+        best_score, best_epoch, _ = save_epoch_checkpoints(
             output, student, optimizer, start_epoch - 1, checkpoint_path, config,
-            initial_validation, best_loss, best_epoch)
+            initial_validation, best_score, best_epoch)
     gradient_checked = False
     print(f'[sampling] dataset_patches={len(loader.dataset)} '
           f'effective_patches={len(loader) * loader.batch_size} '
@@ -330,12 +404,17 @@ def train(args, config, builder, device, checkpoint_path, output):
                 raise RuntimeError('没有执行任何 Student 更新')
             means = (totals / seen).tolist()
             validation = validate_trajectory(student, validation_bank, int(config.test_patch_batch))
-            best_loss, best_epoch, improved = save_epoch_checkpoints(
+            if epoch % rollout_interval == 0:
+                validation.update(validate_rollout(student, config))
+            for key in ('val_rollout_cd', 'val_rollout_p2m', 'val_rollout_score'):
+                validation.setdefault(key, None)
+            best_score, best_epoch, improved = save_epoch_checkpoints(
                 output, student, optimizer, epoch, checkpoint_path, config,
-                validation, best_loss, best_epoch)
+                validation, best_score, best_epoch)
             record = dict(epoch=epoch, patches=seen, stage_losses=means,
                           loss_traj=sum(means) / 4, **validation,
-                          best_val_loss_traj=best_loss, best_epoch=best_epoch, is_best=improved)
+                          best_val_rollout_score=best_score if math.isfinite(best_score) else None,
+                          best_epoch=best_epoch, is_best=improved)
             log.write(json.dumps(record) + '\n')
             log.flush()
             print(json.dumps(record), flush=True)
@@ -354,7 +433,7 @@ def baseline_metric_ops(config, device):
                 project=local_surface_projection, mesh_root=str(p2m._MESH_ROOT))
 
 
-def evaluate_baseline_metrics(prediction, clean, center, scale, name, config, ops):
+def evaluate_baseline_metrics(prediction, clean, center, scale, name, config, ops, mesh_split='test'):
     """与 runner_finetune.test 相同：后处理 -> 世界坐标 -> 各自度量的归一化。"""
     import torch
     device = prediction.device
@@ -371,7 +450,7 @@ def evaluate_baseline_metrics(prediction, clean, center, scale, name, config, op
         world = filtered.unsqueeze(0).to(device) * scale + center
         clean_world = clean.to(device) * scale + center
         # P2M 必须调用测试用双向实现；不能换成训练用单向 compute_p2m_train。
-        p2m_value = ops['p2m'](world[0], name, 'test') * 1e4
+        p2m_value = ops['p2m'](world[0], name, mesh_split) * 1e4
         _, metric_center, metric_scale = ops['normalize'](clean_world)
         cd_value = ops['cd']((world - metric_center) / metric_scale,
                              (clean_world - metric_center) / metric_scale) * 1e4

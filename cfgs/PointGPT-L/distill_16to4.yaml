@@ -27,7 +27,7 @@ distillation:
   student_decay: 0.8145062499999999  # 0.95 ** 4
 
 # 直接复用 baseline PairedPatchDataset：TRAIN_OVERSAMPLE=50、每样本随机 1024 点 patch。
-# total_bs 与 PointGPT-L baseline 相同；Student micro-batch 梯度累积到同一有效 batch。
+# 默认每个 stage 真实 forward 8 个 patch；调小 student_patch_batch 时仅在当前 total_bs 内累积。
 total_bs: 8
 epochs: 20
 learning_rate: 0.00001
@@ -37,14 +37,17 @@ inference_patch_size: 1024
 seed_ratio: 3
 fuse_tau_ratio: 0.5
 teacher_patch_batch: 1
-student_patch_batch: 1
+student_patch_batch: 8
 test_patch_batch: 1
 cpu_threads: 8
 gpu_mem_fraction: 0.9
-# 每 epoch 在同一批验证 patch/Teacher targets 上评估 L_traj，选取越小越好的 best。
+# 每 epoch 在同一批验证 patch/Teacher targets 上评估 L_traj，仅作诊断。
 # 沿用原 val split（VAL_NUM=0 时为 test split），不改变训练采样或训练损失。
 validation_seed: 2024
 validation_patches_per_cloud: 4
+# 每 5 个 epoch 做完整 Student 四步 rollout，输出 CD/P2M/score。
+# best 仅按 val_rollout_score = CD + 0.3 * P2M 选择；未做 rollout 的 epoch 不更新 best。
+rollout_val_interval: 5
 
 # 正常 Student rollout 测试与第一篇 PointGPT-L baseline 使用相同后处理/指标口径。
 # 仅 mode=test 使用；不改变训练 loss 或 validation best 选择。

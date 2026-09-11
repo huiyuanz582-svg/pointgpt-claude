@@ -3,6 +3,7 @@
 import ast
 import copy
 import importlib.util
+import json
 import math
 import os
 from pathlib import Path
@@ -194,7 +195,7 @@ class DistillationTests(unittest.TestCase):
             self.assertIn('optimizer', checkpoint)
             self.assertTrue((output / 'train.jsonl').is_file())
             self.assertEqual(list(output.glob('ckpt-epoch*.pth')), [])
-            self.assertEqual(torch.load(output / 'ckpt-best.pth', weights_only=True)['epoch'], 1)
+            self.assertFalse((output / 'ckpt-best.pth').exists())  # No rollout before epoch 5.
             self.assertEqual(len(created), 1)  # Student 来自加载后的 Teacher deepcopy。
             for key, value in created[0].state_dict().items():
                 torch.testing.assert_close(value, expected[key], rtol=0, atol=0)
@@ -213,36 +214,48 @@ class DistillationTests(unittest.TestCase):
                              torch.device('cpu'), teacher_path, continued)
             self.assertEqual(torch.load(continued / 'ckpt-last.pth', weights_only=True)['epoch'], 2)
             self.assertEqual({path.name for path in continued.glob('*.pth')},
-                             {'ckpt-last.pth', 'ckpt-best.pth'})
-            self.assertTrue((continued / 'ckpt-best.pth').is_file())
+                             {'ckpt-last.pth'})
+            self.assertFalse((continued / 'ckpt-best.pth').exists())
 
     def test_best_selection_saves_only_last_and_best(self):
         config = SimpleNamespace(model={})
         optimizer = torch.optim.AdamW(self.student.parameters())
-        best_loss, best_epoch = float('inf'), None
+        best_score, best_epoch = float('inf'), None
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
-            for epoch, value in enumerate([0.3, 0.2, 0.4], start=1):
+            rollout_scores = {5: 0.3, 10: 0.2, 15: 0.4, 20: 0.2}
+            for epoch in range(1, 22):
                 with torch.no_grad():
                     self.student.weight.fill_(epoch)
-                best_loss, best_epoch, improved = runner.save_epoch_checkpoints(
+                validation = {'val_loss_traj': 1. / epoch}  # Keeps improving, including non-rollout epochs.
+                if epoch in rollout_scores:
+                    validation['val_rollout_score'] = rollout_scores[epoch]
+                elif epoch % 2 == 0:
+                    validation['val_rollout_score'] = None  # Both absent and explicit null must skip.
+                best_score, best_epoch, improved = runner.save_epoch_checkpoints(
                     output, self.student, optimizer, epoch, Path('teacher.pth'), config,
-                    {'val_loss_traj': value}, best_loss, best_epoch)
-                self.assertEqual(improved, epoch < 3)
+                    validation, best_score, best_epoch)
+                self.assertEqual(improved, epoch in (5, 10))
+                if epoch < 5:
+                    self.assertFalse((output / 'ckpt-best.pth').exists())
             best = torch.load(output / 'ckpt-best.pth', weights_only=True)
             last = torch.load(output / 'ckpt-last.pth', weights_only=True)
-            self.assertEqual(best['epoch'], 2)
-            self.assertEqual(float(best['base_model']['weight']), 2)
-            self.assertEqual(last['epoch'], 3)
+            self.assertEqual(best['epoch'], 10)
+            self.assertEqual(float(best['base_model']['weight']), 10)
+            self.assertEqual(last['epoch'], 21)
             self.assertEqual(best['selection']['best_value'], 0.2)
+            self.assertEqual(best['selection']['metric'], 'val_rollout_score')
+            self.assertIsNone(last['selection']['value'])
+            self.assertEqual(last['selection']['best_epoch'], 10)
+            self.assertEqual(last['selection']['best_value'], 0.2)
             self.assertIn('optimizer', last)
             self.assertEqual({path.name for path in output.iterdir()},
                              {'ckpt-last.pth', 'ckpt-best.pth'})
             with self.assertRaises(FloatingPointError):
-                runner.save_epoch_checkpoints(output, self.student, optimizer, 4, Path('teacher.pth'),
-                                              config, {'val_loss_traj': float('nan')}, best_loss, best_epoch)
-            self.assertEqual(torch.load(output / 'ckpt-last.pth', weights_only=True)['epoch'], 3)
-            self.assertEqual(torch.load(output / 'ckpt-best.pth', weights_only=True)['epoch'], 2)
+                runner.save_epoch_checkpoints(output, self.student, optimizer, 22, Path('teacher.pth'),
+                                              config, {'val_rollout_score': float('nan')}, best_score, best_epoch)
+            self.assertEqual(torch.load(output / 'ckpt-last.pth', weights_only=True)['epoch'], 21)
+            self.assertEqual(torch.load(output / 'ckpt-best.pth', weights_only=True)['epoch'], 10)
 
     def test_validation_preserves_batchnorm_gradients_and_train_mode(self):
         class BatchNormModel(ToyEpsilonModel):
@@ -268,6 +281,114 @@ class DistillationTests(unittest.TestCase):
             torch.testing.assert_close(value, before[name], rtol=0, atol=0)
         self.assertTrue(all(torch.equal(p.grad, torch.ones_like(p)) for p in student.parameters()))
         self.assertEqual(first['val_patches'], 4)
+
+    def test_rollout_validation_continuous_full_cloud_and_rng_restore(self):
+        class BatchNormModel(ToyEpsilonModel):
+            def __init__(self):
+                super().__init__()
+                self.bn = torch.nn.BatchNorm1d(3)
+
+            def forward(self, x, clean=None, type='val', name='', noise_std=None):
+                return (super().forward(x, clean, type, name, noise_std) +
+                        .001 * self.bn(x.transpose(1, 2)).transpose(1, 2))
+
+        student = BatchNormModel().train()
+        before = copy.deepcopy(student.state_dict())
+        for p in student.parameters():
+            p.grad = torch.ones_like(p)
+        config = SimpleNamespace(inference_patch_size=4, seed_ratio=2, test_patch_batch=2,
+                                 fuse_tau_ratio=.5, validation_seed=2024)
+        loader = [(points[None], points[None], torch.tensor([sigma]),
+                   [torch.zeros(1, 3)], [torch.ones(1, 1)], [name])
+                  for points, sigma, name in ((self.noisy, .01, 'first'),
+                                              (self.noisy[:5], .03, 'second'))]
+        infer = runner.infer_student
+        def inference(model, noisy, sigma, options):
+            return infer(model, noisy, sigma, options, denoise_fn=self.denoise)
+        received = []
+        def metrics(prediction, clean, center, scale, name, cfg, ops, mesh_split):
+            self.assertFalse(torch.is_grad_enabled())
+            self.assertFalse(student.training)
+            self.assertEqual(mesh_split, 'train')
+            self.assertEqual(prediction.shape, clean[0].shape)
+            received.append((name, len(prediction)))
+            random.random(), np.random.rand(), torch.rand(1)
+            cd, p2m = (2., 4.) if name == 'first' else (6., 8.)
+            return prediction, dict(cd_x1e4=cd, p2m_x1e4=p2m)
+        python_rng, numpy_rng, torch_rng = random.getstate(), np.random.get_state(), torch.get_rng_state()
+        with patch.object(runner, '_rollout_validation_loader', return_value=(loader, 'train')), \
+                patch.object(runner, 'baseline_metric_ops', return_value={}), \
+                patch.object(runner, 'infer_student', side_effect=inference), \
+                patch.object(runner, 'evaluate_baseline_metrics', side_effect=metrics):
+            result = runner.validate_rollout(student, config)
+        self.assertEqual(received, [('first', 8), ('second', 5)])
+        self.assertEqual(result, dict(val_rollout_cd=4., val_rollout_p2m=6.,
+                                     val_rollout_score=5.8, val_rollout_clouds=2))
+        # Two patch batches for the first cloud, one for the second; four calls each.
+        self.assertEqual(len(student.calls), 12)
+        for offset, sigma0 in ((0, .01), (4, .01), (8, .03)):
+            for stage in range(4):
+                call = student.calls[offset + stage]
+                self.assertFalse(call['grad'] or call['training'])
+                torch.testing.assert_close(call['sigma'], torch.full_like(call['sigma'], sigma0 * .95 ** (4 * stage)))
+                if stage < 3:
+                    x = call['x']
+                    expected = (x + call['sigma'][:, None, None] * (student.weight.detach() * x + student.bias.detach()) +
+                                .001 * x / math.sqrt(1 + student.bn.eps))
+                    torch.testing.assert_close(student.calls[offset + stage + 1]['x'], expected)
+        self.assertTrue(student.training)
+        for key, value in student.state_dict().items():
+            torch.testing.assert_close(value, before[key], rtol=0, atol=0)
+        self.assertTrue(all(torch.equal(p.grad, torch.ones_like(p)) for p in student.parameters()))
+        self.assertEqual(random.getstate(), python_rng)
+        np.testing.assert_equal(np.random.get_state(), numpy_rng)
+        torch.testing.assert_close(torch.get_rng_state(), torch_rng, rtol=0, atol=0)
+
+    def test_rollout_validation_failure_restores_mode_and_rng(self):
+        self.student.train()
+        before = torch.get_rng_state()
+        config = SimpleNamespace(validation_seed=2024)
+        with patch.object(runner, '_rollout_validation_loader', side_effect=RuntimeError('missing mesh')):
+            with self.assertRaisesRegex(RuntimeError, 'missing mesh'):
+                runner.validate_rollout(self.student, config)
+        self.assertTrue(self.student.training)
+        torch.testing.assert_close(torch.get_rng_state(), before, rtol=0, atol=0)
+
+    def test_only_rollout_epochs_update_best_and_all_diagnostics_are_logged(self):
+        config = SimpleNamespace(model={}, learning_rate=.001, weight_decay=0.,
+                                 teacher_patch_batch=1, student_patch_batch=8, total_bs=8,
+                                 test_patch_batch=1, epochs=6, grad_norm_clip=1.)
+        args = SimpleNamespace(epochs=None, max_shapes=0, max_patch_batches=0)
+        samples = [(self.noisy[:4], self.noisy[:4], .01, torch.zeros(1, 3),
+                    torch.ones(1, 1), 'cloud') for _ in range(8)]
+        loader = torch.utils.data.DataLoader(samples, batch_size=8, drop_last=True)
+        bank = [(self.capture(), torch.full((4,), self.sigma0))]
+        builder = SimpleNamespace(model_builder=lambda _: ToyEpsilonModel(), load_model=lambda *_: None)
+        diagnostics = [dict(val_loss_traj=float(7-epoch), val_stage_losses=[float(7-epoch)]*4,
+                            val_patches=4) for epoch in range(1, 7)]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            with patch.object(runner, '_train_loader', return_value=loader), \
+                    patch.object(runner, '_validation_bank', return_value=(bank, {'split': 'synthetic'})), \
+                    patch.object(runner, 'validate_trajectory', side_effect=diagnostics) as trajectory, \
+                    patch.object(runner, 'validate_rollout', return_value=dict(
+                        val_rollout_cd=2., val_rollout_p2m=4., val_rollout_score=3.2)) as rollout:
+                runner.train(args, config, builder, torch.device('cpu'), Path('teacher.pth'), output)
+            self.assertEqual(trajectory.call_count, 6)
+            self.assertEqual(rollout.call_count, 1)  # Default interval=5, no forced final rollout.
+            records = [json.loads(line) for line in (output / 'train.jsonl').read_text().splitlines()]
+            self.assertEqual([row['epoch'] for row in records if row['val_rollout_score'] is not None], [5])
+            fields = {'val_loss_traj', 'val_stage_losses', 'val_rollout_cd', 'val_rollout_p2m',
+                      'val_rollout_score', 'best_val_rollout_score', 'best_epoch', 'is_best'}
+            self.assertTrue(all(fields <= row.keys() for row in records))
+            self.assertEqual([row['epoch'] for row in records if row['is_best']], [5])
+            self.assertTrue(all(row['best_val_rollout_score'] is None and row['best_epoch'] is None
+                                for row in records[:4]))
+            self.assertEqual(records[5]['best_val_rollout_score'], 3.2)
+            self.assertEqual(records[5]['best_epoch'], 5)
+            best = torch.load(output / 'ckpt-best.pth', weights_only=True)
+            self.assertEqual(best['epoch'], 5)  # Epoch 6 improves trajectory loss but cannot replace best.
+            self.assertEqual(best['selection']['metric'], 'val_rollout_score')
 
     def test_same_patch_order_and_individual_sigma_teacher_schedule(self):
         patches = torch.randn(3, 7, 3)
