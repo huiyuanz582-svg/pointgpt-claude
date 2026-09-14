@@ -21,6 +21,7 @@ import pytorch3d
 import pytorch3d.loss
 from extensions.emd.emd import earth_mover_distance
 from utils.p2m_loss import compute_p2m
+from .step_condition import StepConditionEmbedding
 import open3d as o3d
 
 
@@ -625,6 +626,8 @@ class PointTransformer(nn.Module):
     def __init__(self, config ,**kwargs):
         super().__init__()
         self.config = config
+        # No parameters or RNG changes for Teacher/baseline instances.
+        self.step_condition = None
 
         self.trans_dim = config.trans_dim #Transformer 内部的 embedding/hidden 维度（decoder/生成器用到）。
         self.depth = config.depth #Transformer encoder 的层数（blocks 数）。
@@ -805,7 +808,19 @@ class PointTransformer(nn.Module):
             group_size=self.group_size,
         )
 
-    def forward(self, noisy_pts, clean_pts=None, type='val', name='', epoch=0, max_epoch=None, noise_std=None):
+    def enable_step_condition(self):
+        """Attach only a new Student branch, after loading the Teacher checkpoint."""
+        if self.step_condition is None:
+            reference = next(self.parameters())
+            # Keep data sampling RNG unchanged by construction of the new branch.
+            with torch.random.fork_rng(devices=[]):
+                self.step_condition = StepConditionEmbedding(self.encoder_dims).to(
+                    device=reference.device, dtype=reference.dtype)
+            self.step_condition.train(self.training)
+        return self
+
+    def forward(self, noisy_pts, clean_pts=None, type='val', name='', epoch=0, max_epoch=None, noise_std=None,
+                start_step=None, target_step=None):
         """
         ε-prediction 去噪框架（等价于 DDPM ε-parameterization）：
         - generator 输出 ε = (clean - noisy) / σ，量级 O(1)，N(0,1) 分布
@@ -829,6 +844,10 @@ class PointTransformer(nn.Module):
         pos_relative = self.pos_embed(position)
 
         x = group_input_tokens
+        if self.step_condition is not None:
+            if start_step is None or target_step is None:
+                raise ValueError('Conditioned Student requires start_step and target_step')
+            x = x + self.step_condition(start_step, target_step, B).to(dtype=x.dtype)[:, None, :]
 
         # 全 attention：去噪不需要因果约束（去掉了预训练的 causal mask）
         # 消融 (a) abl_causal_attn=True 时恢复预训练式因果 mask（triu, True=禁止注意）

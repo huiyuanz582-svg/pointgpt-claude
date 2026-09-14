@@ -17,18 +17,19 @@ dataset:
   _base_: cfgs/dataset_configs/ScoreDenoise.yaml
 
 # 真实训练固定日程；shadow 搜索只记录诊断，不改变 target 或 condition。
+curriculum_mode: fixed_nonuniform
 distillation:
-  teacher_nodes: [0, 4, 8, 12, 16]
+  teacher_nodes: [0, 7, 10, 13, 16]
   teacher_steps: 16
   teacher_eta: 0.3
   teacher_decay: 0.95
   student_steps: 4
   student_eta: 1.0
-  student_decay: 0.8145062499999999  # 0.95 ** 4
+  student_decay: [0.6983372960937497, 0.8573749999999999, 0.8573749999999999, 0.8573749999999999]  # 0.95 ** stage_gap
 
 # 独立的影子课程搜索；当前阶段 min_gap/end/steps 与 16→4 协议保持一致。
 pcd_dynamic:
-  shadow_enabled: true
+  shadow_enabled: false
   threshold: 0.3  # PCD_target：枚举合法候选，选择 |PCD - PCD_target| 最小者。
   lambda_balance: 1.0  # 仅独立 global shadow 分析使用；真实训练仍固定，原 greedy 保留。
   min_gap: 1

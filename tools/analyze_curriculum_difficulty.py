@@ -15,6 +15,7 @@ for path in (ROOT, ROOT / 'tools'):
         sys.path.insert(0, str(path))
 
 from runner_distill import TEACHER_NODES, TEACHER_DECAY, TEACHER_ETA, _sigma_batch, freeze_teacher
+from runner_distill import forward_student_interval, load_student_checkpoint
 
 METRICS = ('D_move', 'D_remain', 'E_imit', 'R_relative')
 DATA_FIELDS = ('dataset', 'resolution', 'noise_type', 'noise_level', 'noisy_path', 'sigma0')
@@ -153,7 +154,7 @@ def analyze_stages(student, teacher_states, clean, sigma0, denominator_eps=1e-12
             x = teacher_states[start].detach().to(device)
             target = teacher_states[end].detach().to(device)
             sigma = sigma_batch * TEACHER_DECAY ** start
-            prediction = student(x, None, 'val', '', noise_std=sigma)
+            prediction = forward_student_interval(student, x, sigma, start, end)
             if prediction.shape != target.shape:
                 raise ValueError('Student 输出 shape 与 Teacher target 不一致')
             move = (x - target).square().sum(-1).mean(-1)
@@ -241,7 +242,7 @@ def main():
     teacher = builder.model_builder(config.model).to(device)
     builder.load_model(teacher, str(teacher_path))
     student = builder.model_builder(config.model).to(device)
-    builder.load_model(student, str(student_path))
+    load_student_checkpoint(student, student_path, builder)
     freeze_teacher(teacher)
     freeze_teacher(student)
     dataset_config = config.dataset._base_

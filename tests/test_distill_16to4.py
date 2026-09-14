@@ -118,6 +118,104 @@ class DistillationTests(unittest.TestCase):
         self.assertFalse(torch.equal(before, self.student.weight))
         self.assertTrue(all(p.grad is None for p in self.teacher.parameters()))
 
+    def test_pcd_diagnostics_exact_ratios_without_changing_loss_or_gradients(self):
+        base = torch.arange(45, dtype=torch.float32).reshape(3, 5, 3) / 50
+        moves = torch.tensor([0., .1, .5])[:, None, None]
+        nodes = torch.stack([base + step * moves for step in range(5)]).requires_grad_()
+        before = nodes.detach().clone()
+        sigmas = torch.tensor([.01, .02, .03])
+        reference = copy.deepcopy(self.student)
+        original_losses = runner.backward_stages(reference, nodes, sigmas)
+        diagnostics = []
+        losses = runner.backward_stages(self.student, nodes, sigmas, stage_diagnostics=diagnostics)
+        self.assertEqual(losses, original_losses)
+        self.assertEqual(len(self.student.calls), 4)  # Logging must not add a forward.
+        for actual, expected in zip(self.student.parameters(), reference.parameters()):
+            torch.testing.assert_close(actual.grad, expected.grad, rtol=0, atol=0)
+        self.assertIsNone(nodes.grad)
+        torch.testing.assert_close(nodes.detach(), before, rtol=0, atol=0)
+        for stage, start in enumerate((0, 4, 8, 12)):
+            x, target = before[stage], before[stage + 1]
+            prediction = x + sigmas[:, None, None] * .95 ** start * (
+                self.student.weight.detach() * x + self.student.bias.detach())
+            d_move = (target - x).square().sum(-1).mean(-1)
+            e_imit = (prediction - target).square().sum(-1).mean(-1)
+            expected = torch.stack((d_move.mean(), e_imit.mean(),
+                                    (e_imit / (d_move + runner.PCD_EPS)).mean()))
+            np.testing.assert_allclose(diagnostics[stage], expected.numpy(), rtol=1e-5)
+            self.assertTrue(all(isinstance(value, float) and math.isfinite(value)
+                                for value in diagnostics[stage]))
+            self.assertEqual(float(d_move[0]), 0.)  # eps handles a stationary Teacher patch.
+            self.assertNotAlmostEqual(diagnostics[stage][2],
+                                      float(e_imit.mean() / (d_move.mean() + runner.PCD_EPS)))
+        # Unequal micro-batches retain the same per-patch diagnostic averages.
+        split_student = ToyEpsilonModel()
+        parts = []
+        for first, last in ((0, 2), (2, 3)):
+            chunk = []
+            runner.backward_stages(split_student, nodes[:, first:last], sigmas[first:last],
+                                   loss_scale=(last - first) / 3, stage_diagnostics=chunk)
+            parts.append(np.asarray(chunk) * (last - first) / 3)
+        np.testing.assert_allclose(sum(parts), diagnostics, rtol=1e-5)
+
+    def test_candidate_pcd_repeatable_arbitrary_targets_and_no_gradients(self):
+        base = torch.arange(30, dtype=torch.float32).reshape(2, 5, 3)
+        states = [(base + .25 * step).requires_grad_() for step in range(17)]
+        predictions = []
+        values = []
+        for t, u in ((1, 2), (1, 3), (1, 16), (15, 16)):
+            prediction = (states[t].detach() + .5).requires_grad_()
+            predictions.append(prediction)
+            first = runner.evaluate_candidate_pcd(states[t], states[u], prediction)
+            second = runner.evaluate_candidate_pcd(states[t], states[u], prediction)
+            self.assertTrue(torch.is_grad_enabled())  # The helper restores its caller's grad mode.
+            with torch.no_grad():
+                move = (states[u] - states[t]).square().sum(-1).mean(-1)
+                imitation = (prediction - states[u]).square().sum(-1).mean(-1)
+                expected = dict(D_move=move, E_imit=imitation, PCD=imitation / (move + 1e-12))
+            for key in ('D_move', 'E_imit', 'PCD'):
+                self.assertEqual(first[key].shape, (2,))
+                torch.testing.assert_close(first[key], second[key], rtol=0, atol=0)
+                torch.testing.assert_close(first[key], expected[key], rtol=0, atol=0)
+                self.assertFalse(first[key].requires_grad)
+                self.assertIsNone(first[key].grad_fn)
+            values.append(float(first['PCD'][0]))
+        self.assertEqual(len(set(values[:3])), 3)
+        self.assertTrue(all(p.requires_grad and p.grad is None for p in states + predictions))
+
+    def test_candidate_pcd_single_cloud_zero_movement_and_shared_epsilon(self):
+        points = torch.ones(5, 3, dtype=torch.float16, requires_grad=True)
+        zero = runner.evaluate_candidate_pcd(points, points, points)
+        displaced = runner.evaluate_candidate_pcd(points, points, points + 1)
+        self.assertEqual(runner.PCD_EPS, 1e-12)
+        for value in zero.values():
+            self.assertEqual(value.shape, ())
+            self.assertEqual(float(value), 0.)
+            self.assertFalse(value.requires_grad)
+        self.assertTrue(torch.isfinite(displaced['PCD']))
+        torch.testing.assert_close(displaced['PCD'], torch.tensor(3. / runner.PCD_EPS))
+        with self.assertRaises(ValueError):
+            runner.evaluate_candidate_pcd(points, points[:1], points)
+
+    def test_candidate_pcd_does_not_affect_fixed_baseline_loss(self):
+        nodes = self.capture().requires_grad_()
+        reference = copy.deepcopy(self.student)
+        expected_losses = runner.backward_stages(reference, nodes, self.sigma0)
+        forward = self.student.forward
+        diagnostics = []
+        def forward_with_diagnostic(x, *args, **kwargs):
+            prediction = forward(x, *args, **kwargs)
+            diagnostics.append(runner.evaluate_candidate_pcd(x, nodes[len(diagnostics) + 1], prediction))
+            self.assertTrue(prediction.requires_grad)
+            return prediction
+        with patch.object(self.student, 'forward', side_effect=forward_with_diagnostic):
+            losses = runner.backward_stages(self.student, nodes, self.sigma0)
+        self.assertEqual(losses, expected_losses)
+        self.assertEqual(len(diagnostics), 4)
+        for actual, expected in zip(self.student.parameters(), reference.parameters()):
+            torch.testing.assert_close(actual.grad, expected.grad, rtol=0, atol=0)
+        self.assertIsNone(nodes.grad)
+
     def test_student_inference_is_four_chained_steps(self):
         prediction, trajectory = runner.infer_student(
             self.student, self.noisy, self.sigma0, self.options, self.denoise,
@@ -357,8 +455,8 @@ class DistillationTests(unittest.TestCase):
                   for points, sigma, name in ((self.noisy, .01, 'first'),
                                               (self.noisy[:5], .03, 'second'))]
         infer = runner.infer_student
-        def inference(model, noisy, sigma, options):
-            return infer(model, noisy, sigma, options, denoise_fn=self.denoise)
+        def inference(model, noisy, sigma, options, **kwargs):
+            return infer(model, noisy, sigma, options, denoise_fn=self.denoise, **kwargs)
         received = []
         def metrics(prediction, clean, center, scale, name, cfg, ops, mesh_split):
             self.assertFalse(torch.is_grad_enabled())
@@ -433,8 +531,16 @@ class DistillationTests(unittest.TestCase):
             records = [json.loads(line) for line in (output / 'train.jsonl').read_text().splitlines()]
             self.assertEqual([row['epoch'] for row in records if row['val_rollout_score'] is not None], [5])
             fields = {'val_loss_traj', 'val_stage_losses', 'val_rollout_cd', 'val_rollout_p2m',
-                      'val_rollout_score', 'best_val_rollout_score', 'best_epoch', 'is_best'}
+                      'val_rollout_score', 'best_val_rollout_score', 'best_epoch', 'is_best',
+                      'mean_D_move', 'mean_E_imit', 'mean_PCD', 'pcd_eps', 'pcd_aggregation'}
             self.assertTrue(all(fields <= row.keys() for row in records))
+            for row in records:
+                for key in ('mean_D_move', 'mean_E_imit', 'mean_PCD'):
+                    self.assertEqual(len(row[key]), 4)
+                    self.assertTrue(all(math.isfinite(value) and value >= 0 for value in row[key]))
+                np.testing.assert_allclose(row['mean_E_imit'], row['stage_losses'], rtol=1e-5)
+                self.assertEqual(row['pcd_eps'], 1e-12)
+                self.assertEqual(row['pcd_aggregation'], 'mean_of_per_patch_ratios')
             self.assertEqual([row['epoch'] for row in records if row['is_best']], [5])
             self.assertTrue(all(row['best_val_rollout_score'] is None and row['best_epoch'] is None
                                 for row in records[:4]))
