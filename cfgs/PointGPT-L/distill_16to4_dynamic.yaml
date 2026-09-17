@@ -1,0 +1,76 @@
+# 与当前完整 PointGPT-L denoiser 同结构；checkpoint 必须用 --teacher_ckpt 显式指定。
+model:
+  NAME: PointTransformer
+  cls_dim: 15
+  trans_dim: 1024
+  depth: 24
+  drop_path_rate: 0.2
+  num_heads: 16
+  group_size: 32
+  num_group: 128
+  encoder_dims: 1024
+  decoder_depth: 4
+  loss: cdl12  # 原构造器的兼容字段；蒸馏不调用 Chamfer/clean/P2M loss。
+  weight_center: 1.0
+
+dataset:
+  _base_: cfgs/dataset_configs/ScoreDenoise.yaml
+
+# 初始日程；每个 epoch 结束后以当前 Student 的 calibration PCD 更新下一 epoch 节点。
+curriculum_mode: dynamic_pcd
+distillation:
+  teacher_nodes: [0, 4, 8, 12, 16]
+  teacher_steps: 16
+  teacher_eta: 0.3
+  teacher_decay: 0.95
+  student_steps: 4
+  student_eta: 1.0
+  student_decay: 0.8145062499999999  # 0.95 ** 4
+
+# 关闭原 per-batch shadow；dynamic 模式只使用下方 dynamic_pcd 搜索参数。
+pcd_dynamic:
+  shadow_enabled: false
+  threshold: 0.3  # PCD_target：枚举合法候选，选择 |PCD - PCD_target| 最小者。
+  lambda_balance: 1.0  # 独立 shadow 分析的兼容配置。
+  min_gap: 1
+  teacher_end: 16
+  student_steps: 4
+
+# 直接复用 baseline PairedPatchDataset：TRAIN_OVERSAMPLE=50、每样本随机 1024 点 patch。
+# 默认每个 stage 真实 forward 8 个 patch；调小 student_patch_batch 时仅在当前 total_bs 内累积。
+total_bs: 8
+epochs: 20
+learning_rate: 0.00001
+weight_decay: 0.0
+grad_norm_clip: 1.0
+inference_patch_size: 1024
+seed_ratio: 3
+fuse_tau_ratio: 0.5
+teacher_patch_batch: 1
+student_patch_batch: 8
+test_patch_batch: 1
+cpu_threads: 8
+gpu_mem_fraction: 0.9
+# 每 epoch 在同一批验证 patch/Teacher targets 上评估 L_traj，仅作诊断。
+# 沿用原 val split（VAL_NUM=0 时为 test split），不改变训练采样或训练损失。
+validation_seed: 2024
+validation_patches_per_cloud: 4
+# 每 5 个 epoch 做完整 Student 四步 rollout，输出 CD/P2M/score。
+# best 仅按 val_rollout_score = CD + 0.3 * P2M 选择；未做 rollout 的 epoch 不更新 best。
+rollout_val_interval: 5
+
+# 正常 Student rollout 测试与第一篇 PointGPT-L baseline 使用相同后处理/指标口径。
+# 仅 mode=test 使用；不改变训练 loss 或 validation best 选择。
+sor_enable: True
+surface_projection:
+  { enable: False, k: 16, num_iters: 1, blend: 0.6 }
+
+# 固定训练集 calibration bank；独立于训练 minibatch，搜索不更新参数。
+dynamic_pcd:
+  initial_nodes: [0, 4, 8, 12, 16]
+  target: 0.3
+  lambda_balance: 1.0
+  update_every_epochs: 1
+  calibration_patches: 64
+  calibration_seed: 2025
+  interval_patch_batch: 8

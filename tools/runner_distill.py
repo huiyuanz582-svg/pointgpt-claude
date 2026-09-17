@@ -1,14 +1,16 @@
-"""固定 16 -> 4 trajectory distillation；从仓库根目录运行，--help 不加载 CUDA。"""
+"""16 -> 4 trajectory distillation with fixed or epoch-level PCD curriculum."""
 
 import argparse
 import copy
 import csv
+import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import random
 import sys
+import time
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -23,17 +25,45 @@ PCD_EPS = 1e-12
 
 def _teacher_nodes(nodes):
     nodes = tuple(nodes)
-    if any(type(t) is not int for t in nodes) or nodes not in (TEACHER_NODES, NONUNIFORM_NODES):
-        raise ValueError('Supported fixed schedules: [0,4,8,12,16] or [0,7,10,13,16]')
+    if (len(nodes) != 5 or any(type(t) is not int for t in nodes) or
+            nodes[0] != 0 or nodes[-1] != 16 or any(t >= u for t, u in zip(nodes[:-1], nodes[1:]))):
+        raise ValueError('Teacher nodes require integer 0 < t1 < t2 < t3 < 16, with endpoints 0 and 16')
     return nodes
+
+
+def dynamic_pcd_options(config):
+    """Only dynamic mode consumes these options; all curriculum settings come from YAML."""
+    if getattr(config, 'curriculum_mode', 'fixed') != 'dynamic_pcd':
+        return None
+    options = dict(getattr(config, 'dynamic_pcd', {}))
+    required = ('initial_nodes', 'target', 'lambda_balance', 'update_every_epochs',
+                'calibration_patches', 'calibration_seed', 'interval_patch_batch')
+    if any(key not in options for key in required):
+        raise ValueError('dynamic_pcd requires ' + ', '.join(required))
+    options['initial_nodes'] = list(_teacher_nodes(options['initial_nodes']))
+    for key in ('target', 'lambda_balance'):
+        options[key] = float(options[key])
+        if not math.isfinite(options[key]) or options[key] < 0:
+            raise ValueError(f'dynamic_pcd.{key} must be finite and nonnegative')
+    for key in ('update_every_epochs', 'calibration_patches', 'interval_patch_batch', 'calibration_seed'):
+        value = options[key]
+        if type(value) is not int or value < (0 if key == 'calibration_seed' else 1):
+            raise ValueError(f'Invalid dynamic_pcd.{key}')
+    if options['calibration_seed'] >= 2 ** 32:
+        raise ValueError('calibration_seed must fit the NumPy seed range')
+    if getattr(config, 'pcd_dynamic', {}).get('shadow_enabled', False):
+        raise ValueError('dynamic_pcd uses epoch-level search; disable per-batch shadow search')
+    return options
 
 
 def configured_teacher_nodes(config):
     specification = getattr(config, 'distillation', None)
-    nodes = _teacher_nodes(specification['teacher_nodes'] if specification is not None else TEACHER_NODES)
     mode = getattr(config, 'curriculum_mode', 'fixed')
+    dynamic = dynamic_pcd_options(config)
+    nodes = _teacher_nodes(dynamic['initial_nodes'] if dynamic is not None else
+                           specification['teacher_nodes'] if specification is not None else TEACHER_NODES)
     expected = {'fixed': TEACHER_NODES, 'fixed_nonuniform': NONUNIFORM_NODES}
-    if mode not in expected or nodes != expected[mode]:
+    if dynamic is None and (mode not in expected or nodes != expected[mode]):
         raise ValueError('curriculum_mode and distillation.teacher_nodes must match')
     if specification is not None and dict(specification) != schedule(nodes):
         raise ValueError('Teacher/Student schedule differs from the supported 16-to-4 protocol')
@@ -104,6 +134,10 @@ def load_student_checkpoint(student, checkpoint_path, builder, expected_nodes=No
     saved_nodes = _teacher_nodes(saved_schedule['teacher_nodes'])
     if saved_schedule != schedule(saved_nodes):
         raise ValueError('Unsupported checkpoint distillation schedule')
+    if checkpoint.get('curriculum_mode') == 'dynamic_pcd':
+        if (list(saved_nodes) != checkpoint.get('nodes_used_this_epoch') or
+                list(saved_nodes) != checkpoint.get('current_teacher_nodes')):
+            raise ValueError('Dynamic checkpoint schedule must match nodes_used_this_epoch')
     if expected_nodes is not None and saved_nodes != _teacher_nodes(expected_nodes):
         raise ValueError('Student checkpoint schedule does not match the test YAML')
     weights = checkpoint.get('model')
@@ -117,6 +151,40 @@ def load_student_checkpoint(student, checkpoint_path, builder, expected_nodes=No
     else:
         student.load_state_dict(weights, strict=True)
     student.distillation_teacher_nodes = saved_nodes
+
+
+def restore_dynamic_curriculum(checkpoint, config):
+    """A saved model is evaluated with used nodes; resumed training starts with next nodes."""
+    options = dynamic_pcd_options(config)
+    if checkpoint.get('curriculum_mode') != 'dynamic_pcd' or checkpoint.get('dynamic_pcd_config') != options:
+        raise ValueError('Dynamic resume requires the same dynamic_pcd configuration')
+    used = _teacher_nodes(checkpoint['nodes_used_this_epoch'])
+    next_nodes = _teacher_nodes(checkpoint['next_teacher_nodes'])
+    if (checkpoint.get('distillation') != schedule(used) or
+            checkpoint.get('current_teacher_nodes') != list(used)):
+        raise ValueError('Inconsistent dynamic checkpoint schedule')
+    for key, value in (('pcd_target', options['target']), ('lambda_balance', options['lambda_balance']),
+                       ('dynamic_update_every_epochs', options['update_every_epochs'])):
+        if checkpoint.get(key) != value:
+            raise ValueError(f'Inconsistent dynamic checkpoint {key}')
+    history = copy.deepcopy(checkpoint['curriculum_history'])
+    expected_epochs = list(range(options['update_every_epochs'], int(checkpoint['epoch']) + 1,
+                                 options['update_every_epochs']))
+    if [row['epoch'] for row in history] != expected_epochs:
+        raise ValueError('Incomplete curriculum history')
+    previous = _teacher_nodes(options['initial_nodes'])
+    expected_used = previous
+    for row in history:
+        if _teacher_nodes(row['old_nodes']) != previous:
+            raise ValueError('Discontinuous curriculum history')
+        previous = _teacher_nodes(row['new_nodes'])
+        if row['epoch'] < checkpoint['epoch']:
+            expected_used = previous
+    if used != expected_used:
+        raise ValueError('nodes_used_this_epoch disagrees with curriculum history')
+    if previous != next_nodes:
+        raise ValueError('next_teacher_nodes disagrees with curriculum history')
+    return next_nodes, history, checkpoint['calibration_metadata']
 
 
 def restore_student_optimizer(optimizer, state, student):
@@ -450,6 +518,88 @@ def _train_loader(config):
     return loader
 
 
+def curriculum_calibration_bank(config, teacher, dataset):
+    """独立固定采样原训练 Dataset；不迭代训练 loader，也不推进训练 RNG。
+
+    PairedPatchDataset 原样完成 clean 归一化、加噪、noisy KNN 同索引切片。
+    固定 noisy realization 的 T0..T16 缓存在 CPU，跨 epoch 只重评 Student。
+    """
+    import numpy as np
+    import torch
+    options = dynamic_pcd_options(config)
+    count, seed = options['calibration_patches'], options['calibration_seed']
+    if count > len(dataset):
+        raise ValueError('calibration_patches exceeds the training dataset size')
+    device = next(teacher.parameters()).device
+    python_state, numpy_state = random.getstate(), np.random.get_state()
+    bank, samples = [], []
+    digest = hashlib.sha256()
+    try:
+        with torch.random.fork_rng(devices=[device.index] if device.type == 'cuda' else []), torch.no_grad():
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.random.default_generator.manual_seed(seed)
+            if device.type == 'cuda':
+                with torch.cuda.device(device):
+                    torch.cuda.manual_seed(seed)
+            indices = torch.randperm(len(dataset), generator=torch.Generator().manual_seed(seed))[:count].tolist()
+            batch_size = options['interval_patch_batch']
+            for offset in range(0, count, batch_size):
+                noisy_patches, sigmas = [], []
+                for index in indices[offset:offset + batch_size]:
+                    sample = dataset[index]
+                    noisy, clean = sample['pcl_noisy'], sample['pcl_clean']
+                    if (noisy.ndim != 2 or noisy.shape[-1] != 3 or noisy.shape != clean.shape or
+                            not torch.isfinite(noisy).all() or not torch.isfinite(clean).all()):
+                        raise ValueError('Calibration requires finite paired [N,3] training patches')
+                    sigma = float(sample['noise_std'])
+                    for value in (noisy, clean, torch.tensor(sigma, dtype=torch.float64)):
+                        digest.update(value.detach().cpu().contiguous().numpy().tobytes())
+                    noisy_patches.append(noisy.detach().cpu().clone())
+                    sigmas.append(sigma)
+                    samples.append(dict(dataset_index=index, name=str(sample['name']), sigma0=sigma,
+                                        patch_size=len(noisy)))
+                sigmas = torch.tensor(sigmas, dtype=noisy_patches[0].dtype)
+                full = capture_teacher(teacher, torch.stack(noisy_patches), sigmas,
+                                       int(config.teacher_patch_batch), return_full_trajectory=True)
+                bank.append((full, sigmas))
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+    metadata = dict(split='train', purpose='curriculum_only', seed=seed, patches=count,
+                    samples=samples, data_sha256=digest.hexdigest(), teacher_steps=16,
+                    pcd_aggregation='mean_of_per_patch_ratios')
+    return bank, metadata
+
+
+def update_dynamic_curriculum(student, bank, config):
+    """One shared global path from mean per-patch interval PCD, not a path per patch."""
+    import torch
+    from tools.shadow_global_search import build_interval_pcd_cache, search_global_teacher_nodes
+    options = dynamic_pcd_options(config)
+    totals, count, forward_calls = {}, 0, 0
+    with torch.no_grad():
+        for states, sigmas in bank:
+            cache = build_interval_pcd_cache(student, states, sigmas, options['interval_patch_batch'])
+            size = states.shape[1]
+            for edge, row in cache['metrics'].items():
+                if edge not in totals:
+                    totals[edge] = dict.fromkeys(('D_move', 'E_imit', 'PCD'), 0.0)
+                for key, values in row.items():
+                    # 先按 patch 求比值，再平均；不同大小的最后一批按样本数加权。
+                    totals[edge][key] += float(values.double().sum())
+            count += size
+            forward_calls += cache['forward_calls']
+            del cache
+        if count != options['calibration_patches']:
+            raise ValueError('Calibration bank size differs from dynamic_pcd.calibration_patches')
+        means = {edge: {key: value / count for key, value in row.items()} for edge, row in totals.items()}
+        result = search_global_teacher_nodes(means, options['target'], options['lambda_balance'])
+    _teacher_nodes(result['nodes'])
+    return dict(result, calibration_patches=count, student_forward_calls=forward_calls,
+                patch_interval_evaluations=count * len(means), pcd_aggregation='mean_of_per_patch_ratios')
+
+
 def _validation_bank(config, teacher):
     """固定验证 noisy/patch/Teacher target，跨 epoch 使用同一份 CPU 缓存。"""
     import torch
@@ -477,7 +627,8 @@ def _validation_bank(config, teacher):
             indices = ((noisy[None] - noisy[seeds, None]) ** 2).sum(-1).topk(
                 patch_size, dim=-1, largest=False).indices
             nodes = capture_teacher(teacher, noisy[indices], sigma0,
-                                    int(config.teacher_patch_batch), teacher_nodes=teacher_nodes)
+                                    int(config.teacher_patch_batch), teacher_nodes=teacher_nodes,
+                                    return_full_trajectory=getattr(config, 'curriculum_mode', 'fixed') == 'dynamic_pcd')
             bank.append((nodes, torch.full((patches_per_cloud,), sigma0)))
             samples.append(dict(name=sample['name'], sigma0=sigma0,
                                 seed_indices=seeds.tolist(), patch_size=patch_size))
@@ -487,6 +638,8 @@ def _validation_bank(config, teacher):
                     patches_per_cloud=patches_per_cloud, samples=samples,
                     split='held_out_train' if data_module.val_num > 0 else 'test',
                     schedule=schedule(teacher_nodes))
+    if getattr(config, 'curriculum_mode', 'fixed') == 'dynamic_pcd':
+        metadata.update(cached_teacher_steps=list(range(17)), schedule_selection='nodes_used_this_epoch')
     return bank, metadata
 
 
@@ -503,6 +656,10 @@ def validate_trajectory(student, bank, patch_batch, teacher_nodes=TEACHER_NODES)
     try:
         with torch.no_grad():
             for nodes, sigma0 in bank:
+                if nodes.shape[0] == 17:
+                    nodes = nodes[list(teacher_nodes)]
+                if nodes.shape[0] != 5:
+                    raise ValueError('Validation bank requires five selected or seventeen full Teacher states')
                 sigmas = _sigma_batch(sigma0, nodes.shape[1], device, nodes.dtype)
                 for offset in range(0, nodes.shape[1], patch_batch):
                     batch_nodes = nodes[:, offset:offset + patch_batch].detach().to(device)
@@ -534,7 +691,7 @@ def _rollout_validation_loader(config):
     return loader, mesh_split
 
 
-def validate_rollout(student, config):
+def validate_rollout(student, config, teacher_nodes=None):
     """Diagnostic whole-cloud Student rollout using the existing test pipeline.
 
     infer_student runs four consecutive updates inside each overlapping patch,
@@ -542,6 +699,7 @@ def validate_rollout(student, config):
     """
     import numpy as np
     import torch
+    teacher_nodes = _teacher_nodes(teacher_nodes if teacher_nodes is not None else configured_teacher_nodes(config))
     device = next(student.parameters()).device
     cuda_devices = [device.index] if device.type == 'cuda' else []
     was_training = student.training
@@ -567,7 +725,7 @@ def validate_rollout(student, config):
                     raise ValueError('Rollout validation requires complete paired [1,N,3] clouds and sigma')
                 sigma0 = float(sigmas.reshape(-1)[0])
                 prediction = infer_student(student, noisy[0].to(device), sigma0, options,
-                                           teacher_nodes=configured_teacher_nodes(config))
+                                           teacher_nodes=teacher_nodes)
                 _, metrics = evaluate_baseline_metrics(
                     prediction, clean, centers[0], scales[0], str(names[0]), config, ops,
                     mesh_split=mesh_split)
@@ -592,15 +750,21 @@ def validate_rollout(student, config):
 
 
 def _save_checkpoint(path, student, optimizer, epoch, teacher_path, config, selection=None,
-                     best_val_rollout_score=float('inf'), best_epoch=None):
+                     best_val_rollout_score=float('inf'), best_epoch=None, curriculum_state=None):
     import torch
     temporary = path.with_suffix('.tmp')
+    if getattr(config, 'curriculum_mode', 'fixed') == 'dynamic_pcd' and curriculum_state is None:
+        raise ValueError('Dynamic checkpoint requires the used/next curriculum state')
+    used_nodes = (curriculum_state['nodes_used_this_epoch'] if curriculum_state is not None
+                  else configured_teacher_nodes(config))
     payload = dict(
         base_model=student.state_dict(),
-        epoch=epoch, distillation=schedule(configured_teacher_nodes(config)), teacher_checkpoint=str(teacher_path),
+        epoch=epoch, distillation=schedule(used_nodes), teacher_checkpoint=str(teacher_path),
         curriculum_mode=getattr(config, 'curriculum_mode', 'fixed'),
         model_config=dict(config.model), selection=selection,
         best_val_rollout_score=best_val_rollout_score, best_epoch=best_epoch)
+    if curriculum_state is not None:
+        payload.update(copy.deepcopy(curriculum_state))
     if optimizer is not None:
         payload['optimizer'] = optimizer.state_dict()
     torch.save(payload, temporary)
@@ -608,7 +772,7 @@ def _save_checkpoint(path, student, optimizer, epoch, teacher_path, config, sele
 
 
 def save_epoch_checkpoints(output, student, optimizer, epoch, teacher_path, config,
-                           validation, best_score, best_epoch):
+                           validation, best_score, best_epoch, curriculum_state=None):
     # Missing/None means no rollout was evaluated this epoch. Never substitute L_traj.
     value = validation.get('val_rollout_score')
     if value is not None:
@@ -624,18 +788,30 @@ def save_epoch_checkpoints(output, student, optimizer, epoch, teacher_path, conf
     # 只保留 last 和 best；last 含 optimizer，best 仅在验证指标改善时更新。
     _save_checkpoint(output / 'ckpt-last.pth', student, optimizer, epoch,
                      teacher_path, config, selection,
-                     best_val_rollout_score=best_score, best_epoch=best_epoch)
+                     best_val_rollout_score=best_score, best_epoch=best_epoch, curriculum_state=curriculum_state)
     if improved:
         _save_checkpoint(output / 'ckpt-best.pth', student, None, epoch,
                          teacher_path, config, selection,
-                         best_val_rollout_score=best_score, best_epoch=best_epoch)
+                         best_val_rollout_score=best_score, best_epoch=best_epoch, curriculum_state=curriculum_state)
     return best_score, best_epoch, improved
 
 
 def train(args, config, builder, device, checkpoint_path, output):
     import numpy as np
     import torch
+    def timestamp():
+        if device.type == 'cuda':
+            torch.cuda.synchronize(device)
+        return time.perf_counter()
+
+    run_started = timestamp()
+    epochs = args.epochs or int(config.epochs)
+    stop_after_epoch = getattr(args, 'stop_after_epoch', None)
+    if stop_after_epoch is not None and not 1 <= stop_after_epoch <= epochs:
+        raise ValueError('stop_after_epoch must be within the unchanged total epoch plan')
     teacher_nodes = configured_teacher_nodes(config)
+    dynamic = dynamic_pcd_options(config)
+    curriculum_history, resumed_calibration = [], None
     teacher = builder.model_builder(config.model).to(device)
     # 严格加载已微调的去噪权重，绝不调用会重置输出头的 fine-tune 初始化流程。
     builder.load_model(teacher, str(checkpoint_path))
@@ -650,7 +826,12 @@ def train(args, config, builder, device, checkpoint_path, output):
     best_score, best_epoch = float('inf'), None
     if getattr(args, 'resume', None):
         resumed = torch.load(args.resume, map_location='cpu')
-        if resumed.get('distillation') != schedule(teacher_nodes) or 'optimizer' not in resumed:
+        if 'optimizer' not in resumed:
+            raise ValueError('--resume requires ckpt-last.pth with optimizer state')
+        if dynamic is not None:
+            teacher_nodes, curriculum_history, resumed_calibration = restore_dynamic_curriculum(resumed, config)
+        elif (resumed.get('curriculum_mode', 'fixed') != getattr(config, 'curriculum_mode', 'fixed') or
+              resumed.get('distillation') != schedule(teacher_nodes)):
             raise ValueError('--resume 需要相同日程且包含 optimizer 的 ckpt-last.pth')
         load_student_state(student, resumed['base_model'])
         restore_student_optimizer(optimizer, resumed['optimizer'], student)
@@ -664,23 +845,33 @@ def train(args, config, builder, device, checkpoint_path, output):
     rollout_interval = int(getattr(config, 'rollout_val_interval', 5))
     if rollout_interval < 1:
         raise ValueError('rollout_val_interval 必须为正整数')
-    epochs = args.epochs or int(config.epochs)
     if start_epoch > epochs:
         raise ValueError('epochs 是目标总 epoch 数，必须大于已完成的 resume epoch')
+    if stop_after_epoch is not None and start_epoch > stop_after_epoch:
+        raise ValueError('stop_after_epoch must be at or after the first resumed epoch')
     validation_bank, validation_metadata = _validation_bank(config, teacher)
     with (output / 'validation_manifest.json').open('w', encoding='utf-8') as handle:
         json.dump(validation_metadata, handle, indent=2, ensure_ascii=False)
+    if dynamic is not None:
+        calibration_bank, calibration_metadata = curriculum_calibration_bank(config, teacher, loader.dataset)
+        if resumed_calibration is not None and calibration_metadata != resumed_calibration:
+            raise ValueError('Resume calibration bank differs from the checkpoint; check dataset/order/noise')
+        with (output / 'calibration_manifest.json').open('w', encoding='utf-8') as handle:
+            json.dump(calibration_metadata, handle, indent=2, ensure_ascii=False)
     print(f'[validation] fixed_patches={sum(nodes.shape[1] for nodes, _ in validation_bank)} '
           f'split={validation_metadata["split"]} diagnostic=val_loss_traj '
           f'best_metric=val_rollout_score', flush=True)
     gradient_checked = False
+    setup_seconds = timestamp() - run_started
     print(f'[sampling] dataset_patches={len(loader.dataset)} '
           f'effective_patches={len(loader) * loader.batch_size} '
           f'batch_size={loader.batch_size} drop_last={loader.drop_last}', flush=True)
-    stage_gaps = [u - t for t, u in zip(teacher_nodes[:-1], teacher_nodes[1:])]
-    print(f'[curriculum] teacher_nodes={list(teacher_nodes)} stage_gaps={stage_gaps}', flush=True)
     with (output / 'train.jsonl').open('w', encoding='utf-8') as log:
         for epoch in range(start_epoch, epochs + 1):
+            epoch_started = timestamp()
+            # 此变量在整个 epoch 的训练和验证中保持不变；next_nodes 只在末尾切换。
+            stage_gaps = [u - t for t, u in zip(teacher_nodes[:-1], teacher_nodes[1:])]
+            print(f'[curriculum] epoch={epoch} teacher_nodes={list(teacher_nodes)} stage_gaps={stage_gaps}', flush=True)
             totals = np.zeros(4, dtype=np.float64)
             pcd_totals = np.zeros((4, 3), dtype=np.float64)
             shadow_rows = []
@@ -734,15 +925,45 @@ def train(args, config, builder, device, checkpoint_path, output):
                 raise RuntimeError('没有执行任何 Student 更新')
             means = (totals / seen).tolist()
             pcd_means = pcd_totals / seen
+            validation_started = timestamp()
+            train_seconds = validation_started - epoch_started
             validation = validate_trajectory(student, validation_bank, int(config.test_patch_batch),
                                              teacher_nodes=teacher_nodes)
+            rollout_started = timestamp()
+            trajectory_validation_seconds = rollout_started - validation_started
             if epoch % rollout_interval == 0:
-                validation.update(validate_rollout(student, config))
+                validation.update(validate_rollout(student, config, teacher_nodes=teacher_nodes) if dynamic is not None
+                                  else validate_rollout(student, config))
             for key in ('val_rollout_cd', 'val_rollout_p2m', 'val_rollout_score'):
                 validation.setdefault(key, None)
+            search_started = timestamp()
+            rollout_validation_seconds = search_started - rollout_started
+            next_nodes, search_result, curriculum_state = teacher_nodes, None, None
+            if dynamic is not None:
+                if epoch % dynamic['update_every_epochs'] == 0:
+                    search_result = update_dynamic_curriculum(student, calibration_bank, config)
+                    next_nodes = _teacher_nodes(search_result['nodes'])
+                    curriculum_history.append(dict(
+                        epoch=epoch, old_nodes=list(teacher_nodes), new_nodes=list(next_nodes),
+                        stage_pcd=search_result['stage_PCD'], pcd_std=search_result['pcd_std'],
+                        pcd_range=search_result['pcd_max_minus_min'],
+                        mean_target_error=search_result['mean_target_error'], path_score=search_result['path_score'],
+                        student_forward_calls=search_result['student_forward_calls']))
+                    print(f'[dynamic-pcd] epoch={epoch} next_nodes={list(next_nodes)} '
+                          f'path_score={search_result["path_score"]:.6g}', flush=True)
+                curriculum_state = dict(
+                    current_teacher_nodes=list(teacher_nodes), nodes_used_this_epoch=list(teacher_nodes),
+                    next_teacher_nodes=list(next_nodes), pcd_target=dynamic['target'],
+                    lambda_balance=dynamic['lambda_balance'],
+                    dynamic_update_every_epochs=dynamic['update_every_epochs'],
+                    dynamic_pcd_config=dynamic, curriculum_history=curriculum_history,
+                    calibration_metadata=calibration_metadata)
+            checkpoint_started = timestamp()
+            curriculum_search_seconds = checkpoint_started - search_started if search_result is not None else 0.0
             best_score, best_epoch, improved = save_epoch_checkpoints(
                 output, student, optimizer, epoch, checkpoint_path, config,
-                validation, best_score, best_epoch)
+                validation, best_score, best_epoch, curriculum_state=curriculum_state)
+            saved_at = timestamp()
             record = dict(epoch=epoch, patches=seen, stage_losses=means,
                           curriculum_mode=getattr(config, 'curriculum_mode', 'fixed'),
                           teacher_nodes=list(teacher_nodes), stage_gaps=stage_gaps,
@@ -753,12 +974,39 @@ def train(args, config, builder, device, checkpoint_path, output):
                           loss_traj=sum(means) / 4, **validation,
                           best_val_rollout_score=best_score if math.isfinite(best_score) else None,
                           best_epoch=best_epoch, is_best=improved)
+            if dynamic is not None:
+                record.update(nodes_used_this_epoch=list(teacher_nodes),
+                              checkpoint_teacher_nodes=list(teacher_nodes),
+                              train_PCD_std=float(np.std(pcd_means[:, 2], ddof=0)),
+                              train_PCD_range=float(np.ptp(pcd_means[:, 2])),
+                              total_planned_epochs=epochs, stop_after_epoch=stop_after_epoch,
+                              train_seconds=train_seconds,
+                              trajectory_validation_seconds=trajectory_validation_seconds,
+                              rollout_validation_seconds=rollout_validation_seconds,
+                              curriculum_search_seconds=curriculum_search_seconds,
+                              checkpoint_seconds=saved_at - checkpoint_started,
+                              epoch_seconds=saved_at - epoch_started,
+                              setup_seconds=setup_seconds, run_elapsed_seconds=saved_at - run_started)
+                record.update(teacher_nodes_used=list(teacher_nodes),
+                              dynamic_update_performed=search_result is not None,
+                              next_teacher_nodes=list(next_nodes),
+                              search_stage_PCD=search_result['stage_PCD'] if search_result else None,
+                              search_PCD_std=search_result['pcd_std'] if search_result else None,
+                              search_PCD_range=search_result['pcd_max_minus_min'] if search_result else None,
+                              search_mean_target_error=search_result['mean_target_error'] if search_result else None,
+                              search_path_score=search_result['path_score'] if search_result else None,
+                              search_student_forward_calls=search_result['student_forward_calls'] if search_result else 0)
             if shadow_options['shadow_enabled']:
                 record.update(shadow_enabled=True, shadow_threshold=shadow_options['threshold'],
                               **summarize_shadow_search(shadow_rows))
             log.write(json.dumps(record) + '\n')
             log.flush()
             print(json.dumps(record), flush=True)
+            teacher_nodes = next_nodes
+            if stop_after_epoch is not None and epoch >= stop_after_epoch:
+                print(f'[stop-after-epoch] saved epoch={epoch}; total_plan={epochs}; '
+                      f'next_epoch={epoch + 1} not started', flush=True)
+                break
 
 
 def baseline_metric_ops(config, device):
@@ -820,7 +1068,15 @@ def test(args, config, builder, device, checkpoint_path, output):
     from easydict import EasyDict
     student = builder.model_builder(config.model).to(device)
     teacher_nodes = configured_teacher_nodes(config)
-    load_student_checkpoint(student, checkpoint_path, builder, expected_nodes=teacher_nodes)
+    dynamic = getattr(config, 'curriculum_mode', 'fixed') == 'dynamic_pcd'
+    load_student_checkpoint(student, checkpoint_path, builder, expected_nodes=None if dynamic else teacher_nodes)
+    if dynamic:
+        teacher_nodes = _teacher_nodes(student.distillation_teacher_nodes)
+        manifest_path = output / 'manifest.json'
+        if manifest_path.is_file():
+            manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+            manifest.update(schedule=schedule(teacher_nodes), schedule_source='student_checkpoint')
+            manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding='utf-8')
     dataset_config = EasyDict(_base_=config.dataset._base_,
                               others=EasyDict(subset='test', bs=1))
     _, loader = builder.dataset_builder(
@@ -898,6 +1154,8 @@ def _build_parser():
     parser.add_argument('--device', type=int, default=0)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--epochs', type=int, default=None)
+    parser.add_argument('--stop_after_epoch', type=int, default=None,
+                        help='Stop after saving this epoch; leave the total epoch plan and resume format unchanged')
     parser.add_argument('--max_shapes', type=int, default=0, help='冒烟：训练 patch 样本数/测试整云数；0=全部')
     parser.add_argument('--max_patch_batches', type=int, default=0, help='训练 DataLoader batch 数上限；0=全部')
     parser.add_argument('--save_trajectory', action='store_true', help='测试保存 S0..S4 的 NPZ')
@@ -911,6 +1169,8 @@ def main():
         raise ValueError('train 必须指定 --teacher_ckpt；test 必须指定 --student_ckpt')
     if args.max_shapes < 0 or args.max_patch_batches < 0 or (args.epochs is not None and args.epochs < 1):
         raise ValueError('epochs 必须为正数，冒烟限制必须非负')
+    if args.stop_after_epoch is not None and (args.mode != 'train' or args.stop_after_epoch < 1):
+        raise ValueError('stop_after_epoch is a positive training-only epoch boundary')
     checkpoint_path = Path(checkpoint_arg).expanduser().resolve()
     if args.resume:
         if args.mode != 'train':

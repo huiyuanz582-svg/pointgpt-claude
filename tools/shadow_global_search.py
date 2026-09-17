@@ -1,4 +1,4 @@
-"""Global four-stage shadow analysis; never imported by the training runner."""
+"""Exact global four-stage selection shared by shadow analysis and epoch curriculum."""
 from importlib import import_module
 from itertools import combinations
 import math
