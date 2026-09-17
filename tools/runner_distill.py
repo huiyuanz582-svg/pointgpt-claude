@@ -44,6 +44,71 @@ def _sigma_batch(sigma0, batch_size, device, dtype):
     return sigma
 
 
+def enable_student_condition(student):
+    if hasattr(student, 'enable_step_condition'):
+        student.enable_step_condition()
+    return student
+
+
+def forward_student_interval(student, points, sigma, start_step, target_step):
+    """One explicit interval interface for fixed training, diagnostics and future targets."""
+    condition = {}
+    if getattr(student, 'step_condition', None) is not None:
+        condition = dict(start_step=start_step, target_step=target_step)
+    return student(points, None, 'val', '', noise_std=sigma, **condition)
+
+
+def load_student_state(student, state):
+    """Strict backbone loading; only a wholly absent new condition branch is initialized."""
+    enable_student_condition(student)
+    weights = {key.replace('module.', ''): value for key, value in state.items()}
+    if (getattr(student, 'step_condition', None) is not None and
+            not any(key.startswith('step_condition.') for key in weights)):
+        weights.update({'step_condition.' + key: value
+                        for key, value in student.step_condition.state_dict().items()})
+    student.load_state_dict(weights, strict=True)
+
+
+def load_student_checkpoint(student, checkpoint_path, builder):
+    """Match the condition branch in the checkpoint; preserve legacy inference."""
+    if not hasattr(student, 'enable_step_condition'):
+        return builder.load_model(student, str(checkpoint_path))
+    import torch
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    if checkpoint.get('distillation', schedule()) != schedule():
+        raise ValueError('Student checkpoint must use the fixed 16-to-4 schedule')
+    weights = checkpoint.get('model')
+    if weights is None:
+        weights = checkpoint.get('base_model')
+    if weights is None:
+        raise ValueError('Student checkpoint must contain model or base_model')
+    weights = {key.replace('module.', ''): value for key, value in weights.items()}
+    if any(key.startswith('step_condition.') for key in weights):
+        load_student_state(student, weights)
+    else:
+        student.load_state_dict(weights, strict=True)
+
+
+def restore_student_optimizer(optimizer, state, student):
+    """Keep legacy AdamW state/hyperparameters; append empty slots only for new parameters."""
+    old_groups = state['param_groups']
+    new_groups = optimizer.param_groups
+    if len(old_groups) == len(new_groups) and any(
+            len(old['params']) != len(new['params']) for old, new in zip(old_groups, new_groups)):
+        condition = getattr(student, 'step_condition', None)
+        condition_params = list(condition.parameters()) if condition is not None else []
+        state = copy.deepcopy(state)
+        next_id = max((pid for group in old_groups for pid in group['params']), default=-1) + 1
+        for old, new in zip(state['param_groups'], new_groups):
+            added = new['params'][len(old['params']):]
+            if len(new['params']) < len(old['params']) or any(
+                    not any(p is q for q in condition_params) for p in added):
+                raise ValueError('Optimizer mismatch outside the new Student condition branch')
+            old['params'].extend(range(next_id, next_id + len(added)))
+            next_id += len(added)
+    optimizer.load_state_dict(state)
+
+
 def capture_teacher(teacher, noisy, sigma0, patch_batch=1):
     """在 baseline 已采出的同一 patch 上迭代，不再次外层 FPS/KNN、重排或融合。"""
     import torch
@@ -87,7 +152,7 @@ def backward_stages(student, nodes, sigma0, loss_scale=1.0):
         sigma = sigmas * TEACHER_DECAY ** start
         # type='val' 只选择坐标输出分支，不会关闭 autograd，也不计算 clean loss。
         # backbone 内部仍预测 epsilon；返回值就是 eta_student=1 的一步状态。
-        next_state = student(x, None, 'val', '', noise_std=sigma)
+        next_state = forward_student_interval(student, x, sigma, start, TEACHER_NODES[stage + 1])
         loss = (next_state - target).square().sum(dim=-1).mean()
         if not torch.isfinite(loss):
             raise FloatingPointError(f'stage {stage} trajectory loss 非有限')
@@ -119,9 +184,20 @@ def infer_student(student, noisy, sigma0, patch_options, denoise_fn=None,
         from tools.runner_finetune import patch_based_denoise
         denoise_fn = patch_based_denoise
     student.eval()
+    model_for_patches = student
+    if getattr(student, 'step_condition', None) is not None:
+        calls = 0
+        def fixed_interval_forward(points, clean=None, type='val', name='', noise_std=None):
+            nonlocal calls
+            # The original denoiser runs all four stages inside each patch batch.
+            stage = calls % 4
+            calls += 1
+            return forward_student_interval(student, points, noise_std,
+                                            TEACHER_NODES[stage], TEACHER_NODES[stage + 1])
+        model_for_patches = fixed_interval_forward
     with torch.no_grad():
         return denoise_fn(
-            student, noisy, sigma0, **patch_options,
+            model_for_patches, noisy, sigma0, **patch_options,
             num_steps=4, step_size=1.0, decay=TEACHER_DECAY ** 4,
             return_trajectory=return_trajectory, raise_on_memory_pressure=True)
 
@@ -202,7 +278,8 @@ def validate_trajectory(student, bank, patch_batch):
                     size = batch_nodes.shape[1]
                     for stage, start in enumerate(TEACHER_NODES[:-1]):
                         sigma = sigmas[offset:offset + size] * TEACHER_DECAY ** start
-                        prediction = student(batch_nodes[stage], None, 'val', '', noise_std=sigma)
+                        prediction = forward_student_interval(
+                            student, batch_nodes[stage], sigma, start, TEACHER_NODES[stage + 1])
                         loss = (prediction - batch_nodes[stage + 1]).square().sum(-1).mean()
                         if not torch.isfinite(loss):
                             raise FloatingPointError('验证 trajectory loss 非有限，不选择 best')
@@ -329,6 +406,8 @@ def train(args, config, builder, device, checkpoint_path, output):
     # 严格加载已微调的去噪权重，绝不调用会重置输出头的 fine-tune 初始化流程。
     builder.load_model(teacher, str(checkpoint_path))
     student = copy.deepcopy(teacher).to(device)
+    if getattr(config, 'student_step_condition', False):
+        enable_student_condition(student)
     student.requires_grad_(True)
     freeze_teacher(teacher)
     student.train()
@@ -340,8 +419,12 @@ def train(args, config, builder, device, checkpoint_path, output):
         resumed = torch.load(args.resume, map_location='cpu')
         if resumed.get('distillation') != schedule() or 'optimizer' not in resumed:
             raise ValueError('--resume 需要相同日程且包含 optimizer 的 ckpt-last.pth')
-        student.load_state_dict(resumed['base_model'], strict=True)
-        optimizer.load_state_dict(resumed['optimizer'])
+        if getattr(config, 'student_step_condition', False):
+            load_student_state(student, resumed['base_model'])
+            restore_student_optimizer(optimizer, resumed['optimizer'], student)
+        else:
+            student.load_state_dict(resumed['base_model'], strict=True)
+            optimizer.load_state_dict(resumed['optimizer'])
         start_epoch = int(resumed['epoch']) + 1
         best_score = float(resumed.get('best_val_rollout_score', float('inf')))
         best_epoch = resumed.get('best_epoch', None)
@@ -478,7 +561,7 @@ def test(args, config, builder, device, checkpoint_path, output):
     import torch
     from easydict import EasyDict
     student = builder.model_builder(config.model).to(device)
-    builder.load_model(student, str(checkpoint_path))
+    load_student_checkpoint(student, checkpoint_path, builder)
     dataset_config = EasyDict(_base_=config.dataset._base_,
                               others=EasyDict(subset='test', bs=1))
     _, loader = builder.dataset_builder(
