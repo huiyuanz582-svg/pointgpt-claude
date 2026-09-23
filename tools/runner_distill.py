@@ -529,6 +529,10 @@ def curriculum_calibration_bank(config, teacher, dataset):
     PairedPatchDataset 原样完成 clean 归一化、加噪、noisy KNN 同索引切片。
     固定 noisy realization 的 T0..T16 缓存在 CPU，跨 epoch 只重评 Student。
     """
+    resolved = resolve_curriculum(config)
+    if resolved['metric']['type'] == 'rollout_aware':
+        from tools.rollout_curriculum import build_stratified_bank
+        return build_stratified_bank(config, teacher, dataset, resolved, capture_teacher)
     import numpy as np
     import torch
     options = dynamic_pcd_options(config)
@@ -577,8 +581,13 @@ def curriculum_calibration_bank(config, teacher, dataset):
     return bank, metadata
 
 
-def update_dynamic_curriculum(student, bank, config):
+def update_dynamic_curriculum(student, bank, config, *, report_path=None):
     """One shared global path from mean per-patch interval PCD, not a path per patch."""
+    resolved = resolve_curriculum(config)
+    if resolved['metric']['type'] == 'rollout_aware':
+        from tools.rollout_curriculum import search_rollout_paths
+        return search_rollout_paths(student, bank, resolved, forward_student_interval,
+                                    report_path=report_path, decay=TEACHER_DECAY)
     import torch
     from tools.shadow_global_search import build_interval_pcd_cache, search_global_teacher_nodes
     options = dynamic_pcd_options(config)
@@ -803,8 +812,13 @@ def save_epoch_checkpoints(output, student, optimizer, epoch, teacher_path, conf
 
 def train(args, config, builder, device, checkpoint_path, output):
     resolved_curriculum = resolve_curriculum(config)
-    if resolved_curriculum['metric']['type'] == 'rollout_aware':
-        raise NotImplementedError('Rollout-aware configuration scaffold: scoring is not installed yet')
+    rollout_aware = resolved_curriculum['metric']['type'] == 'rollout_aware'
+    if rollout_aware:
+        from tools.rollout_curriculum import update_rollout_epoch, rollout_log_fields
+        if getattr(args, 'resume', None):
+            require_supported_resume(resolved_curriculum)
+        print('[rollout-aware] TF training; raw Jrobust selection. '
+              'EMA, switch suppression and rollout-aware resume are NOT enabled.', flush=True)
     import numpy as np
     import torch
     def timestamp():
@@ -948,7 +962,11 @@ def train(args, config, builder, device, checkpoint_path, output):
             search_started = timestamp()
             rollout_validation_seconds = search_started - rollout_started
             next_nodes, search_result, curriculum_state = teacher_nodes, None, None
-            if dynamic is not None:
+            if rollout_aware:
+                next_nodes, search_result, curriculum_state = update_rollout_epoch(
+                    student, calibration_bank, config, resolved_curriculum, epoch, teacher_nodes,
+                    curriculum_history, calibration_metadata, output, update_dynamic_curriculum)
+            elif dynamic is not None:
                 if epoch % dynamic['update_every_epochs'] == 0:
                     search_result = update_dynamic_curriculum(student, calibration_bank, config)
                     next_nodes = _teacher_nodes(search_result['nodes'])
@@ -999,12 +1017,14 @@ def train(args, config, builder, device, checkpoint_path, output):
                 record.update(teacher_nodes_used=list(teacher_nodes),
                               dynamic_update_performed=search_result is not None,
                               next_teacher_nodes=list(next_nodes),
-                              search_stage_PCD=search_result['stage_PCD'] if search_result else None,
-                              search_PCD_std=search_result['pcd_std'] if search_result else None,
-                              search_PCD_range=search_result['pcd_max_minus_min'] if search_result else None,
-                              search_mean_target_error=search_result['mean_target_error'] if search_result else None,
+                              search_stage_PCD=search_result.get('stage_PCD') if search_result else None,
+                              search_PCD_std=search_result.get('pcd_std') if search_result else None,
+                              search_PCD_range=search_result.get('pcd_max_minus_min') if search_result else None,
+                              search_mean_target_error=search_result.get('mean_target_error') if search_result else None,
                               search_path_score=search_result['path_score'] if search_result else None,
                               search_student_forward_calls=search_result['student_forward_calls'] if search_result else 0)
+            if rollout_aware:
+                record.update(rollout_log_fields(search_result, resolved_curriculum))
             if shadow_options['shadow_enabled']:
                 record.update(shadow_enabled=True, shadow_threshold=shadow_options['threshold'],
                               **summarize_shadow_search(shadow_rows))
@@ -1236,10 +1256,12 @@ def main():
     from tools import builder
     output.mkdir(parents=True, exist_ok=True)
     with (output / 'manifest.json').open('w', encoding='utf-8') as handle:
-        json.dump(dict(mode=args.mode, checkpoint=str(checkpoint_path),
+        manifest = dict(mode=args.mode, checkpoint=str(checkpoint_path),
                        config=config, arguments=vars(args), schedule=schedule(teacher_nodes),
-                       gpu_memory_limit=gpu_memory_limit),
-                  handle, indent=2, ensure_ascii=False)
+                       gpu_memory_limit=gpu_memory_limit)
+        if resolved_curriculum['metric']['type'] == 'rollout_aware':
+            manifest['rollout_curriculum'] = resolved_curriculum
+        json.dump(manifest, handle, indent=2, ensure_ascii=False)
     device = torch.device(f'cuda:{args.device}')
     if args.mode == 'train':
         train(args, config, builder, device, checkpoint_path, output)
