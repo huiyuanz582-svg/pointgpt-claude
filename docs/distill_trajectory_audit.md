@@ -12,7 +12,9 @@
 - `runner_distill.evaluate_candidate_pcd`：原公式、原 epsilon，未实现新的 PCD。
 - 原 `builder.dataset_builder` / `PairedEvalDataset`、`baseline_metric_ops`、`evaluate_baseline_metrics`：沿用配对测试集、clean 单位球归一化、CD、双向 P2M、SOR 和可选 surface projection。
 
-每个 noise/shape 只生成一次 Teacher 轨迹，随后在同一 checkpoint 上依次诊断指定路径。相同 noise/shape 的各路径和两种模式使用相同种子；脚本逐次核对 patch 索引、种子坐标、覆盖数、融合权重、T0，并检查 TF/free 第一阶段最大坐标差不超过 `--first_stage_atol`（默认 `1e-6`）。不对融合后的整云重新分块或回灌到下一阶段。
+每个 noise/shape 只生成一次 Teacher 轨迹，随后在同一 checkpoint 上依次诊断指定路径。相同 noise/shape 的各路径和两种模式使用相同种子；脚本逐次核对 patch 索引、种子坐标、覆盖数、融合权重、T0，并检查 TF/free 第一阶段最大坐标差不超过 `--first_stage_atol`（默认 `1e-5`，单位为归一化坐标）。不对融合后的整云重新分块或回灌到下一阶段。
+
+这个容差只用于两次独立 float32 前向的输出检查，输入和 patch 对齐仍要求严格相等。模型包含 GPU `index_add_` 累加；固定随机种子并不保证独立前向逐位一致。旧默认 `1e-6` 曾在最大差异 `1.132488e-6` 时中断。旧服务器脚本也可显式传 `--first_stage_atol 1e-5`，不必修改训练代码。容差不会清零差异、替换预测或修改任何指标。新版在通过和失败时都将最大/平均/P95 绝对坐标差、超限坐标数及比例写入 manifest 的 `first_stage_max_abs_differences`；若仍超限，先检查这些记录，不自动继续放宽容差。
 
 所有模型前向和指标均在 `torch.no_grad()` 内，Teacher/Student 均 eval 且冻结；无 optimizer、backward、训练、在线节点搜索或 checkpoint 写入。诊断路径不写回 checkpoint 的推理节点。
 

@@ -59,7 +59,9 @@ def _build_parser():
     parser.add_argument('--device', type=int, default=0)
     parser.add_argument('--max_shapes', type=int, default=0, help='0=all; same sorted subset at each noise')
     parser.add_argument('--patch_batch', type=int, default=None, help='Default: YAML test_patch_batch')
-    parser.add_argument('--first_stage_atol', type=float, default=1e-6)
+    parser.add_argument('--first_stage_atol', type=float, default=1e-5,
+                        help='Absolute output tolerance in normalized coordinates; '
+                             'inputs/patch indices still require exact equality')
     return parser
 
 
@@ -562,16 +564,34 @@ def _run(args, output, manifest):
                     tf_final, tf = _teacher_forced(student, teacher_trajectory, noisy, noise,
                                                    nodes, options, torch)
                     _aligned(teacher_trajectory, tf, torch)
-                    first_diff = float((tf['patch_states'][1] - free['patch_states'][1]).abs().max())
-                    if first_diff > args.first_stage_atol:
-                        raise RuntimeError(f'TF/free first stage should match: max difference={first_diff}')
+                    # Independent float32 GPU forwards can differ slightly (the
+                    # model uses index_add_ reductions). Do not require bitwise
+                    # output equality or overwrite either measured trajectory.
+                    first_delta = (tf['patch_states'][1] - free['patch_states'][1]).abs().reshape(-1)
+                    first_diff = float(first_delta.max())
+                    first_check = dict(
+                        **context, value=first_diff, mean_abs_difference=float(first_delta.mean()),
+                        p95_abs_difference=float(torch.quantile(first_delta, 0.95)),
+                        coordinates_above_atol=int((first_delta > args.first_stage_atol).sum()),
+                        fraction_above_atol=float((first_delta > args.first_stage_atol).float().mean()),
+                        coordinate_count=int(first_delta.numel()), atol=args.first_stage_atol,
+                        passed=first_diff <= args.first_stage_atol)
+                    # Persist failed checks too, so a rerun never loses the evidence.
+                    manifest.setdefault('first_stage_max_abs_differences', []).append(first_check)
+                    _write_manifest(output, manifest)
+                    if not first_check['passed']:
+                        raise RuntimeError(
+                            f'TF/free first stage exceeds output tolerance: max={first_diff:.9g}, '
+                            f'atol={args.first_stage_atol:.9g}, '
+                            f'mean={first_check["mean_abs_difference"]:.9g}, '
+                            f'p95={first_check["p95_abs_difference"]:.9g}; '
+                            'see run_manifest.json before changing the tolerance')
                     _patch_metrics(teacher_trajectory, tf, free, clean, nodes, device, ops, metrics, context, torch)
                     _whole_metrics(teacher_trajectory, tf, free,
                                    dict(teacher=teacher_final, teacher_forced=tf_final, free_rollout=free_final),
                                    clean, center, scale, nodes, config, raw_config, ops, device,
                                    metrics, context, torch)
                     manifest['completed_shape_noise_path_runs'] += 1
-                    manifest.setdefault('first_stage_max_abs_differences', []).append(dict(**context, value=first_diff))
                     _write_manifest(output, manifest)
                     print(f"[{manifest['completed_shape_noise_path_runs']}/{manifest['expected_shape_noise_path_runs']}] "
                           f"{name} noise={noise:g} nodes={list(nodes)} first_stage_max_diff={first_diff:.3g}", flush=True)
