@@ -16,6 +16,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from utils.curriculum_config import resolve_curriculum, require_supported_resume
+
 TEACHER_NODES = (0, 4, 8, 12, 16)
 NONUNIFORM_NODES = (0, 7, 10, 13, 16)
 TEACHER_ETA = 0.3
@@ -800,6 +802,9 @@ def save_epoch_checkpoints(output, student, optimizer, epoch, teacher_path, conf
 
 
 def train(args, config, builder, device, checkpoint_path, output):
+    resolved_curriculum = resolve_curriculum(config)
+    if resolved_curriculum['metric']['type'] == 'rollout_aware':
+        raise NotImplementedError('Rollout-aware configuration scaffold: scoring is not installed yet')
     import numpy as np
     import torch
     def timestamp():
@@ -829,6 +834,7 @@ def train(args, config, builder, device, checkpoint_path, output):
     best_score, best_epoch = float('inf'), None
     if getattr(args, 'resume', None):
         resumed = torch.load(args.resume, map_location='cpu')
+        require_supported_resume(resolved_curriculum, resumed)
         if 'optimizer' not in resumed:
             raise ValueError('--resume requires ckpt-last.pth with optimizer state')
         if dynamic is not None:
@@ -1209,6 +1215,9 @@ def main():
     import torch
     from utils.config import cfg_from_yaml_file
     config = cfg_from_yaml_file(str(config_path))
+    resolved_curriculum = resolve_curriculum(config)
+    if args.resume:
+        require_supported_resume(resolved_curriculum)
     teacher_nodes = configured_teacher_nodes(config)
     if any(int(config[key]) < 1 for key in (
             'teacher_patch_batch', 'student_patch_batch', 'test_patch_batch',
