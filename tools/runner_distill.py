@@ -965,7 +965,8 @@ def train(args, config, builder, device, checkpoint_path, output):
             if rollout_aware:
                 next_nodes, search_result, curriculum_state = update_rollout_epoch(
                     student, calibration_bank, config, resolved_curriculum, epoch, teacher_nodes,
-                    curriculum_history, calibration_metadata, output, update_dynamic_curriculum)
+                    curriculum_history, calibration_metadata, output, update_dynamic_curriculum,
+                    forward_fn=forward_student_interval)
             elif dynamic is not None:
                 if epoch % dynamic['update_every_epochs'] == 0:
                     search_result = update_dynamic_curriculum(student, calibration_bank, config)
@@ -987,6 +988,8 @@ def train(args, config, builder, device, checkpoint_path, output):
                     calibration_metadata=calibration_metadata)
             checkpoint_started = timestamp()
             curriculum_search_seconds = checkpoint_started - search_started if search_result is not None else 0.0
+            if rollout_aware and search_result is not None:
+                curriculum_search_seconds = search_result['search_seconds']  # Diagnostics have separate timing.
             best_score, best_epoch, improved = save_epoch_checkpoints(
                 output, student, optimizer, epoch, checkpoint_path, config,
                 validation, best_score, best_epoch, curriculum_state=curriculum_state)

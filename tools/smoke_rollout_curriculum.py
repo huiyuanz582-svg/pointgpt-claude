@@ -60,13 +60,14 @@ def main():
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
     from tools import builder, runner_distill as runner
-    from tools.rollout_curriculum import write_report
+    from tools.rollout_curriculum import write_report, diagnose_stage_paths
     device = torch.device('cuda', args.device)
     manifest = dict(status='running', purpose='scoring_smoke_no_training', arguments=vars(args),
                     resolved_curriculum=resolved, gpu_memory_limit=budget,
                     source_sha256={name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
                                    for name in ('tools/rollout_curriculum.py', 'tools/runner_distill.py',
-                                                'utils/curriculum_config.py')})
+                                                'utils/curriculum_config.py', 'utils/curriculum_diagnostics.py',
+                                                'tools/smoke_rollout_curriculum.py')})
     write_report(output / 'manifest.json', manifest)
     try:
         teacher = builder.model_builder(config.model).to(device)
@@ -84,8 +85,21 @@ def main():
         bank, metadata = runner.curriculum_calibration_bank(config, teacher, dataset)
         write_report(output / 'calibration_manifest.json', metadata)
         result = runner.update_dynamic_curriculum(student, bank, config, report_path=output / 'search.json')
+        current_nodes = (student.distillation_teacher_nodes if student_path else
+                         runner.configured_teacher_nodes(config))
+        diagnostics = diagnose_stage_paths(
+            student, bank, resolved, runner.forward_student_interval,
+            current=current_nodes, selected=result['nodes'], epoch=0,
+            model_state=dict(id=f'{output}::smoke_student_seed_{args.seed}',
+                             kind='loaded_student_checkpoint' if student_path else 'teacher_clone_with_condition',
+                             checkpoint=str(student_path) if student_path else None,
+                             teacher_checkpoint=str(teacher_path), seed=args.seed,
+                             current_path_source='student_checkpoint' if student_path else 'config_initial_nodes'),
+            output=output)
         manifest.update(status='completed', student_forward_calls=result['student_forward_calls'],
-                        nodes=result['nodes'], Jrobust=result['Jrobust'], search_seconds=result['search_seconds'])
+                        nodes=result['nodes'], Jrobust=result['Jrobust'], search_seconds=result['search_seconds'],
+                        stage_diagnostics=dict(diagnostics['files'], student_forward_calls=diagnostics['student_forward_calls'],
+                                               seconds=diagnostics['diagnostic_seconds']))
         print(json.dumps(manifest, ensure_ascii=False, allow_nan=False), flush=True)
     except BaseException as error:
         manifest.update(status='failed', error=f'{type(error).__name__}: {error}')

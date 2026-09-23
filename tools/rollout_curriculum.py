@@ -297,8 +297,133 @@ def build_stratified_bank(config, teacher, dataset, resolved, capture_fn, *, tra
                       data_sha256=digest.hexdigest(), teacher_steps=16)
 
 
+def diagnose_stage_paths(student, bank, resolved, forward_fn, *, current, selected, epoch,
+                         model_state, output=None, decay=0.95, print_table=True):
+    """Post-selection diagnostics only; independent forwards never enter path ranking."""
+    import torch
+    from utils.curriculum_diagnostics import diagnostic_paths, summarize_path, compact_table, write_stage_report
+    paths = diagnostic_paths(current, selected)
+    levels, eps = resolved['calibration']['noise_levels'], resolved['metric']['eps']
+    if type(epoch) is not int or epoch < 0 or not model_state.get('id'):
+        raise ValueError('Diagnostics require a nonnegative epoch and a model-state ID')
+    if output is not None:
+        stem = f'curriculum_stage_diagnostics_epoch_{epoch:03d}'
+        if any((Path(output) / (stem + suffix)).exists() for suffix in ('.json', '.csv')):
+            raise FileExistsError(f'Refusing to overwrite diagnostics: {stem}')
+    report = dict(status='running', epoch=epoch, model_state=dict(model_state), paths=paths,
+                  noise_levels=list(levels), eps=eps, rows=[], student_forward_calls=0,
+                  tf_forward_calls=0, fr_additional_forward_calls=0, shared_first_stage_calls=0,
+                  micro_batches=0, nonfinite_count=0, small_local_denominator_count=0,
+                  diagnostic_only=True, changes_selection=False, all_noise_aggregation='pooled_patches',
+                  std_definition='population std over four stages (ddof=0)',
+                  first_stage_share_zero_sum='undefined; never add epsilon to this share',
+                  role_aliases='compute once per unique path; alias rows must not be added together')
+    stored = {p['path_id']: {name: [] for name in ('A_TF', 'M', 'C_TF', 'A_FR', 'E_FR', 'A_FR_minus_A_TF')}
+              for p in paths}
+    group_chunks = []
+    started = time.perf_counter()
+
+    def finite(value):
+        count = int((~torch.isfinite(value)).sum())
+        report['nonfinite_count'] += count
+        if count:
+            raise FloatingPointError(f'Diagnostic contains {count} nonfinite values; no samples dropped')
+
+    def predict(x, sigma, start, target, mode):
+        report['student_forward_calls'] += 1
+        report[mode + '_forward_calls'] += 1
+        prediction = forward_fn(student, x, sigma, start, target).detach()
+        if prediction.shape != x.shape or prediction.device != x.device:
+            raise ValueError('Diagnostic prediction changed point shape/device')
+        finite(prediction)
+        return prediction
+
+    try:
+        with isolated_evaluation(student) as device:
+            if device.type == 'cuda':
+                torch.cuda.synchronize(device)
+            for states, sigmas, groups in bank:
+                sigmas = torch.as_tensor(sigmas).detach().cpu().reshape(-1)
+                groups = torch.as_tensor(groups).detach().cpu().reshape(-1)
+                if (states.ndim != 4 or states.shape[0] != 17 or states.shape[-1] != 3 or
+                        states.shape[1] < 1 or states.shape[2] < 1 or not states.is_floating_point() or
+                        len(sigmas) != states.shape[1] or len(groups) != states.shape[1] or
+                        groups.dtype not in (torch.int32, torch.int64)):
+                    raise ValueError('Diagnostic bank must have [17,B,N,3] states and aligned sigma/group IDs')
+                finite(sigmas)
+                if (groups < 0).any() or (groups >= len(levels)).any():
+                    raise ValueError('Invalid diagnostic noise group')
+                expected = torch.tensor(levels, dtype=sigmas.dtype)[groups.long()]
+                if not torch.allclose(sigmas, expected, rtol=1e-6, atol=1e-10):
+                    raise ValueError('Diagnostic sigma differs from its noise group')
+                for offset in range(0, states.shape[1], resolved['search']['patch_batch']):
+                    teacher = states[:, offset:offset + resolved['search']['patch_batch']].detach().to(device)
+                    finite(teacher)
+                    size = teacher.shape[1]
+                    sigma0 = sigmas[offset:offset + size].to(device=device, dtype=teacher.dtype)
+                    denominator = squared_distance(teacher[0], teacher[16]) + eps
+                    finite(denominator)
+                    if (denominator <= 0).any():
+                        raise FloatingPointError('Diagnostic endpoint denominator must be positive')
+                    group_chunks.append(groups[offset:offset + size].long())
+                    for path in paths:
+                        nodes = path['path']
+                        values = {name: [] for name in stored[path['path_id']]}
+                        previous = teacher[0]
+                        for stage, (start, target) in enumerate(zip(nodes[:-1], nodes[1:])):
+                            sigma = sigma0 * decay ** start
+                            tf = predict(teacher[start], sigma, start, target, 'tf')
+                            if stage == 0:
+                                fr = tf  # T0 is identical: one actual forward for both readouts.
+                                report['shared_first_stage_calls'] += 1
+                            else:
+                                fr = predict(previous, sigma, start, target, 'fr_additional')
+                            a_tf = squared_distance(tf, teacher[target])
+                            move = squared_distance(teacher[start], teacher[target])
+                            a_fr = squared_distance(fr, teacher[target])
+                            local_denominator = move + eps
+                            if (local_denominator <= 0).any():
+                                raise FloatingPointError('Diagnostic local denominator must be positive')
+                            report['small_local_denominator_count'] += int(
+                                (local_denominator < resolved['metric']['denominator_warn_threshold']).sum())
+                            stage_values = dict(A_TF=a_tf, M=move, C_TF=a_tf / local_denominator,
+                                                A_FR=a_fr, E_FR=a_fr / denominator, A_FR_minus_A_TF=a_fr - a_tf)
+                            for name, value in stage_values.items():
+                                finite(value)
+                                values[name].append(value)
+                            previous = fr
+                            del tf, fr
+                        for name, value in values.items():
+                            stored[path['path_id']][name].append(torch.stack(value, -1).double().cpu())
+                        del previous, values, stage_values
+                    report['micro_batches'] += 1
+                    del teacher, denominator, sigma0
+            if not group_chunks:
+                raise ValueError('Diagnostic bank is empty')
+            groups = torch.cat(group_chunks)
+            for path in paths:
+                values = {name: torch.cat(chunks) for name, chunks in stored[path['path_id']].items()}
+                report['rows'].extend(summarize_path(path, values, groups, levels, epoch=epoch, model_state=model_state))
+            report['theoretical_forward_calls'] = 7 * len(paths) * report['micro_batches']
+            if report['student_forward_calls'] != report['theoretical_forward_calls']:
+                raise AssertionError('Unexpected diagnostic forward count')
+            if device.type == 'cuda':
+                torch.cuda.synchronize(device)
+            report['status'] = 'completed'
+    except BaseException as error:
+        report.update(status='failed', error=f'{type(error).__name__}: {error}', rows=[])
+        raise
+    finally:
+        report['diagnostic_seconds'] = time.perf_counter() - started
+        if output is not None:
+            report['files'] = write_stage_report(output, report)
+    if print_table:
+        print(compact_table(report), flush=True)
+    return report
+
+
 def update_rollout_epoch(student, bank, config, resolved, epoch, used_nodes, history,
-                         metadata, output, update_fn):
+                         metadata, output, update_fn, *, forward_fn):
     """Raw argmin only. No EMA/threshold/hold behavior is claimed or applied."""
     next_nodes, result = tuple(used_nodes), None
     if epoch % resolved['search']['update_every_epochs'] == 0:
@@ -307,6 +432,15 @@ def update_rollout_epoch(student, bank, config, resolved, epoch, used_nodes, his
             raise FileExistsError(f'Refusing to overwrite search report: {destination}')
         result = update_fn(student, bank, config, report_path=destination)
         next_nodes = tuple(result['nodes'])
+        diagnostics = diagnose_stage_paths(
+            student, bank, resolved, forward_fn, current=used_nodes, selected=next_nodes,
+            epoch=epoch, model_state=dict(id=f'{Path(output).resolve()}::student::post_train_epoch_{epoch}',
+                                         kind='post_epoch_training_before_checkpoint', checkpoint=None),
+            output=output)
+        result['stage_diagnostics'] = dict(diagnostics['files'],
+                                          student_forward_calls=diagnostics['student_forward_calls'],
+                                          seconds=diagnostics['diagnostic_seconds'])
+        write_report(destination, result)  # Only attach file/cost metadata; candidate scores stay unchanged.
         history.append(dict(epoch=epoch, old_nodes=list(used_nodes), new_nodes=list(next_nodes),
                             metric='rollout_aware', path_score=result['Jrobust'],
                             report=destination.name, student_forward_calls=result['student_forward_calls']))
@@ -323,4 +457,5 @@ def rollout_log_fields(result, resolved):
                 search_Jrobust=result['Jrobust'] if result else None,
                 search_noise_groups=result['candidates'][0]['noise_groups'] if result else None,
                 search_runner_up_gap=result['runner_up_gap'] if result else None,
-                search_nonfinite_count=result['nonfinite_count'] if result else None)
+                search_nonfinite_count=result['nonfinite_count'] if result else None,
+                curriculum_stage_diagnostics=result.get('stage_diagnostics') if result else None)

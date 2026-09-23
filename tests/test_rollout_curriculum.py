@@ -195,12 +195,17 @@ class RolloutTests(unittest.TestCase):
         used = (0,4,8,12,16)
         with tempfile.TemporaryDirectory() as directory:
             same, report, state = rollout.update_rollout_epoch(model, bank, None, options, 1, used, history,
-                                                               {}, directory, updater)
+                                                               {}, directory, updater, forward_fn=forward)
             self.assertIsNone(report)
             self.assertEqual(model.calls, 0)
             _, report, state = rollout.update_rollout_epoch(model, bank, None, options, 2, used, history,
-                                                            {}, directory, updater)
+                                                            {}, directory, updater, forward_fn=forward)
             self.assertTrue((Path(directory) / 'curriculum_search_epoch0002.json').is_file())
+            self.assertTrue((Path(directory) / 'curriculum_stage_diagnostics_epoch_002.json').is_file())
+            self.assertTrue((Path(directory) / 'curriculum_stage_diagnostics_epoch_002.csv').is_file())
+            self.assertEqual(report['student_forward_calls'], 4)  # Search remains separate.
+            self.assertEqual(report['stage_diagnostics']['student_forward_calls'], 7)
+            self.assertEqual(model.calls, 11)
             self.assertEqual(len(history), 1)
             self.assertFalse(state['rollout_curriculum']['implementation']['ema_enabled'])
             self.assertEqual(state['nodes_used_this_epoch'], list(used))
