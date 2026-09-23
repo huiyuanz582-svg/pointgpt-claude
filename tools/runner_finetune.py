@@ -155,7 +155,7 @@ def patch_based_denoise(base_model, pcl_noisy, noise_std_t, patch_size=1024,
                         seed_ratio=3, patch_batch=4,
                         num_steps=1, step_size=1.0, decay=0.95,
                         fuse_tau_ratio=0.5, return_trajectory=False,
-                        raise_on_memory_pressure=False):
+                        raise_on_memory_pressure=False, trajectory_transfer='step'):
     """
     完整点云的 patch-based 推理：把 N 点云切成覆盖全部点的重叠 1024-patch，
     逐 patch 去噪后按到种子点距离的高斯权重加权拼回完整点云。
@@ -184,11 +184,17 @@ def patch_based_denoise(base_model, pcl_noisy, noise_std_t, patch_size=1024,
       - patch_idx / fuse_weights / coverage_count / seeds。
     注意：global_states 只是诊断 readout，并没有回灌到下一步；真实教师仍是固定外层 patch、
     patch 内独立 rollout、最后融合。默认关闭时不分配任何轨迹内存，既有 train/val/test 行为不变。
+    trajectory_transfer='batch' 仅改变轨迹搬运：同一 patch batch 的逐步状态先缓存在
+    原设备，再一次性回传 CPU；更新公式、返回张量和 CPU 融合顺序保持不变。
+    trajectory_transfer='device' 将轨迹及其索引/权重保留在输入设备，整云轨迹也在该
+    设备上按原公式融合；GPU 累加可能有浮点舍入差异，不改变实际 rollout。
     """
     if num_steps < 1:
         raise ValueError(f'num_steps 必须 >= 1，当前为 {num_steps}')
     if patch_batch < 1:
         raise ValueError(f'patch_batch 必须 >= 1，当前为 {patch_batch}')
+    if trajectory_transfer not in ('step', 'batch', 'device'):
+        raise ValueError('trajectory_transfer must be step, batch, or device')
     if patch_size < 1 or seed_ratio <= 0:
         raise ValueError('patch_size 和 seed_ratio 必须 > 0')
     if (not np.isfinite(step_size) or step_size <= 0 or
@@ -197,6 +203,7 @@ def patch_based_denoise(base_model, pcl_noisy, noise_std_t, patch_size=1024,
         raise ValueError('step_size/decay 必须为有限正数，fuse_tau_ratio 必须为有限值')
 
     device = pcl_noisy.device
+    trajectory_device = device if trajectory_transfer == 'device' else torch.device('cpu')
     if pcl_noisy.ndim != 2 or pcl_noisy.shape[-1] != 3 or pcl_noisy.shape[0] == 0:
         raise ValueError(f'pcl_noisy 必须为非空 [N, 3]，当前形状为 {tuple(pcl_noisy.shape)}')
     N = pcl_noisy.shape[0]
@@ -223,8 +230,8 @@ def patch_based_denoise(base_model, pcl_noisy, noise_std_t, patch_size=1024,
         # 精确缓存 patch 内状态，后续蒸馏不能只依赖融合整云，否则会把教师误写成全局 Markov 轨迹。
         patch_states = torch.empty(
             (num_steps + 1, patches.shape[0], patch_size, 3),
-            dtype=pcl_noisy.dtype, device='cpu')
-        patch_states[0].copy_(patches.detach().cpu())
+            dtype=pcl_noisy.dtype, device=trajectory_device)
+        patch_states[0].copy_(patches.detach().to(trajectory_device))
 
     # 分批喂模型去噪
     denoised_patches = []
@@ -240,6 +247,12 @@ def patch_based_denoise(base_model, pcl_noisy, noise_std_t, patch_size=1024,
                 print(message + '。为防崩溃主动退出')
                 sys.exit(0)
         x = patches[i:i + patch_batch]                            # [b, patch_size, 3]
+        trajectory_batch = None
+        if patch_states is not None and trajectory_transfer == 'batch':
+            # Copies on the current CUDA stream preserve every original step;
+            # only the device-to-host transfer is delayed until the batch ends.
+            trajectory_batch = torch.empty(
+                (num_steps, *x.shape), dtype=x.dtype, device=x.device)
         sigma_t = sigma0
         for step_idx in range(num_steps):
             ns = torch.full((x.shape[0],), float(sigma_t), device=device)
@@ -248,8 +261,14 @@ def patch_based_denoise(base_model, pcl_noisy, noise_std_t, patch_size=1024,
             eps = (out - x) / sigma_t                             # 估计的 ε
             x = x + step_size * sigma_t * eps                     # Langevin 退火步
             sigma_t = sigma_t * decay                             # σ 逐步退火
-            if patch_states is not None:
-                patch_states[step_idx + 1, i:i + x.shape[0]].copy_(x.detach().cpu())
+            if trajectory_batch is not None:
+                trajectory_batch[step_idx].copy_(x.detach())
+            elif patch_states is not None:
+                patch_states[step_idx + 1, i:i + x.shape[0]].copy_(x.detach().to(trajectory_device))
+        if trajectory_batch is not None:
+            # Blocking copy: CPU fusion must never read an unfinished transfer.
+            patch_states[1:, i:i + x.shape[0]].copy_(trajectory_batch.cpu())
+            del trajectory_batch
         denoised_patches.append(x.detach())
         del x, out, eps, ns
     denoised_patches = torch.cat(denoised_patches, dim=0)          # [S, patch_size, 3]
@@ -281,39 +300,40 @@ def patch_based_denoise(base_model, pcl_noisy, noise_std_t, patch_size=1024,
     coverage_count = torch.zeros(N, 1, dtype=torch.long, device=device)
     coverage_count.index_add_(0, flat_idx, torch.ones_like(flat_idx).view(-1, 1))
 
-    # 阶段 0 的全局逐步轨迹在 CPU 上融合，避免把 31×50k 状态长期留在显存。
-    patch_idx_cpu = patch_idx.detach().cpu()
-    fuse_w_cpu = fuse_w.detach().cpu()
-    flat_idx_cpu = patch_idx_cpu.reshape(-1)
-    flat_w_cpu = fuse_w_cpu.reshape(-1, 1)
-    wsum_cpu = torch.zeros(N, 1, dtype=pcl_noisy.dtype)
-    wsum_cpu.index_add_(0, flat_idx_cpu, flat_w_cpu)
-    uncovered_cpu = (wsum_cpu < 1e-8).squeeze(-1)
-    noisy_cpu = pcl_noisy.detach().cpu()
+    # Preserve the same readout formula on the selected storage device. In
+    # device mode these .to() calls are no-ops; no trajectory is sent to CPU.
+    trajectory_idx = patch_idx.detach().to(trajectory_device)
+    trajectory_weights = fuse_w.detach().to(trajectory_device)
+    trajectory_flat_idx = trajectory_idx.reshape(-1)
+    trajectory_flat_w = trajectory_weights.reshape(-1, 1)
+    trajectory_wsum = torch.zeros(N, 1, dtype=pcl_noisy.dtype, device=trajectory_device)
+    trajectory_wsum.index_add_(0, trajectory_flat_idx, trajectory_flat_w)
+    trajectory_uncovered = (trajectory_wsum < 1e-8).squeeze(-1)
+    trajectory_noisy = pcl_noisy.detach().to(trajectory_device)
     global_states = torch.empty(
-        (num_steps + 1, N, 3), dtype=pcl_noisy.dtype, device='cpu')
-    global_states[0].copy_(noisy_cpu)
+        (num_steps + 1, N, 3), dtype=pcl_noisy.dtype, device=trajectory_device)
+    global_states[0].copy_(trajectory_noisy)
     for step_idx in range(1, num_steps + 1):
-        step_accum = torch.zeros(N, 3, dtype=pcl_noisy.dtype)
+        step_accum = torch.zeros(N, 3, dtype=pcl_noisy.dtype, device=trajectory_device)
         step_accum.index_add_(
-            0, flat_idx_cpu,
-            patch_states[step_idx].reshape(-1, 3) * flat_w_cpu)
-        fused = step_accum / wsum_cpu.clamp_min(1e-8)
-        fused[uncovered_cpu] = noisy_cpu[uncovered_cpu]
+            0, trajectory_flat_idx,
+            patch_states[step_idx].reshape(-1, 3) * trajectory_flat_w)
+        fused = step_accum / trajectory_wsum.clamp_min(1e-8)
+        fused[trajectory_uncovered] = trajectory_noisy[trajectory_uncovered]
         global_states[step_idx].copy_(fused)
 
     sigma_before = torch.tensor(
-        [sigma0 * (decay ** k) for k in range(num_steps)], dtype=torch.float64)
+        [sigma0 * (decay ** k) for k in range(num_steps)], dtype=torch.float64, device=trajectory_device)
     sigma_after = torch.tensor(
         [sigma0] + [sigma0 * (decay ** k) for k in range(1, num_steps + 1)],
-        dtype=torch.float64)
+        dtype=torch.float64, device=trajectory_device)
     trajectory = {
         'global_states': global_states,
         'patch_states': patch_states,
-        'patch_idx': patch_idx_cpu,
-        'fuse_weights': fuse_w_cpu,
-        'coverage_count': coverage_count.detach().cpu().squeeze(-1),
-        'seeds': seeds.detach().cpu(),
+        'patch_idx': trajectory_idx,
+        'fuse_weights': trajectory_weights,
+        'coverage_count': coverage_count.detach().to(trajectory_device).squeeze(-1),
+        'seeds': seeds.detach().to(trajectory_device),
         'sigma_before': sigma_before,
         'sigma_after': sigma_after,
         'logical_nfe': int(num_steps),
@@ -442,6 +462,9 @@ def _p2m_batch_loss(denoised_norm, center, scale, name, logger=None, verbose=Fal
             p2m_b = compute_p2m_train(pred_world, name[b], split='train')
             p2m_terms.append(p2m_b)
         except Exception as e:
+            from utils.gpu_memory import is_cuda_oom
+            if is_cuda_oom(e):
+                raise
             if verbose:
                 print_log(f'[P2M] 跳过 (mesh 缺失或 pytorch3d 问题): {e}', logger=logger)
     if len(p2m_terms) == 0:
@@ -618,14 +641,9 @@ def run_net(args, config, train_writer=None, val_writer=None):
                     loss_scalar = loss1.mean().item()
                     _loss.backward()
             except RuntimeError as e:
-                if "out of memory" in str(e):
-                    print_log('OOM，清理显存并跳过当前 batch', logger=logger)
-                    torch.cuda.empty_cache()
-                    base_model.zero_grad()
-                    num_iter = 0   # 复位累计计数：否则 step_per_update=1 时此后整个 epoch 不再 optimizer.step()
-                    continue
-                else:
-                    raise e
+                if 'out of memory' in str(e).lower():
+                    print_log('OOM：立即终止当前任务，不跳过 batch、不重试、不保存应急 checkpoint', logger=logger)
+                raise
 
             # 累加到 step_per_update 个 batch 后再 clip + step
             # （consistency 的 K 步 backward 已累加进同一份 .grad，与单步路径共用这段）

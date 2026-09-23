@@ -140,7 +140,10 @@ def run_net(args, config, train_writer=None, val_writer=None):
             try:
                 loss.backward()
                 # print("Using one GPU")
-            except:
+            except BaseException as error:
+                from utils.gpu_memory import is_cuda_oom
+                if is_cuda_oom(error):
+                    raise
                 loss = loss.mean()
                 loss.backward()
                 # print("Using multi GPUs")

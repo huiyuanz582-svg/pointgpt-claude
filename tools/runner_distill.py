@@ -492,10 +492,13 @@ def infer_student(student, noisy, sigma0, patch_options, denoise_fn=None,
     if return_trajectory and teacher_nodes != TEACHER_NODES:
         initial_sigma = float(torch.as_tensor(sigma0).reshape(-1)[0])
         trajectory = result[1]
+        trajectory_device = trajectory['patch_states'].device
         trajectory['sigma_before'] = torch.tensor(
-            [initial_sigma * TEACHER_DECAY ** t for t in teacher_nodes[:-1]], dtype=torch.float64)
+            [initial_sigma * TEACHER_DECAY ** t for t in teacher_nodes[:-1]],
+            dtype=torch.float64, device=trajectory_device)
         trajectory['sigma_after'] = torch.tensor(
-            [initial_sigma * TEACHER_DECAY ** t for t in teacher_nodes], dtype=torch.float64)
+            [initial_sigma * TEACHER_DECAY ** t for t in teacher_nodes],
+            dtype=torch.float64, device=trajectory_device)
     return result
 
 
@@ -1022,13 +1025,24 @@ def baseline_metric_ops(config, device):
                 project=local_surface_projection, mesh_root=str(p2m._MESH_ROOT))
 
 
-def evaluate_baseline_metrics(prediction, clean, center, scale, name, config, ops, mesh_split='test'):
-    """与 runner_finetune.test 相同：后处理 -> 世界坐标 -> 各自度量的归一化。"""
+def evaluate_baseline_metrics(prediction, clean, center, scale, name, config, ops, mesh_split='test',
+                              keep_on_device=False):
+    """原后处理/归一化/CD/P2M；keep_on_device 仅省去搬运并保留返回点云的设备。
+
+    默认仍返回 CPU 点云。开启后，只有完全关闭后处理时才跳过输入的 CPU 搬运；
+    SOR/surface projection 启用时仍走原设备与执行路径。
+    """
     import torch
     device = prediction.device
     sp = getattr(config, 'surface_projection', None) or {}
     with torch.no_grad():
-        filtered = ops['sor'](prediction) if getattr(config, 'sor_enable', True) else prediction.cpu()
+        if getattr(config, 'sor_enable', True):
+            filtered = ops['sor'](prediction)
+        elif keep_on_device and not sp.get('enable', False):
+            # No CPU postprocessing is needed. Avoid a GPU -> CPU -> GPU roundtrip.
+            filtered = prediction
+        else:
+            filtered = prediction.cpu()
         if sp.get('enable', False):
             filtered = ops['project'](filtered, k=int(sp.get('k', 16)),
                                       num_iters=int(sp.get('num_iters', 1)), blend=float(sp.get('blend', 1.0)))
@@ -1046,7 +1060,7 @@ def evaluate_baseline_metrics(prediction, clean, center, scale, name, config, op
         metrics = dict(cd_x1e4=float(cd_value), p2m_x1e4=float(p2m_value))
         if not all(math.isfinite(value) for value in metrics.values()):
             raise FloatingPointError(f'{name}: CD/P2M 非有限')
-        return world[0].detach().cpu(), metrics
+        return (world[0].detach() if keep_on_device else world[0].detach().cpu()), metrics
 
 
 def write_test_summary(output, rows, protocol, expected_shapes, dataset_shapes):
@@ -1204,7 +1218,8 @@ def main():
         raise RuntimeError('真实 PointGPT 训练/测试需要原 CUDA 环境及其扩展')
     torch.cuda.set_device(args.device)
     torch.set_num_threads(cpu_threads)
-    torch.cuda.set_per_process_memory_fraction(float(config.gpu_mem_fraction), args.device)
+    from utils.gpu_memory import apply_gpu_memory_limit
+    gpu_memory_limit = apply_gpu_memory_limit(config, args.device)
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -1213,7 +1228,8 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     with (output / 'manifest.json').open('w', encoding='utf-8') as handle:
         json.dump(dict(mode=args.mode, checkpoint=str(checkpoint_path),
-                       config=config, arguments=vars(args), schedule=schedule(teacher_nodes)),
+                       config=config, arguments=vars(args), schedule=schedule(teacher_nodes),
+                       gpu_memory_limit=gpu_memory_limit),
                   handle, indent=2, ensure_ascii=False)
     device = torch.device(f'cuda:{args.device}')
     if args.mode == 'train':
@@ -1223,4 +1239,6 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    from utils.gpu_memory import exit_on_cuda_oom
+    with exit_on_cuda_oom():
+        main()

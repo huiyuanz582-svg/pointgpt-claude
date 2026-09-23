@@ -1,6 +1,3 @@
-from tools import pretrain_run_net as pretrain
-from tools import finetune_run_net as finetune
-from tools import test_run_net as test_net
 from utils import parser, dist_utils, misc
 from utils.logger import *
 from utils.config import *
@@ -12,13 +9,10 @@ from torchstat import stat
 
 
 def apply_resource_limits(args, config, logger=None):
-    """主动给进程加 CPU/GPU 资源上限（共享服务器防吃满核 / 防单进程把整卡显存吃爆崩机）。
+    """CPU 线程限制及固定 CUDA 分配预算；设置失败即终止，不跳过 OOM batch。
 
-    与 runner 里"显存超阈值就保存退出"(check_memory_and_exit) 互补：那是被动监控+退出，
-    这里是主动封顶。两个 yaml 旋钮（缺省/<=0 = 不限制，保持旧行为）：
-      - cpu_threads:       PyTorch + numpy/MKL CPU 线程数上限
-      - gpu_mem_fraction:  单进程可用显存占整卡比例上限 (0,1]，超限会触发可被 try/except 捕获的
-                           OOM（跳过该 batch）而不是把整卡/服务器拖崩
+    默认 48 GiB 目标上限，其中 1 GiB 预留给分配器外开销。gpu_mem_fraction
+    仅能进一步收紧预算。该限制按进程/设备生效，不是 Docker 容器总额。
     """
     def _log(msg):
         print(msg)
@@ -33,13 +27,14 @@ def apply_resource_limits(args, config, logger=None):
             os.environ[_k] = str(cpu_threads)
         _log(f'[资源限制] CPU 线程上限 = {cpu_threads}')
 
-    gpu_frac = float(config.get('gpu_mem_fraction', 0) or 0)
-    if gpu_frac > 0 and args.use_gpu:
-        try:
-            torch.cuda.set_per_process_memory_fraction(gpu_frac, args.local_rank)
-            _log(f'[资源限制] GPU 单进程显存上限 = {gpu_frac:.0%}（device {args.local_rank}）')
-        except Exception as e:
-            _log(f'[资源限制] 设置 GPU 显存比例失败（已忽略）: {e}')
+    if args.use_gpu:
+        from utils.gpu_memory import apply_gpu_memory_limit
+        # DataParallel uses all visible GPUs; DDP owns only its assigned device.
+        # These are logical CUDA indices, including inside Docker.
+        devices = ([torch.cuda.current_device()] if args.distributed else
+                   range(torch.cuda.device_count()))
+        for device in devices:
+            apply_gpu_memory_limit(config, device, logger=logger)
 
 
 def main():
@@ -94,8 +89,11 @@ def main():
     log_config_to_file(config, 'config', logger=logger)
     # exit()
     logger.info(f'Distributed training: {args.distributed}')
-    # 主动资源限制（CPU 线程数 / GPU 单进程显存比例），从 yaml 读，缺省不限制
+    # Install before loading the runners/models. Missing GPU settings still use 48 GiB.
     apply_resource_limits(args, config, logger=logger)
+    from tools import pretrain_run_net as pretrain
+    from tools import finetune_run_net as finetune
+    from tools import test_run_net as test_net
     # set random seeds
     if args.seed is not None:
         logger.info(f'Set random seed to {args.seed}, '
@@ -125,4 +123,6 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    from utils.gpu_memory import exit_on_cuda_oom
+    with exit_on_cuda_oom():
+        main()
