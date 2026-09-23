@@ -1,0 +1,13 @@
+# Only for tools/diagnose_rollout_curriculum.py; this is not a training config.
+# Relative base_config paths are resolved against the repository root.
+base_config: cfgs/PointGPT-L/distill_16to4_rollout_smoke.yaml
+paths:
+  A: [0, 4, 8, 12, 16]
+  B: [0, 7, 10, 13, 16]
+  C: [0, 10, 12, 14, 16]
+  D: [0, 13, 14, 15, 16]
+noise_levels: [0.005, 0.01, 0.02]
+patches_per_level: 16
+calibration_seeds: [2025, 2026, 2027]
+# Keep the successful smoke micro-batch size; only the bank is larger.
+patch_batch: 2

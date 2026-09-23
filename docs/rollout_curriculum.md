@@ -198,6 +198,88 @@ two or three unique paths, respectively. The smoke search remains 30 forwards
 and adds 21/42/63 diagnostic forwards. These are additional eval calls with no
 backward/optimizer work. Search and diagnostics each restore modes and RNG state.
 
+## Expanded fixed-checkpoint diagnostics
+
+`tools/diagnose_rollout_curriculum.py` is a separate, manual diagnostic entry. It
+loads the required trained, conditioned Student checkpoint once and evaluates
+the named paths below with unchanged weights. It does not run path search,
+select new nodes, call an optimizer, save a checkpoint or enter a training loop.
+The original small smoke entry and its four-patches-per-noise limit are unchanged.
+
+`cfgs/PointGPT-L/distill_16to4_rollout_diagnostics.yaml` is a diagnostic-study
+configuration, not a training YAML. Its `base_config` supplies the existing model,
+training dataset, metric normalization and GPU limits; relative base paths resolve
+from the repository root. The study overrides the calibration and explicit-path
+settings on copies, without rewriting the base YAML.
+
+|Name|Teacher nodes|
+|---|---|
+|A|`[0,4,8,12,16]`|
+|B|`[0,7,10,13,16]`|
+|C|`[0,10,12,14,16]`|
+|D|`[0,13,14,15,16]`|
+
+Defaults are 16 patches per noise level `[0.005,0.01,0.02]`, calibration seeds
+`[2025,2026,2027]`, and micro-batch size 2. Within each seed, every path sees the
+same bank. Each seed rebuilds the train-only bank by explicitly changing
+`curriculum_calibration.seed`, then releases that bank before the next seed.
+The model/runtime `--seed` remains separate and never overrides calibration seeds.
+The diagnostic path roles are the supplied names; there is no `selected` role.
+The checkpoint's saved inference nodes are recorded as `current_checkpoint_nodes`
+in model metadata without adding an unrequested fifth diagnostic path.
+
+The interface `diagnose_stage_paths(..., named_paths={...})` reuses exactly the
+existing TF/FR formulas, mode/RNG isolation and artifact format. Named paths are
+mutually exclusive with `current`/`selected`. Identical node paths share one
+computation while preserving their name aliases. Existing callers retain the
+fixed/current/selected behavior when `named_paths` is omitted.
+
+The entry accepts at most 8 names, 32 patches/noise, 5 distinct calibration seeds
+and micro-batches of at most 8. Its noise levels remain exactly the three above;
+3% is still held out. These bounds do not change smoke or training limits.
+Default Student cost is `4 paths * 7 forwards * 3 noises * ceil(16/2) = 672`
+forwards per seed, **2,016** for all three seeds. This excludes rebuilding the
+Teacher trajectories. No 455-path search or scoring forwards are performed.
+
+User-run server command, from `/workspace` inside the existing Docker environment
+(documented here only; not executed as part of this code change):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -u tools/diagnose_rollout_curriculum.py \
+  --config cfgs/PointGPT-L/distill_16to4_rollout_diagnostics.yaml \
+  --teacher_ckpt experiments/L_consistency_plus/ckpt-best.pth \
+  --student_ckpt experiments/distill_16to4_dynamic/full20_seed0/ckpt-best.pth \
+  --output_dir "diagnostics/rollout_curriculum/expanded_$(date +%Y%m%d_%H%M%S)_$$" \
+  --device 0 --seed 0
+```
+
+Optional `--calibration_seeds 2025 2026 2027`, `--patches_per_level 16`, and
+`--patch_batch 2` explicitly override study settings. Outputs must use a new
+directory; existing experiment/checkpoint files are never overwritten.
+
+The root `manifest.json` records requested settings, expected/actual Student
+cost, source/config hashes, checkpoint file metadata, memory budget and each
+seed's status. Checkpoint file metadata includes path/size/mtime, not a content
+hash. Each `calibration_seed_<seed>/` contains `resolved_curriculum.json`,
+`calibration_manifest.json` (actual seed, patch indices and input fingerprint),
+and `curriculum_stage_diagnostics_epoch_000.json/.csv`. Here epoch 000 still means
+a standalone snapshot, not the checkpoint's training epoch. All runs have one
+model-state ID and a separate `calibration_seed` field.
+
+After every seed completes, `seed_summary.json/.csv` reports equal-weight means,
+population standard deviations, minima and maxima **across seed-level means or
+summary values**, including the individual seed values and sample/undefined
+counts. It deduplicates role aliases by actual path. P90/P95 remain in each seed's
+artifacts; this summary neither averages quantiles nor claims pooled quantiles.
+The two within-seed aggregation orders stay separate. Undefined zero-sum shares
+remain null and contribute to explicit undefined-seed counts. Different seeds
+may reuse shapes or indices, so these are not independent model-training runs.
+
+Any seed failure stops the study, marks the root/current run failed and prevents
+cross-seed aggregation; completed earlier seed artifacts are retained. There is
+no automatic retry or resume. The existing allocator limit and OOM exit 86 apply.
+These are corresponding-point Teacher-trajectory metrics, not clean CD/P2M scores.
+
 ## Manual server commands (not executed during development)
 
 Run inside the existing Docker environment, from `/workspace`, after switching
@@ -262,3 +344,11 @@ all_noise pooling, share/std/range aggregation orders, role deduplication, artif
 fields, failed-run behavior and unchanged scores/ranking/model state after diagnostics.
 No training, full test suite, trajectory audit, real-model search, server command
 or GPU program is run as part of this implementation.
+
+For the expanded diagnostic entry, additional CPU test cases are provided in
+`tests/test_curriculum_diagnostic_study.py` and `tests/test_curriculum_stage_diagnostics.py`.
+They cover bank-seed overrides, bounds/costs, named-path forward equivalence and
+isolation, alias deduplication, seed aggregation/undefined values, incomplete runs
+and aggregate artifacts. These new cases have **not been executed** in this change;
+the earlier 23-test pass does not validate this extension. No expanded server
+diagnostic or Pilot-A has been launched as part of this change.

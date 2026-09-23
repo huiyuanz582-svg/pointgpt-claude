@@ -2,6 +2,7 @@
 
 import csv
 import json
+from collections.abc import Mapping
 from pathlib import Path
 
 
@@ -20,10 +21,22 @@ CSV_FIELDS = ('epoch', 'model_state_id', 'checkpoint', 'path_id', 'path', 'path_
               'undefined_count', 'mean', 'median', 'p90', 'p95', 'value')
 
 
-def diagnostic_paths(current, selected):
-    """Deduplicate actual paths while preserving all three role aliases."""
+def diagnostic_paths(current=None, selected=None, *, named_paths=None):
+    """Deduplicate paths; default roles are unchanged, explicit names imply no selection."""
+    if named_paths is None:
+        entries = (('fixed_reference', FIXED_REFERENCE), ('current', current), ('selected', selected))
+    else:
+        if current is not None or selected is not None:
+            raise ValueError('Use named_paths or current/selected, not both')
+        if not isinstance(named_paths, Mapping) or not named_paths:
+            raise ValueError('named_paths must be a nonempty name-to-path mapping')
+        entries = named_paths.items()
     paths = {}
-    for role, values in (('fixed_reference', FIXED_REFERENCE), ('current', current), ('selected', selected)):
+    for role, values in entries:
+        if not isinstance(role, str) or not role.strip() or '|' in role:
+            raise ValueError('Diagnostic path names must be nonempty strings without |')
+        if not isinstance(values, (list, tuple)):
+            raise ValueError('Diagnostic paths must be node lists or tuples')
         nodes = tuple(values)
         if (len(nodes) != 5 or any(type(t) is not int for t in nodes) or nodes[0] != 0 or
                 nodes[-1] != 16 or any(t >= u for t, u in zip(nodes[:-1], nodes[1:]))):

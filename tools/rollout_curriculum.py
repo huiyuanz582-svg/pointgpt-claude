@@ -297,12 +297,12 @@ def build_stratified_bank(config, teacher, dataset, resolved, capture_fn, *, tra
                       data_sha256=digest.hexdigest(), teacher_steps=16)
 
 
-def diagnose_stage_paths(student, bank, resolved, forward_fn, *, current, selected, epoch,
-                         model_state, output=None, decay=0.95, print_table=True):
-    """Post-selection diagnostics only; independent forwards never enter path ranking."""
+def diagnose_stage_paths(student, bank, resolved, forward_fn, *, current=None, selected=None, epoch,
+                         model_state, output=None, decay=0.95, print_table=True, named_paths=None):
+    """TF/FR diagnostics for existing roles or named paths; never scores/selects nodes."""
     import torch
     from utils.curriculum_diagnostics import diagnostic_paths, summarize_path, compact_table, write_stage_report
-    paths = diagnostic_paths(current, selected)
+    paths = diagnostic_paths(current, selected, named_paths=named_paths)
     levels, eps = resolved['calibration']['noise_levels'], resolved['metric']['eps']
     if type(epoch) is not int or epoch < 0 or not model_state.get('id'):
         raise ValueError('Diagnostics require a nonnegative epoch and a model-state ID')

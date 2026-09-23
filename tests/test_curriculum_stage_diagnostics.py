@@ -85,6 +85,42 @@ class StageDiagnosticTests(unittest.TestCase):
                 previous = fr
         self.assertEqual(self.rows(report, 'A_FR_minus_A_TF')[0]['mean'], 0.)
 
+    def test_named_study_paths_include_all_four_without_selection_and_share_aliases(self):
+        named = dict(A=REFERENCE, B=CURRENT, C=SELECTED, D=(0, 13, 14, 15, 16), C_alias=SELECTED)
+        model = MockStudent().train()
+        model.bn.eval()
+        state = copy.deepcopy(model.state_dict())
+        modes = [m.training for m in model.modules()]
+        rng = torch.get_rng_state(), random.getstate(), np.random.get_state()
+        report = rollout.diagnose_stage_paths(
+            model, synthetic_bank(), settings([REFERENCE]), forward, named_paths=named,
+            epoch=0, model_state=MODEL_STATE, print_table=False)
+        self.assertEqual([p['path'] for p in report['paths']], [list(p) for p in list(named.values())[:4]])
+        self.assertEqual(report['paths'][2]['path_roles'], ['C', 'C_alias'])
+        self.assertEqual(report['student_forward_calls'], 28)
+        self.assertEqual(report['tf_forward_calls'], 16)
+        self.assertEqual(report['fr_additional_forward_calls'], 12)
+        self.assertNotIn('selected', {r['path_role'] for r in report['rows']})
+        self.assertFalse(report['changes_selection'])
+        self.assertEqual(modes, [m.training for m in model.modules()])
+        for key, value in state.items():
+            torch.testing.assert_close(value, model.state_dict()[key], rtol=0, atol=0)
+        torch.testing.assert_close(rng[0], torch.get_rng_state(), rtol=0, atol=0)
+        self.assertEqual(rng[1], random.getstate())
+        np.testing.assert_equal(rng[2], random.get_state())
+        for label, path in list(named.items())[:4]:
+            single = self.run_diagnostics(current=path, selected=path)
+            expected = self.rows(single, 'E_FR', role='current')
+            self.assertEqual([r['mean'] for r in self.rows(report, 'E_FR', role=label)],
+                             [r['mean'] for r in expected])
+
+    def test_named_paths_reject_ambiguous_or_invalid_requests(self):
+        for paths in ({}, {'A': [0, 4, 4, 12, 16]}, {'A': [0, 4.0, 8, 12, 16]}, {'': REFERENCE}):
+            with self.subTest(paths=paths), self.assertRaises(ValueError):
+                diagnostic_paths(named_paths=paths)
+        with self.assertRaises(ValueError):
+            diagnostic_paths(REFERENCE, SELECTED, named_paths={'A': REFERENCE})
+
     def test_summary_aggregation_order_and_pooled_all_noise(self):
         c = torch.tensor([[8.,0.,0.,0.], [0.,8.,0.,0.], [0.,0.,8.,0.]], dtype=torch.float64)
         a = torch.tensor([[1.,1.,1.,1.], [9.,1.,1.,1.], [0.,0.,0.,0.]], dtype=torch.float64)
