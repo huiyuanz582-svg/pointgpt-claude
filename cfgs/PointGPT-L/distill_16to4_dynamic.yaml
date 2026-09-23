@@ -61,7 +61,7 @@ rollout_val_interval: 5
 
 # 正常 Student rollout 测试与第一篇 PointGPT-L baseline 使用相同后处理/指标口径。
 # 仅 mode=test 使用；不改变训练 loss 或 validation best 选择。
-sor_enable: True
+sor_enable: False
 surface_projection:
   { enable: False, k: 16, num_iters: 1, blend: 0.6 }
 
