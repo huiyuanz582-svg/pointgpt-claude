@@ -9,6 +9,7 @@ from contextlib import ExitStack, redirect_stderr, redirect_stdout
 import copy
 import csv
 from datetime import datetime, timezone
+from functools import partial
 import hashlib
 import json
 import math
@@ -59,7 +60,13 @@ def _build_parser():
     parser.add_argument('--device', type=int, default=0)
     parser.add_argument('--max_shapes', type=int, default=0, help='0=all; same sorted subset at each noise')
     parser.add_argument('--patch_batch', type=int, default=None, help='Default: YAML test_patch_batch')
-    parser.add_argument('--first_stage_atol', type=float, default=1e-6)
+    parser.add_argument('--metric_patch_batch', type=int, default=32,
+                        help='Patch transfer/PCD batch; CD stays per patch (default: 32)')
+    parser.add_argument('--trajectory_transfer', choices=('device', 'step', 'batch'), default='device',
+                        help='Keep trajectory/fusion on GPU (device, default), or copy to CPU per step/batch')
+    parser.add_argument('--first_stage_atol', type=float, default=1e-5,
+                        help='Absolute output tolerance in normalized coordinates; '
+                             'inputs/patch indices still require exact equality')
     return parser
 
 
@@ -236,7 +243,8 @@ def _aligned(reference, trajectory, torch):
         raise RuntimeError('Runs did not start from identical noisy patches')
 
 
-def _teacher_forced(student, teacher, noisy, sigma0, nodes, options, torch):
+def _teacher_forced(student, teacher, noisy, sigma0, nodes, options, torch,
+                    denoise_fn=None):
     """Reuse the exact outer patch loop/fusion; replace only Student input by T_t.
 
     No fused whole-cloud state is fed back. At eta=1 the outer update reconstructs
@@ -244,15 +252,28 @@ def _teacher_forced(student, teacher, noisy, sigma0, nodes, options, torch):
     """
     from tools.runner_distill import forward_student_interval, TEACHER_DECAY
     from tools.runner_finetune import patch_based_denoise
+    if denoise_fn is None:
+        denoise_fn = patch_based_denoise
     offset = 0
     calls = 0
+    teacher_inputs = None
 
     def forward(points, clean=None, type='val', name='', noise_std=None):
-        nonlocal offset, calls
+        nonlocal offset, calls, teacher_inputs
         stage = calls % 4
         start, target = nodes[stage:stage + 2]
         count = points.shape[0]
-        teacher_input = teacher['patch_states'][start, offset:offset + count].to(points.device)
+        teacher_states = teacher['patch_states']
+        if teacher_states.device == points.device:
+            # A view into the resident Teacher trajectory; no copy or transfer.
+            teacher_input = teacher_states[start, offset:offset + count]
+        else:
+            # Transfer all four original Teacher starts together; no re-fusion
+            # or recomputation of a Teacher/Student state is introduced. This
+            # fallback is used only by the explicit CPU storage modes.
+            if stage == 0:
+                teacher_inputs = teacher_states[list(nodes[:-1]), offset:offset + count].to(points.device)
+            teacher_input = teacher_inputs[stage]
         if teacher_input.shape != points.shape:
             raise RuntimeError('Teacher-forced patch batch alignment failed')
         if stage == 0 and not torch.equal(points, teacher_input):
@@ -262,40 +283,49 @@ def _teacher_forced(student, teacher, noisy, sigma0, nodes, options, torch):
         calls += 1
         if stage == 3:
             offset += count
+            teacher_inputs = None
         return prediction
 
-    result = patch_based_denoise(forward, noisy, sigma0, **options, num_steps=4,
-                                step_size=1.0, decay=TEACHER_DECAY ** 4,
-                                return_trajectory=True, raise_on_memory_pressure=True)
+    result = denoise_fn(forward, noisy, sigma0, **options, num_steps=4,
+                       step_size=1.0, decay=TEACHER_DECAY ** 4,
+                       return_trajectory=True, raise_on_memory_pressure=True)
     if offset != teacher['patch_states'].shape[1] or calls % 4:
         raise RuntimeError('Incomplete Teacher-forced rollout')
     return result
 
 
-def _patch_metrics(teacher, tf, free, clean, nodes, device, ops, metrics, context, torch):
+def _patch_metrics(teacher, tf, free, clean, nodes, device, ops, metrics, context, torch,
+                   patch_batch=32):
     """CD/PCD samples are patches, displacement tails are computed inside each patch."""
     from tools.runner_distill import evaluate_candidate_pcd
-    clean_patches = clean.detach().cpu()[teacher['patch_idx']]
+    patch_idx = teacher['patch_idx']
+    clean_patches = clean.detach().to(patch_idx.device)[patch_idx]
     for stage, (start, target) in enumerate(zip(nodes[:-1], nodes[1:]), 1):
         samples = {mode: {} for mode in ('teacher', 'teacher_forced', 'free_rollout')}
 
-        def collect(mode, key, value):
-            samples[mode].setdefault(key, []).append(float(value))
+        for offset in range(0, clean_patches.shape[0], patch_batch):
+            batch = slice(offset, offset + patch_batch)
+            t0 = teacher['patch_states'][start, batch].to(device)
+            goal = teacher['patch_states'][target, batch].to(device)
+            gt = clean_patches[batch].to(device)
+            columns = {}
 
-        for patch in range(clean_patches.shape[0]):
-            t0 = teacher['patch_states'][start, patch].to(device)
-            goal = teacher['patch_states'][target, patch].to(device)
-            gt = clean_patches[patch].to(device)
-            collect('teacher', 'cd_to_clean_x1e4', ops['cd'](goal[None], gt[None]) * 1e4)
+            def patch_cd(left, right):
+                # The original CD wrapper may reduce its batch dimension.
+                # Keep one call per patch so the sample distribution is unchanged.
+                return torch.stack([ops['cd'](left[j:j + 1], right[j:j + 1]).reshape(()) * 1e4
+                                    for j in range(left.shape[0])])
+
+            columns[('teacher', 'cd_to_clean_x1e4')] = patch_cd(goal, gt)
             for mode, trajectory in (('teacher_forced', tf), ('free_rollout', free)):
-                prediction = trajectory['patch_states'][stage, patch].to(device)
+                prediction = trajectory['patch_states'][stage, batch].to(device)
                 source = (t0 if mode == 'teacher_forced' else
-                          trajectory['patch_states'][stage - 1, patch].to(device))
-                collect(mode, 'cd_to_teacher_x1e4', ops['cd'](prediction[None], goal[None]) * 1e4)
-                collect(mode, 'cd_to_clean_x1e4', ops['cd'](prediction[None], gt[None]) * 1e4)
+                          trajectory['patch_states'][stage - 1, batch].to(device))
+                columns[(mode, 'cd_to_teacher_x1e4')] = patch_cd(prediction, goal)
+                columns[(mode, 'cd_to_clean_x1e4')] = patch_cd(prediction, gt)
                 displacement = (prediction - source).norm(dim=-1)
-                collect(mode, 'displacement_norm_mean', displacement.mean())
-                collect(mode, 'displacement_norm_p95', torch.quantile(displacement, 0.95))
+                columns[(mode, 'displacement_norm_mean')] = displacement.mean(dim=-1)
+                columns[(mode, 'displacement_norm_p95')] = torch.quantile(displacement, 0.95, dim=-1)
                 # For free rollout keep the SAME Teacher denominator; this is an
                 # auxiliary relative error, NOT the PCD used by curriculum search.
                 pcd = evaluate_candidate_pcd(t0, goal, prediction)
@@ -303,7 +333,12 @@ def _patch_metrics(teacher, tf, free, clean, nodes, device, ops, metrics, contex
                           else dict(E_imit='E_to_teacher', D_move='D_move_teacher',
                                     PCD='relative_error_teacher_move'))
                 for key, value in pcd.items():
-                    collect(mode, rename[key], value)
+                    columns[(mode, rename[key])] = value
+            # One blocking host transfer per metric batch instead of extracting
+            # every GPU scalar separately. Keep one value per original patch.
+            host_columns = torch.stack(list(columns.values())).detach().cpu().tolist()
+            for (mode, key), values in zip(columns, host_columns):
+                samples[mode].setdefault(key, []).extend(values)
         for mode, values in samples.items():
             for key, value in values.items():
                 unit = ('x1e4' if key.startswith('cd_') else 'normalized_length'
@@ -326,12 +361,13 @@ def _whole_metrics(teacher, tf, free, final_predictions, clean, center, scale, n
         for mode, trajectory, index in (('teacher', teacher, target),
                                         ('teacher_forced', tf, stage), ('free_rollout', free, stage)):
             # Use the original GPU fusion for the final result, exactly as formal
-            # inference; intermediate readouts use the existing CPU trajectory fusion.
+            # inference; intermediate readouts use fusion on the trajectory device.
             prediction = (final_predictions[mode] if stage == 4 else
                           trajectory['global_states'][index].to(device))
             target_state = final_predictions['teacher'] if stage == 4 else goal
             raw_world, quality = evaluate_baseline_metrics(
-                prediction, clean[None], center, scale, context['name'], raw_config, ops)
+                prediction, clean[None], center, scale, context['name'], raw_config, ops,
+                keep_on_device=True)
             values[mode] = dict(cd_to_clean_x1e4=quality['cd_x1e4'], p2m_x1e4=quality['p2m_x1e4'])
             if mode != 'teacher':
                 values[mode]['cd_to_teacher_x1e4'] = float(
@@ -340,8 +376,15 @@ def _whole_metrics(teacher, tf, free, final_predictions, clean, center, scale, n
                 metrics.add_stage(context, mode, 'whole_cloud', stage, nodes, key, [value], 'x1e4')
             if stage == 4:
                 metrics.add_final(context, mode, 'raw', clean.shape[0], raw_world.shape[0], quality)
-                world, processed = evaluate_baseline_metrics(
-                    prediction, clean[None], center, scale, context['name'], config, ops)
+                if (not config.get('sor_enable', True) and
+                        not (config.get('surface_projection') or {}).get('enable', False)):
+                    # Both labels describe the same unchanged prediction in this
+                    # configuration; reuse its original CD/P2M computation.
+                    world, processed = raw_world, quality
+                else:
+                    world, processed = evaluate_baseline_metrics(
+                        prediction, clean[None], center, scale, context['name'], config, ops,
+                        keep_on_device=True)
                 metrics.add_final(context, mode, 'baseline_postprocessed', clean.shape[0],
                                   world.shape[0], processed)
         for key in values['teacher_forced']:
@@ -411,9 +454,17 @@ def _run(args, output, manifest):
     import torch
     from easydict import EasyDict
     from utils.config import cfg_from_yaml_file
+    config = cfg_from_yaml_file(args.config)
+    if not torch.cuda.is_available():
+        raise RuntimeError('Run on the existing CUDA training/test environment with its compiled extensions')
+    torch.cuda.set_device(args.device)
+    device = torch.device(f'cuda:{args.device}')
+    torch.set_num_threads(threads)
+    from utils.gpu_memory import apply_gpu_memory_limit
+    manifest['gpu_memory_limit'] = apply_gpu_memory_limit(config, args.device)
+    _write_manifest(output, manifest)
     from tools.runner_distill import (freeze_teacher, load_student_checkpoint, infer_student,
                                       baseline_metric_ops, _patch_options, TEACHER_ETA, TEACHER_DECAY)
-    config = cfg_from_yaml_file(args.config)
     plan = _data_plan(args, config)
     paths = list(PATHS) if args.all_paths else [_nodes(p) for p in (args.teacher_nodes or [PATHS[2]])]
     if len(paths) != len(set(paths)):
@@ -466,22 +517,22 @@ def _run(args, output, manifest):
                                                            for t in nodes[:-1]])
                              for noise in args.noise_levels]) for nodes in paths]
     _write_manifest(output, manifest)
-    if not torch.cuda.is_available():
-        raise RuntimeError('Run on the existing CUDA training/test environment with its compiled extensions')
-    torch.cuda.set_device(args.device)
-    device = torch.device(f'cuda:{args.device}')
-    torch.set_num_threads(threads)
-    torch.cuda.set_per_process_memory_fraction(float(config.get('gpu_mem_fraction', 0.9)), args.device)
     torch.cuda.reset_peak_memory_stats(device)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
     _seed(args.seed, np, torch)
     from tools import builder
     from tools.runner_finetune import patch_based_denoise
+    denoise_fn = partial(patch_based_denoise, trajectory_transfer=args.trajectory_transfer)
     options = _patch_options(config, args.patch_batch or config.test_patch_batch)
     if options['patch_batch'] < 1 or options['patch_size'] < 1:
         raise ValueError('patch size and batch must be positive')
     manifest['patch_options'] = options
+    manifest['execution'] = dict(trajectory_transfer=args.trajectory_transfer,
+                                 trajectory_device=str(device) if args.trajectory_transfer == 'device' else 'cpu',
+                                 metric_patch_batch=args.metric_patch_batch,
+                                 whole_metrics_keep_on_device=True,
+                                 reuse_final_metrics_without_postprocessing=True)
     manifest['runtime'] = dict(torch=torch.__version__, cuda=torch.version.cuda,
                                gpu=torch.cuda.get_device_name(device), numpy=np.__version__)
     teacher = builder.model_builder(config.model).to(device)
@@ -543,9 +594,10 @@ def _run(args, output, manifest):
                 _write_manifest(output, manifest)
                 print(f'[Teacher 16-step] {name} noise={noise:g}', flush=True)
                 _seed(seed, np, torch)
-                teacher_final, teacher_trajectory = patch_based_denoise(
+                teacher_final, teacher_trajectory = denoise_fn(
                     teacher, noisy, noise, **options, num_steps=16, step_size=TEACHER_ETA,
                     decay=TEACHER_DECAY, return_trajectory=True, raise_on_memory_pressure=True)
+                manifest['execution']['trajectory_device'] = str(teacher_trajectory['patch_states'].device)
                 _aligned(teacher_trajectory, teacher_trajectory, torch)
                 manifest['inputs'][-1]['patch_count'] = int(teacher_trajectory['patch_idx'].shape[0])
                 manifest['inputs'][-1]['uncovered_points'] = int((teacher_trajectory['coverage_count'] == 0).sum())
@@ -556,22 +608,42 @@ def _run(args, output, manifest):
                     print(f'[TF/free audit] {name} noise={noise:g} nodes={list(nodes)}', flush=True)
                     _seed(seed, np, torch)
                     free_final, free = infer_student(student, noisy, noise, options,
-                                                      return_trajectory=True, teacher_nodes=nodes)
+                                                      return_trajectory=True, teacher_nodes=nodes,
+                                                      denoise_fn=denoise_fn)
                     _aligned(teacher_trajectory, free, torch)
                     _seed(seed, np, torch)
                     tf_final, tf = _teacher_forced(student, teacher_trajectory, noisy, noise,
-                                                   nodes, options, torch)
+                                                   nodes, options, torch, denoise_fn=denoise_fn)
                     _aligned(teacher_trajectory, tf, torch)
-                    first_diff = float((tf['patch_states'][1] - free['patch_states'][1]).abs().max())
-                    if first_diff > args.first_stage_atol:
-                        raise RuntimeError(f'TF/free first stage should match: max difference={first_diff}')
-                    _patch_metrics(teacher_trajectory, tf, free, clean, nodes, device, ops, metrics, context, torch)
+                    # Independent float32 GPU forwards can differ slightly (the
+                    # model uses index_add_ reductions). Do not require bitwise
+                    # output equality or overwrite either measured trajectory.
+                    first_delta = (tf['patch_states'][1] - free['patch_states'][1]).abs().reshape(-1)
+                    first_diff = float(first_delta.max())
+                    first_check = dict(
+                        **context, value=first_diff, mean_abs_difference=float(first_delta.mean()),
+                        p95_abs_difference=float(torch.quantile(first_delta, 0.95)),
+                        coordinates_above_atol=int((first_delta > args.first_stage_atol).sum()),
+                        fraction_above_atol=float((first_delta > args.first_stage_atol).float().mean()),
+                        coordinate_count=int(first_delta.numel()), atol=args.first_stage_atol,
+                        passed=first_diff <= args.first_stage_atol)
+                    # Persist failed checks too, so a rerun never loses the evidence.
+                    manifest.setdefault('first_stage_max_abs_differences', []).append(first_check)
+                    _write_manifest(output, manifest)
+                    if not first_check['passed']:
+                        raise RuntimeError(
+                            f'TF/free first stage exceeds output tolerance: max={first_diff:.9g}, '
+                            f'atol={args.first_stage_atol:.9g}, '
+                            f'mean={first_check["mean_abs_difference"]:.9g}, '
+                            f'p95={first_check["p95_abs_difference"]:.9g}; '
+                            'see run_manifest.json before changing the tolerance')
+                    _patch_metrics(teacher_trajectory, tf, free, clean, nodes, device, ops, metrics, context, torch,
+                                   patch_batch=args.metric_patch_batch)
                     _whole_metrics(teacher_trajectory, tf, free,
                                    dict(teacher=teacher_final, teacher_forced=tf_final, free_rollout=free_final),
                                    clean, center, scale, nodes, config, raw_config, ops, device,
                                    metrics, context, torch)
                     manifest['completed_shape_noise_path_runs'] += 1
-                    manifest.setdefault('first_stage_max_abs_differences', []).append(dict(**context, value=first_diff))
                     _write_manifest(output, manifest)
                     print(f"[{manifest['completed_shape_noise_path_runs']}/{manifest['expected_shape_noise_path_runs']}] "
                           f"{name} noise={noise:g} nodes={list(nodes)} first_stage_max_diff={first_diff:.3g}", flush=True)
@@ -612,6 +684,7 @@ def main():
     args = _build_parser().parse_args()
     if (args.max_shapes < 0 or args.expected_epoch < 1 or not 0 <= args.seed < 2 ** 32 or
             args.device < 0 or (args.patch_batch is not None and args.patch_batch < 1) or
+            args.metric_patch_batch < 1 or
             not math.isfinite(args.first_stage_atol) or args.first_stage_atol <= 0):
         raise ValueError('Invalid count, device, seed, patch batch, epoch, or tolerance')
     if (len(set(args.noise_levels)) != len(args.noise_levels) or
@@ -638,7 +711,7 @@ def main():
                     source_sha256={name: _sha256(REPO_ROOT / name) for name in (
                         'tools/diagnose_distill_trajectory.py', 'tools/runner_distill.py',
                         'tools/runner_finetune.py', 'models/PointGPT.py', 'models/step_condition.py',
-                        'datasets/ScoreDenoiseDataset.py', 'utils/p2m_loss.py')})
+                        'datasets/ScoreDenoiseDataset.py', 'utils/p2m_loss.py', 'utils/gpu_memory.py')})
     _write_manifest(output, manifest)
     with (output / 'run.log').open('x', encoding='utf-8') as log:
         with redirect_stdout(_Tee(sys.stdout, log)), redirect_stderr(_Tee(sys.stderr, log)):
@@ -658,4 +731,6 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    from utils.gpu_memory import exit_on_cuda_oom
+    with exit_on_cuda_oom():
+        main()

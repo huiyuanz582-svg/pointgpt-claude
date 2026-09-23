@@ -1,18 +1,20 @@
 # Dynamic PCD Teacher-forced / free-rollout 诊断
 
-独立入口：`tools/diagnose_distill_trajectory.py`。正式训练、测试、模型、PCD 和节点搜索代码均不改动。此脚本只在用户手动执行时加载模型并调用 GPU；开发交付阶段不执行它。
+独立入口：`tools/diagnose_distill_trajectory.py`。模型、PCD、节点搜索及训练方法不改动。公共推理/指标函数提供默认关闭的执行优化参数，由此审计入口启用；现有 train/val/test 调用保持原执行路径。此脚本只在用户手动执行时加载模型并调用 GPU；开发交付阶段不执行它。
 
 ## 复用范围和运行过程
 
 - `runner_distill.load_student_checkpoint`：严格加载 Student 和已训练的 Step Condition，检查 checkpoint 保存的实际训练节点。默认要求 Epoch 5、`[0,10,12,14,16]`、`dynamic_pcd`。
 - `builder.load_model`、`runner_distill.freeze_teacher`：加载原始 Teacher，禁用梯度，eval，无 condition。
-- `runner_finetune.patch_based_denoise(return_trajectory=True)`：原有 FPS/KNN、固定外层 patches、16 步 Teacher、patch 内更新、融合权重及 CPU 逐步轨迹。Teacher eta=0.3、decay=0.95。不再重复实现 `capture_teacher` 的 16 步循环。
+- `runner_finetune.patch_based_denoise(return_trajectory=True)`：原有 FPS/KNN、固定外层 patches、16 步 Teacher、patch 内更新和融合权重。审计默认将逐步轨迹保留在 GPU 并在 GPU 融合；可显式选择 CPU 存储。Teacher eta=0.3、decay=0.95。不再重复实现 `capture_teacher` 的 16 步循环。
 - `runner_distill.infer_student(return_trajectory=True)`：原有真实连续四步 Student rollout，明确传入当前诊断路径。
 - `runner_distill.forward_student_interval`：Teacher-forced 适配器按 patch batch 顺序输入缓存的 `T_start`，传入区间 condition 和 `sigma0 * 0.95**start`。外层仍调用原有 `patch_based_denoise`，eta=1，输出为 Student 预测（仅有原有反解/重建操作的浮点舍入）。
 - `runner_distill.evaluate_candidate_pcd`：原公式、原 epsilon，未实现新的 PCD。
 - 原 `builder.dataset_builder` / `PairedEvalDataset`、`baseline_metric_ops`、`evaluate_baseline_metrics`：沿用配对测试集、clean 单位球归一化、CD、双向 P2M、SOR 和可选 surface projection。
 
-每个 noise/shape 只生成一次 Teacher 轨迹，随后在同一 checkpoint 上依次诊断指定路径。相同 noise/shape 的各路径和两种模式使用相同种子；脚本逐次核对 patch 索引、种子坐标、覆盖数、融合权重、T0，并检查 TF/free 第一阶段最大坐标差不超过 `--first_stage_atol`（默认 `1e-6`）。不对融合后的整云重新分块或回灌到下一阶段。
+每个 noise/shape 只生成一次 Teacher 轨迹，随后在同一 checkpoint 上依次诊断指定路径。相同 noise/shape 的各路径和两种模式使用相同种子；脚本逐次核对 patch 索引、种子坐标、覆盖数、融合权重、T0，并检查 TF/free 第一阶段最大坐标差不超过 `--first_stage_atol`（默认 `1e-5`，单位为归一化坐标）。不对融合后的整云重新分块或回灌到下一阶段。
+
+这个容差只用于两次独立 float32 前向的输出检查，输入和 patch 对齐仍要求严格相等。模型包含 GPU `index_add_` 累加；固定随机种子并不保证独立前向逐位一致。旧默认 `1e-6` 曾在最大差异 `1.132488e-6` 时中断。旧服务器脚本也可显式传 `--first_stage_atol 1e-5`，不必修改训练代码。容差不会清零差异、替换预测或修改任何指标。新版在通过和失败时都将最大/平均/P95 绝对坐标差、超限坐标数及比例写入 manifest 的 `first_stage_max_abs_differences`；若仍超限，先检查这些记录，不自动继续放宽容差。
 
 所有模型前向和指标均在 `torch.no_grad()` 内，Teacher/Student 均 eval 且冻结；无 optimizer、backward、训练、在线节点搜索或 checkpoint 写入。诊断路径不写回 checkpoint 的推理节点。
 
@@ -47,7 +49,30 @@ data/ScoreDenoise/PUNet/meshes/test/*.off
 
 ## Linux 运行命令
 
-以下命令仅供用户执行。先进入服务器仓库根目录并激活原环境，将占位符替换为真实 Linux 路径。默认仍使用原 YAML 的 `test_patch_batch`，可显式传 `--patch_batch 1` 控制显存。
+以下命令仅供用户执行。先进入服务器仓库根目录并激活原环境，将占位符替换为真实 Linux 路径。模型前向默认仍使用原 YAML 的 `test_patch_batch`；CPU/GPU 执行优化见下节。
+
+### CPU/GPU 执行优化
+
+只改变存储设备、传输、执行批次和重复结果复用，不修改模型、condition、sigma、Teacher/Student 更新式、PCD epsilon、采样、融合权重或指标定义，也不启用 AMP/TF32。GPU 模式按原公式融合整云轨迹，浮点累加顺序可能与 CPU 不同；中间融合结果始终只用于指标，不回灌 rollout。
+
+|参数/行为|默认|用途与边界|
+|---|---|---|
+|`--trajectory_transfer device`|启用|Teacher/TF/free 的 patch 状态、整云状态、索引、权重和 sigma 元数据常驻输入 GPU；整云轨迹融合和指标输入切片均留在 GPU。|
+|`--trajectory_transfer batch` / `step`|显式选择|显存不足时可在新进程中选择 CPU 存储：每个 patch batch 统一回传，或逐步回传。保留原 CPU 融合路径，不自动切换设备或放宽容差。|
+|`--metric_patch_batch 32`|32|调用原 PCD 函数的批量接口，仍为每个 patch 分别计算位移 mean/P95；Chamfer 保留逐 patch 调用。GPU 模式无需搬运轨迹输入，仅标量结果每批统一回传，未提前聚合样本。|
+|整云指标保留设备|启用|完全关闭后处理时省去 GPU→CPU→GPU 往返；仍调用原 CD 和双向 P2M。SOR/projection 启用时保留原后处理路径。|
+|相同最终指标复用|启用|仅 SOR 和 projection 都关闭时，`baseline_postprocessed` 复用 `raw` 的同一组 CD/P2M；两类 CSV 行仍完整输出。|
+|`--patch_batch`|YAML（当前为 1）|模型前向批次，独立于指标批次。可在后续获准运行时逐档比较 1/2/4/8，不能仅凭剩余显存直接认定某一批次适合。|
+
+Teacher-forced 在 GPU 模式直接读取原始 Teacher 起点的张量视图，保持节点和 patch 顺序；CPU 模式才批量搬运四个起点。执行参数及实际轨迹设备记录于 manifest 的 `execution` 与 `patch_options`；训练 YAML、checkpoint 及其训练节点均不被修改。公共函数仍默认 CPU 轨迹，只有审计入口默认启用 GPU 模式，原常规测试的 NumPy 导出保持兼容。
+
+50K、146 个 patches、float32 时，三套 patch/整云轨迹坐标共约 62 MiB，另需索引、权重和运算临时空间。GPU 模式不再回传这些轨迹；CPU batch 模式在模型 batch=1 时仍会将 3504 次逐步回传降为 438 次（不含初始状态和融合元数据）。指标的显式结果回传由约 8760 次逐标量读取降为 20 次批量读取（metric batch=32）；原 PCD 有限性检查、对齐检查、日志/manifest 标量读取等仍可能产生同步。这些是代码路径计数，不是实测加速倍数。
+
+后续验证须使用相同 checkpoint/数据/seed/nodes，并保持相同 `--patch_batch`，先对照 CPU/GPU 存储模式的完整轨迹及逐 shape/stage/patch 指标，并确认 manifest 中 `execution.trajectory_device` 符合选择；通过后再单独改变模型 batch。GPU 融合、批量归约和 CUDA 调度可能产生浮点舍入差异，不能承诺逐位相等，也不能自动放宽现有一致性容差。应比较实际耗时、峰值显存和数值差异，而不仅看 GPU 利用率。
+
+当前交付只做静态检查，尚未运行上述 CPU/GPU 数值或速度验证。服务器上旧版脚本不认识新增参数；使用前须同步本次改动的 `tools/diagnose_distill_trajectory.py`、`tools/runner_finetune.py`、`tools/runner_distill.py` 及新文件 `utils/gpu_memory.py`。开发阶段不自动同步或执行服务器任务。
+
+审计入口默认启用 [48 GiB 显存预算](gpu_memory_limit.md)：PyTorch 分配器实际最多 47 GiB，另预留 1 GiB；CUDA OOM 以退出码 86 终止，不自动回传轨迹或重试。该预算按进程/设备生效，不是 Docker 总显存硬隔离；分配器外开销不受硬限制。
 
 设置共用参数（Bash）：
 
@@ -127,7 +152,7 @@ PCD **不是 CD 的比值**：复用逐点对应的平方 L2 均值 `E_imit / (D
 
 位移是 `TF_prediction - T_start` 或 `S_k - S_{k-1}`。先在各 patch 内计算点位移范数的均值、P95，再对这些 patch 级指标报告六项统计；例如 `displacement_norm_p95` 行的 `mean` 是各 patch 的 P95 均值，不能当作全部点合并后的 P95。重叠 patches 作为 patch 样本计数，未去重。
 
-逐阶段整云状态是原固定 patch 轨迹的融合读数，不是每一步重新切整云 patch。最终状态使用原推理函数直接返回的 GPU 融合结果；中间状态使用原有 CPU 轨迹融合，可能有少量浮点差异。
+逐阶段整云状态是原固定 patch 轨迹的融合读数，不是每一步重新切整云 patch。最终状态使用原推理函数直接返回的 GPU 融合结果；中间状态按原公式在所选轨迹设备融合（默认 GPU，`step`/`batch` 为 CPU），可能有少量浮点差异。
 
 逐阶段仅计算 raw 状态。最终 CD/P2M 同时给出：
 
