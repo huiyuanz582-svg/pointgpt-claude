@@ -107,7 +107,7 @@ class StageDiagnosticTests(unittest.TestCase):
             torch.testing.assert_close(value, model.state_dict()[key], rtol=0, atol=0)
         torch.testing.assert_close(rng[0], torch.get_rng_state(), rtol=0, atol=0)
         self.assertEqual(rng[1], random.getstate())
-        np.testing.assert_equal(rng[2], random.get_state())
+        np.testing.assert_equal(rng[2], np.random.get_state())
         for label, path in list(named.items())[:4]:
             single = self.run_diagnostics(current=path, selected=path)
             expected = self.rows(single, 'E_FR', role='current')
