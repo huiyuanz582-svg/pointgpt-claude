@@ -17,6 +17,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from utils.curriculum_config import resolve_curriculum, require_supported_resume
+from utils.training_input import (resolve_training_input, teacher_input_probability,
+                                  training_input_metadata, sample_teacher_input_mask,
+                                  summarize_input_stages)
 
 TEACHER_NODES = (0, 4, 8, 12, 16)
 NONUNIFORM_NODES = (0, 7, 10, 13, 16)
@@ -447,6 +450,56 @@ def backward_stages(student, nodes, sigma0, loss_scale=1.0, stage_diagnostics=No
     return losses
 
 
+def backward_student_input_stages(student, nodes, sigma0, teacher_mask, loss_scale=1.0,
+                                 input_diagnostics=None, teacher_nodes=TEACHER_NODES):
+    """Four local losses with optional detached previous-Student inputs.
+
+    Teacher targets, nominal sigma/condition and loss scaling match TF training.
+    The mask is [4, B], sampled before micro-batching. Each patch/stage selects
+    one whole point state; no point interpolation or cross-stage backpropagation.
+    """
+    import torch
+    teacher_nodes = _teacher_nodes(teacher_nodes)
+    if (nodes.ndim != 4 or nodes.shape[0] != 5 or nodes.shape[-1] != 3 or
+            nodes.shape[1] == 0):
+        raise ValueError('Expected five Teacher nodes with shape [5, B, N, 3], B > 0')
+    if teacher_mask.shape != (4, nodes.shape[1]) or teacher_mask.dtype != torch.bool:
+        raise ValueError('teacher_mask must be bool [4, B]')
+    if not teacher_mask[0].all():
+        raise ValueError('Stage 1 must start at Teacher T0')
+    device = next(student.parameters()).device
+    mask = teacher_mask.to(device)
+    sigmas = _sigma_batch(sigma0, nodes.shape[1], device, nodes.dtype)
+    losses, previous = [], None
+    for stage, start in enumerate(teacher_nodes[:-1]):
+        teacher_start = nodes[stage].detach().to(device)
+        x = (teacher_start if stage == 0 else
+             torch.where(mask[stage, :, None, None], teacher_start, previous))
+        target = nodes[stage + 1].detach().to(device)
+        next_state = forward_student_interval(
+            student, x, sigmas * TEACHER_DECAY ** start, start, teacher_nodes[stage + 1])
+        error = (next_state - target).square().sum(dim=-1)
+        loss = error.mean()
+        if not torch.isfinite(loss):
+            raise FloatingPointError(f'stage {stage} student-input trajectory loss is nonfinite')
+        if not loss.requires_grad:
+            raise RuntimeError('Student trajectory loss has no gradient')
+        if input_diagnostics is not None:
+            with torch.no_grad():
+                per_patch = error.detach().mean(-1)
+                teacher_count = mask[stage].sum()
+                input_diagnostics.append(torch.stack((
+                    teacher_count, nodes.shape[1] - teacher_count,
+                    per_patch[mask[stage]].double().sum(),
+                    per_patch[~mask[stage]].double().sum())).cpu().tolist())
+        previous = next_state.detach()
+        (loss * loss_scale / 4).backward()
+        losses.append(float(loss.detach()))
+        # Release each stage graph before constructing the next one.
+        del next_state, error, loss, x, target, teacher_start
+    return losses
+
+
 def check_gradients(teacher, student):
     """运行时检查冻结与梯度；不要求未参与 forward 的分类参数有梯度。"""
     import torch
@@ -779,6 +832,10 @@ def _save_checkpoint(path, student, optimizer, epoch, teacher_path, config, sele
         best_val_rollout_score=best_val_rollout_score, best_epoch=best_epoch)
     if curriculum_state is not None:
         payload.update(copy.deepcopy(curriculum_state))
+    training_input = resolve_training_input(config)
+    if training_input['type'] != 'teacher_forced':
+        payload['training_input'] = training_input
+        payload['training_input_protocol'] = training_input_metadata(training_input, epoch)
     if optimizer is not None:
         payload['optimizer'] = optimizer.state_dict()
     torch.save(payload, temporary)
@@ -812,12 +869,14 @@ def save_epoch_checkpoints(output, student, optimizer, epoch, teacher_path, conf
 
 def train(args, config, builder, device, checkpoint_path, output):
     resolved_curriculum = resolve_curriculum(config)
+    training_input = resolved_curriculum['training_input']
+    teacher_forced = training_input['type'] == 'teacher_forced'
+    if getattr(args, 'resume', None):
+        require_supported_resume(resolved_curriculum)
     rollout_aware = resolved_curriculum['metric']['type'] == 'rollout_aware'
     if rollout_aware:
         from tools.rollout_curriculum import update_rollout_epoch, rollout_log_fields
-        if getattr(args, 'resume', None):
-            require_supported_resume(resolved_curriculum)
-        print('[rollout-aware] TF training; raw Jrobust selection. '
+        print(f'[rollout-aware] {training_input["type"]} training; raw Jrobust selection. '
               'EMA, switch suppression and rollout-aware resume are NOT enabled.', flush=True)
     import numpy as np
     import torch
@@ -897,6 +956,15 @@ def train(args, config, builder, device, checkpoint_path, output):
             print(f'[curriculum] epoch={epoch} teacher_nodes={list(teacher_nodes)} stage_gaps={stage_gaps}', flush=True)
             totals = np.zeros(4, dtype=np.float64)
             pcd_totals = np.zeros((4, 3), dtype=np.float64)
+            input_totals = np.zeros((4, 4), dtype=np.float64)
+            teacher_probability = teacher_input_probability(training_input, epoch)
+            input_generator = None
+            if training_input['type'] == 'scheduled_rollout':
+                input_generator = torch.Generator(device='cpu').manual_seed(
+                    (training_input['sampling_seed'] + epoch - 1) % (2 ** 32))
+            print(f'[training-input] mode={training_input["type"]} '
+                  f'teacher_probability_stages_2_to_4={teacher_probability:g}; '
+                  f'stage_1=T0; student_state_detached=true', flush=True)
             shadow_rows = []
             seen = 0
             for batch_index, (noisy, clean, sigmas, _centers, _scales, _names) in enumerate(loader):
@@ -921,16 +989,28 @@ def train(args, config, builder, device, checkpoint_path, output):
                     nodes = capture_teacher(teacher, noisy, sigmas, int(config.teacher_patch_batch),
                                             teacher_nodes=teacher_nodes)
                 count = noisy.shape[0]
+                teacher_mask = (None if teacher_forced else
+                                sample_teacher_input_mask(count, teacher_probability, input_generator))
                 optimizer.zero_grad(set_to_none=True)
                 for offset in range(0, count, batch_size):
                     batch_nodes = nodes[:, offset:offset + batch_size]
                     size = batch_nodes.shape[1]
                     stage_diagnostics = []
-                    losses = backward_stages(student, batch_nodes, sigmas[offset:offset + batch_size],
-                                             loss_scale=size / count, stage_diagnostics=stage_diagnostics,
-                                             teacher_nodes=teacher_nodes)
+                    if teacher_forced:
+                        losses = backward_stages(student, batch_nodes, sigmas[offset:offset + batch_size],
+                                                 loss_scale=size / count, stage_diagnostics=stage_diagnostics,
+                                                 teacher_nodes=teacher_nodes)
+                        pcd_totals += np.asarray(stage_diagnostics) * size
+                        input_totals[:, 0] += size
+                        input_totals[:, 2] += np.asarray(losses) * size
+                    else:
+                        losses = backward_student_input_stages(
+                            student, batch_nodes, sigmas[offset:offset + batch_size],
+                            teacher_mask[:, offset:offset + batch_size], loss_scale=size / count,
+                            input_diagnostics=stage_diagnostics, teacher_nodes=teacher_nodes)
+                        # Counts and loss SUMS; conditional means must use the actual source counts.
+                        input_totals += np.asarray(stage_diagnostics)
                     totals += np.asarray(losses) * size
-                    pcd_totals += np.asarray(stage_diagnostics) * size
                 nonzero = check_gradients(teacher, student)
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     student.parameters(), float(config.grad_norm_clip), error_if_nonfinite=True)
@@ -997,26 +1077,31 @@ def train(args, config, builder, device, checkpoint_path, output):
             record = dict(epoch=epoch, patches=seen, stage_losses=means,
                           curriculum_mode=getattr(config, 'curriculum_mode', 'fixed'),
                           teacher_nodes=list(teacher_nodes), stage_gaps=stage_gaps,
-                          mean_D_move=pcd_means[:, 0].tolist(),
-                          mean_E_imit=pcd_means[:, 1].tolist(),
-                          mean_PCD=pcd_means[:, 2].tolist(), pcd_eps=PCD_EPS,
-                          pcd_aggregation='mean_of_per_patch_ratios',
+                          mean_D_move=pcd_means[:, 0].tolist() if teacher_forced else None,
+                          mean_E_imit=pcd_means[:, 1].tolist() if teacher_forced else None,
+                          mean_PCD=pcd_means[:, 2].tolist() if teacher_forced else None, pcd_eps=PCD_EPS,
+                          pcd_aggregation='mean_of_per_patch_ratios' if teacher_forced else None,
                           loss_traj=sum(means) / 4, **validation,
                           best_val_rollout_score=best_score if math.isfinite(best_score) else None,
                           best_epoch=best_epoch, is_best=improved)
+            record.update(training_input=training_input['type'],
+                          training_input_protocol=training_input_metadata(training_input, epoch),
+                          training_input_stages=summarize_input_stages(input_totals),
+                          loss_traj_input=training_input['type'],
+                          val_loss_traj_input='teacher_forced',
+                          total_planned_epochs=epochs, stop_after_epoch=stop_after_epoch,
+                          train_seconds=train_seconds,
+                          trajectory_validation_seconds=trajectory_validation_seconds,
+                          rollout_validation_seconds=rollout_validation_seconds,
+                          curriculum_search_seconds=curriculum_search_seconds,
+                          checkpoint_seconds=saved_at - checkpoint_started,
+                          epoch_seconds=saved_at - epoch_started,
+                          setup_seconds=setup_seconds, run_elapsed_seconds=saved_at - run_started)
             if dynamic is not None:
                 record.update(nodes_used_this_epoch=list(teacher_nodes),
                               checkpoint_teacher_nodes=list(teacher_nodes),
-                              train_PCD_std=float(np.std(pcd_means[:, 2], ddof=0)),
-                              train_PCD_range=float(np.ptp(pcd_means[:, 2])),
-                              total_planned_epochs=epochs, stop_after_epoch=stop_after_epoch,
-                              train_seconds=train_seconds,
-                              trajectory_validation_seconds=trajectory_validation_seconds,
-                              rollout_validation_seconds=rollout_validation_seconds,
-                              curriculum_search_seconds=curriculum_search_seconds,
-                              checkpoint_seconds=saved_at - checkpoint_started,
-                              epoch_seconds=saved_at - epoch_started,
-                              setup_seconds=setup_seconds, run_elapsed_seconds=saved_at - run_started)
+                              train_PCD_std=float(np.std(pcd_means[:, 2], ddof=0)) if teacher_forced else None,
+                              train_PCD_range=float(np.ptp(pcd_means[:, 2])) if teacher_forced else None)
                 record.update(teacher_nodes_used=list(teacher_nodes),
                               dynamic_update_performed=search_result is not None,
                               next_teacher_nodes=list(next_nodes),
@@ -1262,6 +1347,8 @@ def main():
         manifest = dict(mode=args.mode, checkpoint=str(checkpoint_path),
                        config=config, arguments=vars(args), schedule=schedule(teacher_nodes),
                        gpu_memory_limit=gpu_memory_limit)
+        if args.mode == 'train':
+            manifest['training_input_protocol'] = training_input_metadata(resolved_curriculum['training_input'])
         if resolved_curriculum['metric']['type'] == 'rollout_aware':
             manifest['rollout_curriculum'] = resolved_curriculum
         json.dump(manifest, handle, indent=2, ensure_ascii=False)

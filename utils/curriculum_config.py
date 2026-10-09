@@ -4,6 +4,8 @@ from collections.abc import Mapping
 from itertools import combinations
 import math
 
+from utils.training_input import resolve_training_input
+
 
 ALL_PATHS = tuple((0,) + nodes + (16,) for nodes in combinations(range(1, 16), 3))
 
@@ -61,11 +63,7 @@ def candidate_paths(search):
 
 def resolve_curriculum(config):
     """Defaults dispatch to the actual legacy implementation, never an approximation."""
-    training = _block(config, 'training_input', {'type': 'teacher_forced'})
-    if training['type'] == 'scheduled_rollout':
-        raise NotImplementedError('scheduled_rollout training is not implemented; use teacher_forced')
-    if training['type'] != 'teacher_forced':
-        raise ValueError('Unknown training_input.type')
+    training = resolve_training_input(config)
     metric = _block(config, 'curriculum_metric', dict(
         type='original_pcd', distance='pointwise_squared_l2', normalization='teacher_endpoint',
         eps=1e-12, alpha=1.0, beta=0.25, gamma=0.25, lambda_worst=0.25,
@@ -120,11 +118,18 @@ def resolve_curriculum(config):
     calibration['noise_levels'] = sorted(levels)
     return dict(metric=metric, training_input=training, search=search, calibration=calibration,
                 implementation=dict(ema_enabled=False, switch_suppression_enabled=False,
-                                    rollout_resume_enabled=False, scheduled_training_enabled=False,
+                                    rollout_resume_enabled=False,
+                                    scheduled_training_enabled=training['type'] == 'scheduled_rollout',
+                                    student_rollout_training_enabled=training['type'] == 'student_rollout',
                                     selection='raw_argmin_Jrobust'))
 
 
 def require_supported_resume(resolved, checkpoint=None):
+    saved_input = (checkpoint or {}).get('training_input', {'type': 'teacher_forced'})
+    if (resolved['training_input']['type'] != 'teacher_forced' or
+            saved_input.get('type') != 'teacher_forced'):
+        raise NotImplementedError('Student-input resume/method migration is not implemented; '
+                                  'start a new run from the Teacher checkpoint.')
     saved = (checkpoint or {}).get('rollout_curriculum')
     if resolved['metric']['type'] == 'rollout_aware' or saved is not None:
         raise NotImplementedError('Rollout-aware resume/method migration is not implemented; '

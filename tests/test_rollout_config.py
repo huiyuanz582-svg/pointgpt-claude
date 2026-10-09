@@ -49,13 +49,13 @@ class ConfigTests(unittest.TestCase):
             with self.subTest(paths=paths), self.assertRaises(ValueError):
                 resolve_curriculum(cfg)
 
-    def test_no_3_percent_or_scheduled_training_or_silent_settings(self):
+    def test_no_3_percent_or_silent_settings(self):
         cfg = config()
         cfg['curriculum_calibration'] = {'noise_levels': [.005, .01, .03]}
         with self.assertRaises(ValueError):
             resolve_curriculum(cfg)
-        with self.assertRaises(NotImplementedError):
-            resolve_curriculum({'training_input': {'type': 'scheduled_rollout'}})
+        self.assertEqual(resolve_curriculum({'training_input': {'type': 'scheduled_rollout'}})
+                         ['training_input']['type'], 'scheduled_rollout')
         with self.assertRaises(ValueError):
             resolve_curriculum({'curriculum_search': {'update_every_epochs': 2}})
         with self.assertRaises(NotImplementedError):

@@ -1,9 +1,14 @@
 # Rollout-aware scoring + teacher-forced training (Pilot-A)
 
-This implementation changes curriculum scoring only. Training continues to call
+The Pilot-A configuration changes curriculum scoring only. Training continues to call
 the original `backward_stages` with Teacher inputs, the original four losses,
 micro-batch scaling, gradient clipping and optimizer update. Model/condition,
 Teacher rollout, whole-cloud inference and CD/P2M best-checkpoint selection are unchanged.
+
+The `paper2-scheduled-rollout-input` branch also provides independent mixed/continuous
+Student training inputs; see [student_training_input.md](student_training_input.md).
+They require an explicit `training_input.type` opt-in. Pilot-A and existing YAMLs
+remain teacher-forced.
 
 Missing configuration, or explicit `curriculum_metric.type: original_pcd` and
 `training_input.type: teacher_forced`, dispatches to the existing interval-PCD
@@ -17,13 +22,13 @@ fixed stratified calibration, free-rollout scoring, per-micro-batch DFS prefix r
 raw robust-score argmin, configured epoch update interval, complete JSON search
 reports, and new checkpoint metadata needed to bind weights to used/next nodes.
 
-**Not enabled:** scheduled-rollout training, EMA, relative/absolute switch thresholds,
-minimum hold duration, and rollout-aware training resume. The last four search
+**Not enabled:** EMA, relative/absolute switch thresholds,
+minimum hold duration, and rollout-aware training resume. The four search
 settings are parsed/validated and recorded as requested settings; reports and
 startup logs explicitly mark smoothing/suppression disabled. Every scheduled
 search directly selects the raw `Jrobust` minimum. Ties use lexicographic path order.
 
-`scheduled_rollout` and rollout-aware `--resume` raise before training. Resuming a
+Student-input and rollout-aware `--resume` raise before training. Resuming a
 new-method checkpoint through the old mode is also rejected. Old checkpoints do
 not require new fields, and old-mode resume remains supported. New checkpoint
 inference uses `nodes_used_this_epoch`, never `next_teacher_nodes`. Checkpoint

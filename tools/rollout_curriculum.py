@@ -1,4 +1,4 @@
-"""Rollout-aware scoring only. No scheduled training, EMA, or resume implementation.
+"""Rollout-aware scoring; training input policy is handled by runner_distill.
 
 No torch/model imports at module scope. The search never calls backward/step and
 keeps only a DFS branch of point states for the current calibration micro-batch.
@@ -452,7 +452,7 @@ def update_rollout_epoch(student, bank, config, resolved, epoch, used_nodes, his
 
 
 def rollout_log_fields(result, resolved):
-    return dict(curriculum_metric='rollout_aware', training_input='teacher_forced',
+    return dict(curriculum_metric='rollout_aware', training_input=resolved['training_input']['type'],
                 rollout_implementation=resolved['implementation'],
                 search_Jrobust=result['Jrobust'] if result else None,
                 search_noise_groups=result['candidates'][0]['noise_groups'] if result else None,
