@@ -4,7 +4,10 @@ import unittest
 
 from utils.curriculum_config import resolve_curriculum, require_supported_resume
 from utils.training_input import (resolve_training_input, teacher_input_probability,
-                                  summarize_input_stages)
+                                  summarize_input_stages, training_input_metadata,
+                                  noise_anchored_teacher_probabilities,
+                                  new_noise_anchor_statistics, accumulate_noise_anchor_statistics,
+                                  summarize_noise_anchor_statistics)
 
 
 class TrainingInputConfigTests(unittest.TestCase):
@@ -72,6 +75,68 @@ class TrainingInputConfigTests(unittest.TestCase):
         self.assertEqual(rows[0]['teacher_fraction'], .75)
         self.assertIsNone(rows[1]['student_input_loss'])
         self.assertIsNone(rows[2]['teacher_input_loss'])
+
+    def test_noise_anchor_preserves_warmup_and_low_noise_schedule(self):
+        supplied = {'type': 'scheduled_rollout', 'noise_teacher_anchor': {
+            'sigma_start': .01, 'sigma_end': .02, 'teacher_prob_high': .68}}
+        original = copy.deepcopy(supplied)
+        training = resolve_training_input({'training_input': supplied})
+        sigmas = [.005, .01, (.01 * .02) ** .5, .02, .03]
+        expected = [.2, .2, .44, .68, .68]
+        for actual, value in zip(noise_anchored_teacher_probabilities(training, 8, sigmas), expected):
+            self.assertAlmostEqual(actual, value)
+        self.assertEqual(noise_anchored_teacher_probabilities(training, 1, sigmas), [1.] * 5)
+        self.assertEqual(noise_anchored_teacher_probabilities(training, 4, sigmas), [.84] * 5)
+        self.assertEqual(supplied, original)
+        metadata = training_input_metadata(training, 8)
+        self.assertEqual(metadata['teacher_probability'], .2)
+        self.assertEqual(metadata['teacher_probability_scope'], 'base_before_noise_anchor')
+        self.assertEqual(metadata['noise_probability_basis'], 'initial_sigma0')
+        legacy = resolve_training_input({'training_input': {'type': 'scheduled_rollout'}})
+        self.assertEqual(noise_anchored_teacher_probabilities(legacy, 8, sigmas), [.2] * 5)
+        self.assertNotIn('noise_teacher_anchor', legacy)
+        self.assertNotIn('teacher_probability_scope', training_input_metadata(legacy, 8))
+        for bad in (0, -1, True, float('nan'), float('inf')):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                noise_anchored_teacher_probabilities(training, 8, [bad])
+
+    def test_noise_anchor_configuration_rejects_ignored_or_invalid_options(self):
+        valid = dict(sigma_start=.01, sigma_end=.02, teacher_prob_high=.68)
+        invalid = [None, {}, [], dict(valid, unknown=1),
+                   dict(valid, sigma_start=0), dict(valid, sigma_start=.02),
+                   dict(valid, sigma_end=.009), dict(valid, teacher_prob_high=.1),
+                   dict(valid, teacher_prob_high=1.1), dict(valid, sigma_start=True),
+                   dict(valid, sigma_end=float('inf')), dict(valid, teacher_prob_high='0.68')]
+        for anchor in invalid:
+            with self.subTest(anchor=anchor), self.assertRaises(ValueError):
+                resolve_training_input({'training_input': {'type': 'scheduled_rollout',
+                                                         'noise_teacher_anchor': anchor}})
+        for mode in ('teacher_forced', 'student_rollout'):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                resolve_training_input({'training_input': {'type': mode, 'noise_teacher_anchor': valid}})
+        training = resolve_training_input({'training_input': {'type': 'scheduled_rollout',
+                                                             'noise_teacher_anchor': valid}})
+        with self.assertRaises(NotImplementedError):
+            require_supported_resume(resolve_curriculum({'training_input': training}))
+
+    def test_noise_band_counts_use_actual_stage_masks(self):
+        training = resolve_training_input({'training_input': {'type': 'scheduled_rollout',
+            'noise_teacher_anchor': dict(sigma_start=.01, sigma_end=.02, teacher_prob_high=.68)}})
+        sigmas, probabilities = [.005, .01, .02], [.2, .2, .68]
+        mask = [[True, True, True], [False, True, True], [True, False, True], [False, False, True]]
+        totals = new_noise_anchor_statistics()
+        accumulate_noise_anchor_statistics(totals, training, sigmas, probabilities, mask)
+        low, high = summarize_noise_anchor_statistics(totals, training)
+        self.assertEqual((low['patches'], high['patches']), (2, 1))
+        self.assertEqual([row['teacher_count'] for row in low['stages']], [1, 1, 0])
+        self.assertEqual([row['teacher_count'] for row in high['stages']], [1, 1, 1])
+        self.assertAlmostEqual(low['planned_teacher_probability_mean'], .2)
+        self.assertAlmostEqual(high['planned_teacher_probability_mean'], .68)
+        empty = summarize_noise_anchor_statistics(new_noise_anchor_statistics(), training)
+        self.assertIsNone(empty[0]['planned_teacher_probability_mean'])
+        self.assertIsNone(empty[1]['stages'][0]['teacher_fraction'])
+        with self.assertRaises(ValueError):
+            accumulate_noise_anchor_statistics(totals, training, sigmas[:-1], probabilities, mask)
 
 
 if __name__ == '__main__':

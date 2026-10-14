@@ -1,0 +1,64 @@
+# Fixed nodes + Mixed; retain stronger Teacher anchors for high-noise patches.
+# Compare with Mixed20 seed0 / rollout_val_interval=1; efficacy is unverified.
+model:
+  NAME: PointTransformer
+  cls_dim: 15
+  trans_dim: 1024
+  depth: 24
+  drop_path_rate: 0.2
+  num_heads: 16
+  group_size: 32
+  num_group: 128
+  encoder_dims: 1024
+  decoder_depth: 4
+  loss: cdl12
+  weight_center: 1.0
+
+dataset:
+  _base_: cfgs/dataset_configs/ScoreDenoise.yaml
+
+curriculum_mode: fixed
+distillation:
+  teacher_nodes: [0, 4, 8, 12, 16]
+  teacher_steps: 16
+  teacher_eta: 0.3
+  teacher_decay: 0.95
+  student_steps: 4
+  student_eta: 1.0
+  student_decay: 0.8145062499999999
+
+pcd_dynamic:
+  shadow_enabled: false
+
+total_bs: 8
+epochs: 20
+learning_rate: 0.00001
+weight_decay: 0.0
+grad_norm_clip: 1.0
+inference_patch_size: 1024
+seed_ratio: 3
+fuse_tau_ratio: 0.5
+teacher_patch_batch: 1
+student_patch_batch: 8
+test_patch_batch: 1
+cpu_threads: 8
+gpu_mem_fraction: 0.9
+gpu_mem_limit_gib: 48
+gpu_mem_headroom_gib: 1
+validation_seed: 2024
+validation_patches_per_cloud: 4
+rollout_val_interval: 1
+sor_enable: false
+surface_projection: {enable: false, k: 16, num_iters: 1, blend: 0.6}
+
+training_input:
+  type: scheduled_rollout
+  warmup_epochs: 2
+  decay_epochs: 6
+  teacher_prob_start: 1.0
+  teacher_prob_end: 0.2
+  sampling_seed: 2025
+  noise_teacher_anchor:
+    sigma_start: 0.01
+    sigma_end: 0.02
+    teacher_prob_high: 0.68

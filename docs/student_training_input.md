@@ -1,5 +1,8 @@
 # 混合 / 连续 Student 输入
 
+固定节点 Mixed 的下一轮高噪声改进见 [fixed_mixed_noise_anchor.md](fixed_mixed_noise_anchor.md)。
+新配置按初始 sigma0 保留高噪声 Teacher 输入，训练范围仍为 0.5%–2%，尚无效果验证。
+
 分支：`paper2-scheduled-rollout-input`，从 `paper2-rollout-aware-curriculum`
 的 `e472b7b` 创建。本次实验只改变训练输入来源，先固定
 `[0, 4, 8, 12, 16]` + Step Condition，评估是否减轻 Teacher-forced
