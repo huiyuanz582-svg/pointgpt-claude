@@ -1,7 +1,7 @@
 # 混合 / 连续 Student 输入
 
-固定节点 Mixed 的下一轮高噪声改进见 [fixed_mixed_noise_anchor.md](fixed_mixed_noise_anchor.md)。
-新配置按初始 sigma0 保留高噪声 Teacher 输入，训练范围仍为 0.5%–2%，尚无效果验证。
+固定节点的新监督实验见 [fixed_mixed_matched_targets.md](fixed_mixed_matched_targets.md)。
+已撤回按噪声强度调整输入比例的版本；新配置恢复原 Mixed 概率，仅对 Student 输入重算 Teacher 目标。
 
 分支：`paper2-scheduled-rollout-input`，从 `paper2-rollout-aware-curriculum`
 的 `e472b7b` 创建。本次实验只改变训练输入来源，先固定
@@ -23,7 +23,7 @@ patch、每个阶段独立选择输入。这里的“混合”是选择整个点
 混合模式允许中途重新回到 Teacher 节点；下一步若再选择 Student，使用的就是
 这次实际输入所产生的输出。纯 Student 模式四步连续，不在中途重置。
 
-所有模式仍以 `T[nk]` 为该阶段监督目标，计算对应点的平方 L2：
+未设置 `student_target` 时，所有模式仍以 `T[nk]` 为该阶段监督目标，计算对应点的平方 L2：
 先对 xyz 求和，再对点/patch 求均值，四阶段等权。每个阶段单独 backward，
 micro-batch 按样本数加权，一个 DataLoader batch 只做一次 optimizer step。
 Student 状态在阶段之间 detach，**不通过前面的阶段反传梯度**；没有四步 BPTT。

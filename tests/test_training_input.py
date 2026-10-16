@@ -155,47 +155,6 @@ class TrainingInputTests(unittest.TestCase):
             runner.backward_student_input_stages(ToyStudent(), nodes, sigmas,
                                                  sample_teacher_input_mask(3, 0))
 
-    def test_per_patch_probability_mask_is_reproducible_and_extremes_are_exact(self):
-        probabilities = [0., 1., .2, .68]
-        global_state = torch.random.get_rng_state().clone()
-        generator = torch.Generator(device='cpu').manual_seed(2025)
-        expected_generator = torch.Generator(device='cpu').manual_seed(2025)
-        expected = torch.rand((4, 3), generator=expected_generator) < torch.tensor(probabilities)[:, None]
-        mask = sample_teacher_input_mask(4, probabilities, generator)
-        self.assertTrue(mask[0].all())
-        self.assertFalse(mask[1:, 0].any())
-        self.assertTrue(mask[1:, 1].all())
-        self.assertTrue(torch.equal(mask[1:], expected.T))
-        self.assertTrue(torch.equal(global_state, torch.random.get_rng_state()))
-        self.assertTrue(torch.equal(generator.get_state(), expected_generator.get_state()))
-        state = generator.get_state().clone()
-        sample_teacher_input_mask(4, [0.] * 4, generator)
-        sample_teacher_input_mask(4, [1.] * 4, generator)
-        self.assertTrue(torch.equal(state, generator.get_state()))
-        for invalid in ([.2], [0., 1., .2, float('nan')], [0., 1., .2, True]):
-            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
-                sample_teacher_input_mask(4, invalid, generator)
-
-    def test_noise_anchor_config_keeps_mixed20_controls(self):
-        control = yaml.safe_load((ROOT / 'cfgs/PointGPT-L/distill_16to4_input_scheduled.yaml').read_text(encoding='utf-8'))
-        candidate = yaml.safe_load((ROOT / 'cfgs/PointGPT-L/distill_16to4_input_noise_anchor.yaml').read_text(encoding='utf-8'))
-        resolve_curriculum(candidate)
-        self.assertEqual(candidate['distillation'], runner.schedule())
-        self.assertEqual(candidate['rollout_val_interval'], 1)
-        candidate['training_input'].pop('noise_teacher_anchor')
-        control['rollout_val_interval'] = 1
-        self.assertEqual(candidate, control)
-
-    def test_noise_anchor_range_is_checked_before_loading_models(self):
-        config = SimpleNamespace(curriculum_mode='fixed', training_input={
-            'type': 'scheduled_rollout', 'noise_teacher_anchor': dict(
-                sigma_start=.01, sigma_end=.03, teacher_prob_high=.68)},
-            dataset=SimpleNamespace(_base_=SimpleNamespace(NOISE_MIN=.005, NOISE_MAX=.02)))
-        builder = SimpleNamespace(model_builder=Mock())
-        with self.assertRaisesRegex(ValueError, 'training noise range'):
-            runner.train(SimpleNamespace(), config, builder, torch.device('cpu'), Path('teacher.pth'), Path('unused'))
-        builder.model_builder.assert_not_called()
-
     def test_fixed_controls_differ_only_in_input_policy(self):
         configs = [yaml.safe_load((ROOT / f'cfgs/PointGPT-L/distill_16to4_input_{name}.yaml')
                                   .read_text(encoding='utf-8'))
@@ -213,20 +172,14 @@ class TrainingInputTests(unittest.TestCase):
         nodes, sigmas = nodes_and_sigma()
         loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(
             nodes[0], nodes[0], sigmas, torch.zeros(3), torch.ones(3), torch.arange(3)), batch_size=3)
-        for label in ('teacher_forced', 'scheduled_rollout', 'student_rollout', 'noise_anchor'):
-            mode = 'scheduled_rollout' if label == 'noise_anchor' else label
-            with self.subTest(mode=label), tempfile.TemporaryDirectory() as directory:
+        for mode in ('teacher_forced', 'scheduled_rollout', 'student_rollout'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
                 output = Path(directory)
                 policy = {'type': mode}
                 if mode == 'scheduled_rollout':
                     policy.update(warmup_epochs=0, decay_epochs=1,
                                   teacher_prob_start=.5, teacher_prob_end=.5)
-                if label == 'noise_anchor':
-                    policy.update(teacher_prob_start=1., teacher_prob_end=.2,
-                                  noise_teacher_anchor=dict(sigma_start=.01, sigma_end=.02,
-                                                            teacher_prob_high=.68))
                 config = SimpleNamespace(model={}, curriculum_mode='fixed', training_input=policy,
-                                         dataset=SimpleNamespace(_base_=SimpleNamespace(NOISE_MIN=.005, NOISE_MAX=.02)),
                                          epochs=2, learning_rate=1e-3, weight_decay=0., grad_norm_clip=1.,
                                          student_patch_batch=2, teacher_patch_batch=1, test_patch_batch=1,
                                          rollout_val_interval=1, pcd_dynamic={'shadow_enabled': False})
@@ -259,16 +212,6 @@ class TrainingInputTests(unittest.TestCase):
                         combined = sum((stats[source + '_input_loss'] or 0.) * stats[source + '_count']
                                        for source in ('teacher', 'student')) / 3
                         self.assertAlmostEqual(combined, row['stage_losses'][stage])
-                    if label == 'noise_anchor':
-                        bands = row['training_input_noise_bands']
-                        self.assertEqual(sum(band['patches'] for band in bands), 3)
-                        self.assertEqual(row['training_input_protocol']['teacher_probability_scope'],
-                                         'base_before_noise_anchor')
-                        for stage in range(3):
-                            self.assertEqual(sum(band['stages'][stage]['teacher_count'] for band in bands),
-                                             row['training_input_stages'][stage + 1]['teacher_count'])
-                    else:
-                        self.assertNotIn('training_input_noise_bands', row)
                 last = torch.load(output / 'ckpt-last.pth', map_location='cpu')
                 best = torch.load(output / 'ckpt-best.pth', map_location='cpu')
                 self.assertEqual((last['epoch'], best['epoch']), (2, 1))

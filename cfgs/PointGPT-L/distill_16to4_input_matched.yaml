@@ -1,5 +1,5 @@
-# Fixed nodes + Mixed; retain stronger Teacher anchors for high-noise patches.
-# Compare with Mixed20 seed0 / rollout_val_interval=1; efficacy is unverified.
+# Original Mixed input schedule; Teacher labels Student-source actual states.
+# Fixed equal nodes, full20 and per-epoch whole-cloud validation.
 model:
   NAME: PointTransformer
   cls_dim: 15
@@ -58,7 +58,4 @@ training_input:
   teacher_prob_start: 1.0
   teacher_prob_end: 0.2
   sampling_seed: 2025
-  noise_teacher_anchor:
-    sigma_start: 0.01
-    sigma_end: 0.02
-    teacher_prob_high: 0.68
+  student_target: teacher_from_student_input

@@ -19,9 +19,7 @@ if str(REPO_ROOT) not in sys.path:
 from utils.curriculum_config import resolve_curriculum, require_supported_resume
 from utils.training_input import (resolve_training_input, teacher_input_probability,
                                   training_input_metadata, sample_teacher_input_mask,
-                                  summarize_input_stages, noise_anchored_teacher_probabilities,
-                                  new_noise_anchor_statistics, accumulate_noise_anchor_statistics,
-                                  summarize_noise_anchor_statistics)
+                                  summarize_input_stages, summarize_training_targets)
 
 TEACHER_NODES = (0, 4, 8, 12, 16)
 NONUNIFORM_NODES = (0, 7, 10, 13, 16)
@@ -245,6 +243,52 @@ def capture_teacher(teacher, noisy, sigma0, patch_batch=1, return_full_trajector
     return nodes
 
 
+def teacher_interval_target(teacher, points, sigma0, start_step, target_step, patch_batch=1):
+    """Frozen Teacher endpoint from the learner's actual state at a nominal interval.
+
+    Only the endpoint is retained. Extra Teacher calls cannot advance the global
+    RNGs used by subsequent Student dropout or training-data sampling.
+    """
+    import numpy as np
+    import torch
+    if (type(start_step) is not int or type(target_step) is not int or
+            not 0 <= start_step < target_step <= 16):
+        raise ValueError('Teacher interval requires integer 0 <= start_step < target_step <= 16')
+    if type(patch_batch) is not int or patch_batch < 1:
+        raise ValueError('teacher patch_batch must be a positive integer')
+    if (points.ndim != 3 or points.shape[0] < 1 or points.shape[1] < 1 or
+            points.shape[-1] != 3 or not points.is_floating_point() or
+            not torch.isfinite(points).all()):
+        raise ValueError('Teacher interval points must be finite floating [B,N,3]')
+    device = next(teacher.parameters()).device
+    sigmas = _sigma_batch(sigma0, points.shape[0], device, points.dtype)
+    freeze_teacher(teacher)
+    python_state, numpy_state = random.getstate(), np.random.get_state()
+    cuda_devices = [device.index] if device.type == 'cuda' else []
+    endpoints = []
+    try:
+        with torch.random.fork_rng(devices=cuda_devices), torch.no_grad():
+            for offset in range(0, points.shape[0], patch_batch):
+                x = points[offset:offset + patch_batch].detach().to(device)
+                sigma = sigmas[offset:offset + patch_batch] * TEACHER_DECAY ** start_step
+                for _ in range(start_step, target_step):
+                    out = teacher(x, None, 'val', '', noise_std=sigma)
+                    if out.shape != x.shape:
+                        raise ValueError('Teacher interval output shape differs from input')
+                    # Preserve the original Teacher update arithmetic exactly.
+                    eps = (out - x) / sigma[:, None, None]
+                    x = x + TEACHER_ETA * sigma[:, None, None] * eps
+                    sigma = sigma * TEACHER_DECAY
+                endpoints.append(x.detach().to(points.device))
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+    target = torch.cat(endpoints, dim=0).detach()
+    if not torch.isfinite(target).all():
+        raise FloatingPointError('Teacher interval target contains nonfinite coordinates')
+    return target
+
+
 def evaluate_candidate_pcd(T_start, T_target, student_pred):
     """Evaluate supplied states for any 0 <= t < u <= 16, independently of fixed nodes.
 
@@ -453,15 +497,26 @@ def backward_stages(student, nodes, sigma0, loss_scale=1.0, stage_diagnostics=No
 
 
 def backward_student_input_stages(student, nodes, sigma0, teacher_mask, loss_scale=1.0,
-                                 input_diagnostics=None, teacher_nodes=TEACHER_NODES):
+                                 input_diagnostics=None, teacher_nodes=TEACHER_NODES,
+                                 student_target='teacher_target_node', teacher=None,
+                                 teacher_patch_batch=1, target_diagnostics=None):
     """Four local losses with optional detached previous-Student inputs.
 
-    Teacher targets, nominal sigma/condition and loss scaling match TF training.
+    Legacy targets remain unchanged unless teacher_from_student_input is selected.
+    The new policy labels only Student-source samples with a frozen Teacher interval
+    starting at their actual detached input; Teacher-source samples retain node targets.
     The mask is [4, B], sampled before micro-batching. Each patch/stage selects
     one whole point state; no point interpolation or cross-stage backpropagation.
     """
     import torch
     teacher_nodes = _teacher_nodes(teacher_nodes)
+    if student_target not in ('teacher_target_node', 'teacher_from_student_input'):
+        raise ValueError('Unknown Student target policy')
+    matched_targets = student_target == 'teacher_from_student_input'
+    if matched_targets and (teacher is None or teacher is student):
+        raise ValueError('Matched targets require a separate frozen Teacher')
+    if matched_targets and (type(teacher_patch_batch) is not int or teacher_patch_batch < 1):
+        raise ValueError('teacher_patch_batch must be a positive integer')
     if (nodes.ndim != 4 or nodes.shape[0] != 5 or nodes.shape[-1] != 3 or
             nodes.shape[1] == 0):
         raise ValueError('Expected five Teacher nodes with shape [5, B, N, 3], B > 0')
@@ -478,6 +533,21 @@ def backward_student_input_stages(student, nodes, sigma0, teacher_mask, loss_sca
         x = (teacher_start if stage == 0 else
              torch.where(mask[stage, :, None, None], teacher_start, previous))
         target = nodes[stage + 1].detach().to(device)
+        matched_count = 0
+        if matched_targets:
+            student_source = ~mask[stage]
+            matched_count = int(student_source.sum())
+            if matched_count:
+                local_target = teacher_interval_target(
+                    teacher, x[student_source], sigmas[student_source], start,
+                    teacher_nodes[stage + 1], int(teacher_patch_batch))
+                target = target.clone()
+                target[student_source] = local_target
+                del local_target
+        if target_diagnostics is not None:
+            target_diagnostics.append([
+                nodes.shape[1] - matched_count, matched_count,
+                matched_count * (teacher_nodes[stage + 1] - start)])
         next_state = forward_student_interval(
             student, x, sigmas * TEACHER_DECAY ** start, start, teacher_nodes[stage + 1])
         error = (next_state - target).square().sum(dim=-1)
@@ -873,12 +943,7 @@ def train(args, config, builder, device, checkpoint_path, output):
     resolved_curriculum = resolve_curriculum(config)
     training_input = resolved_curriculum['training_input']
     teacher_forced = training_input['type'] == 'teacher_forced'
-    noise_anchor = training_input.get('noise_teacher_anchor')
-    if noise_anchor is not None:
-        data = config.dataset._base_
-        if not (float(data.NOISE_MIN) <= noise_anchor['sigma_start'] <
-                noise_anchor['sigma_end'] <= float(data.NOISE_MAX)):
-            raise ValueError('Noise-anchor sigma range must lie inside the unchanged training noise range')
+    matched_targets = training_input.get('student_target') == 'teacher_from_student_input'
     if getattr(args, 'resume', None):
         require_supported_resume(resolved_curriculum)
     rollout_aware = resolved_curriculum['metric']['type'] == 'rollout_aware'
@@ -965,8 +1030,8 @@ def train(args, config, builder, device, checkpoint_path, output):
             totals = np.zeros(4, dtype=np.float64)
             pcd_totals = np.zeros((4, 3), dtype=np.float64)
             input_totals = np.zeros((4, 4), dtype=np.float64)
+            target_totals = np.zeros((4, 3), dtype=np.int64) if matched_targets else None
             teacher_probability = teacher_input_probability(training_input, epoch)
-            noise_anchor_totals = new_noise_anchor_statistics() if noise_anchor is not None else None
             input_generator = None
             if training_input['type'] == 'scheduled_rollout':
                 input_generator = torch.Generator(device='cpu').manual_seed(
@@ -974,10 +1039,9 @@ def train(args, config, builder, device, checkpoint_path, output):
             print(f'[training-input] mode={training_input["type"]} '
                   f'teacher_probability_stages_2_to_4={teacher_probability:g}; '
                   f'stage_1=T0; student_state_detached=true', flush=True)
-            if noise_anchor is not None:
-                print(f'[noise-teacher-anchor] sigma0={noise_anchor["sigma_start"]:g}..'
-                      f'{noise_anchor["sigma_end"]:g}; q_high={noise_anchor["teacher_prob_high"]:g}; '
-                      f'base_q={teacher_probability:g}; interpolation=log_sigma', flush=True)
+            if matched_targets:
+                print('[training-target] Teacher input -> original node; Student input -> '
+                      'frozen Teacher interval from detached actual input; extra RNGs isolated', flush=True)
             shadow_rows = []
             seen = 0
             for batch_index, (noisy, clean, sigmas, _centers, _scales, _names) in enumerate(loader):
@@ -1002,15 +1066,8 @@ def train(args, config, builder, device, checkpoint_path, output):
                     nodes = capture_teacher(teacher, noisy, sigmas, int(config.teacher_patch_batch),
                                             teacher_nodes=teacher_nodes)
                 count = noisy.shape[0]
-                probabilities = teacher_probability
-                if noise_anchor is not None:
-                    sigma_values = _sigma_batch(sigmas, count, torch.device('cpu'), noisy.dtype).tolist()
-                    probabilities = noise_anchored_teacher_probabilities(training_input, epoch, sigma_values)
                 teacher_mask = (None if teacher_forced else
-                                sample_teacher_input_mask(count, probabilities, input_generator))
-                if noise_anchor is not None:
-                    accumulate_noise_anchor_statistics(noise_anchor_totals, training_input, sigma_values,
-                                                       probabilities, teacher_mask.tolist())
+                                sample_teacher_input_mask(count, teacher_probability, input_generator))
                 optimizer.zero_grad(set_to_none=True)
                 for offset in range(0, count, batch_size):
                     batch_nodes = nodes[:, offset:offset + batch_size]
@@ -1024,12 +1081,21 @@ def train(args, config, builder, device, checkpoint_path, output):
                         input_totals[:, 0] += size
                         input_totals[:, 2] += np.asarray(losses) * size
                     else:
+                        target_options = {}
+                        if matched_targets:
+                            target_diagnostics = []
+                            target_options = dict(student_target='teacher_from_student_input',
+                                                  teacher=teacher, teacher_patch_batch=int(config.teacher_patch_batch),
+                                                  target_diagnostics=target_diagnostics)
                         losses = backward_student_input_stages(
                             student, batch_nodes, sigmas[offset:offset + batch_size],
                             teacher_mask[:, offset:offset + batch_size], loss_scale=size / count,
-                            input_diagnostics=stage_diagnostics, teacher_nodes=teacher_nodes)
+                            input_diagnostics=stage_diagnostics, teacher_nodes=teacher_nodes,
+                            **target_options)
                         # Counts and loss SUMS; conditional means must use the actual source counts.
                         input_totals += np.asarray(stage_diagnostics)
+                        if matched_targets:
+                            target_totals += np.asarray(target_diagnostics, dtype=np.int64)
                     totals += np.asarray(losses) * size
                 nonzero = check_gradients(teacher, student)
                 grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -1117,9 +1183,10 @@ def train(args, config, builder, device, checkpoint_path, output):
                           checkpoint_seconds=saved_at - checkpoint_started,
                           epoch_seconds=saved_at - epoch_started,
                           setup_seconds=setup_seconds, run_elapsed_seconds=saved_at - run_started)
-            if noise_anchor is not None:
-                record['training_input_noise_bands'] = summarize_noise_anchor_statistics(
-                    noise_anchor_totals, training_input)
+            if matched_targets:
+                record.update(training_target_stages=summarize_training_targets(target_totals),
+                              loss_traj_target='input_matched_teacher_interval',
+                              val_loss_traj_target='teacher_target_node')
             if dynamic is not None:
                 record.update(nodes_used_this_epoch=list(teacher_nodes),
                               checkpoint_teacher_nodes=list(teacher_nodes),
