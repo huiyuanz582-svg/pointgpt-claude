@@ -4,8 +4,7 @@ import unittest
 
 from utils.curriculum_config import resolve_curriculum, require_supported_resume
 from utils.training_input import (resolve_training_input, teacher_input_probability,
-                                  summarize_input_stages, training_input_metadata,
-                                  summarize_training_targets)
+                                  summarize_input_stages)
 
 
 class TrainingInputConfigTests(unittest.TestCase):
@@ -73,43 +72,6 @@ class TrainingInputConfigTests(unittest.TestCase):
         self.assertEqual(rows[0]['teacher_fraction'], .75)
         self.assertIsNone(rows[1]['student_input_loss'])
         self.assertIsNone(rows[2]['teacher_input_loss'])
-
-    def test_matched_target_is_explicit_and_preserves_original_schedule(self):
-        original = resolve_training_input({'training_input': {'type': 'scheduled_rollout'}})
-        self.assertNotIn('student_target', original)
-        self.assertEqual(training_input_metadata(original, 8)['target'], 'teacher_target_node')
-        for mode in ('scheduled_rollout', 'student_rollout'):
-            supplied = dict(type=mode, student_target='teacher_from_student_input')
-            before = copy.deepcopy(supplied)
-            resolved = resolve_curriculum({'training_input': supplied})
-            self.assertEqual(supplied, before)
-            training = resolved['training_input']
-            metadata = training_input_metadata(training, 8)
-            self.assertEqual(metadata['target'], 'input_matched_teacher_interval')
-            self.assertTrue(metadata['teacher_target_detached'])
-            self.assertTrue(metadata['extra_teacher_rng_isolated'])
-            self.assertEqual(metadata['teacher_probability'], .2 if mode == 'scheduled_rollout' else 0.)
-            with self.assertRaises(NotImplementedError):
-                require_supported_resume(resolved)
-        explicit_old = resolve_training_input({'training_input': dict(
-            type='scheduled_rollout', student_target='teacher_target_node')})
-        self.assertEqual(training_input_metadata(explicit_old, 8)['target'], 'teacher_target_node')
-
-    def test_retired_noise_policy_and_invalid_target_settings_are_rejected(self):
-        cases = [dict(type='scheduled_rollout', noise_teacher_anchor=dict(
-                     sigma_start=.01, sigma_end=.02, teacher_prob_high=.68)),
-                 dict(type='teacher_forced', student_target='teacher_from_student_input')]
-        cases.extend(dict(type='scheduled_rollout', student_target=value)
-                     for value in (None, True, .5, 'typo', {}))
-        for case in cases:
-            with self.subTest(case=case), self.assertRaises(ValueError):
-                resolve_training_input({'training_input': case})
-
-    def test_target_counts_are_sample_steps_not_microbatch_calls(self):
-        rows = summarize_training_targets([[8, 0, 0], [2, 6, 24], [3, 5, 20], [1, 7, 28]])
-        self.assertEqual(rows[0]['teacher_node_target_count'], 8)
-        self.assertEqual(rows[1]['student_input_teacher_target_count'], 6)
-        self.assertEqual(sum(row['extra_teacher_sample_steps'] for row in rows), 72)
 
 
 if __name__ == '__main__':

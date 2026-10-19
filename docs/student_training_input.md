@@ -1,8 +1,5 @@
 # 混合 / 连续 Student 输入
 
-固定节点的新监督实验见 [fixed_mixed_matched_targets.md](fixed_mixed_matched_targets.md)。
-已撤回按噪声强度调整输入比例的版本；新配置恢复原 Mixed 概率，仅对 Student 输入重算 Teacher 目标。
-
 分支：`paper2-scheduled-rollout-input`，从 `paper2-rollout-aware-curriculum`
 的 `e472b7b` 创建。本次实验只改变训练输入来源，先固定
 `[0, 4, 8, 12, 16]` + Step Condition，评估是否减轻 Teacher-forced
@@ -23,7 +20,7 @@ patch、每个阶段独立选择输入。这里的“混合”是选择整个点
 混合模式允许中途重新回到 Teacher 节点；下一步若再选择 Student，使用的就是
 这次实际输入所产生的输出。纯 Student 模式四步连续，不在中途重置。
 
-未设置 `student_target` 时，所有模式仍以 `T[nk]` 为该阶段监督目标，计算对应点的平方 L2：
+所有模式仍以 `T[nk]` 为该阶段监督目标，计算对应点的平方 L2：
 先对 xyz 求和，再对点/patch 求均值，四阶段等权。每个阶段单独 backward，
 micro-batch 按样本数加权，一个 DataLoader batch 只做一次 optimizer step。
 Student 状态在阶段之间 detach，**不通过前面的阶段反传梯度**；没有四步 BPTT。
@@ -75,12 +72,16 @@ detach 后的状态。没有增加 Teacher 轨迹长度或搜索候选。沿用 
 
 三份配置除 `training_input` 外完全相同，均固定等间隔节点、训练时启用现有
 Step Condition、关闭 shadow 搜索。其余参数沿用 `distill_16to4_baseline.yaml`，
-测试 SOR 开启、surface projection 关闭。原配置没有改写。
+测试 SOR 关闭、surface projection 关闭。原配置没有改写。
 相比历史 baseline 关闭了只读 shadow 诊断；严格对照应使用这里的 TF 配置重新跑。
 
 输入策略与 `original_pcd` / `rollout_aware` 的选择独立。将新策略用于已有动态配置时，
 原节点选择公式、更新时机、校准集及 TF/FR 诊断仍保留；Student 的训练改变后，
 搜索结果当然可能随之变化。首轮先使用上述固定节点配置，以便单独判断输入策略。
+
+第一版 Mixed20 结果已完成；现在的 Mixed + 全局 PCD 动态节点专用配置、
+节点保存/推理语义和手动启动命令见 [mixed_dynamic_nodes.md](mixed_dynamic_nodes.md)。
+动态实验默认仍为 20 epoch，并按实际 Mixed20 协议每 epoch 整云验证。
 
 ## 日志与 checkpoint
 

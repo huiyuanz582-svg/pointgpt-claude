@@ -20,8 +20,6 @@ def resolve_training_input(config):
     if mode == 'scheduled_rollout':
         defaults.update(warmup_epochs=2, decay_epochs=6, teacher_prob_start=1.0,
                         teacher_prob_end=0.2, sampling_seed=2025)
-    if mode != 'teacher_forced' and 'student_target' in supplied:
-        defaults['student_target'] = 'teacher_target_node'
     unknown = set(supplied) - set(defaults)
     if unknown:
         raise ValueError(f'Unknown training_input keys for {mode}: {sorted(unknown)}')
@@ -40,9 +38,6 @@ def resolve_training_input(config):
             resolved[key] = float(value)
         if resolved['teacher_prob_end'] > resolved['teacher_prob_start']:
             raise ValueError('teacher_prob_end must be <= teacher_prob_start')
-    if resolved.get('student_target', 'teacher_target_node') not in (
-            'teacher_target_node', 'teacher_from_student_input'):
-        raise ValueError('student_target must be teacher_target_node or teacher_from_student_input')
     return resolved
 
 
@@ -77,13 +72,6 @@ def training_input_metadata(training, epoch=None):
         result['rng'] = 'dedicated_cpu_generator_seed_(sampling_seed+epoch-1)_mod_2**32'
     if epoch is not None:
         result['teacher_probability'] = teacher_input_probability(training, epoch)
-    if training.get('student_target') == 'teacher_from_student_input':
-        result.update(target='input_matched_teacher_interval',
-                      teacher_input_target='teacher_target_node',
-                      student_input_target='teacher_from_detached_student_input',
-                      teacher_interval='start_step_to_target_step',
-                      teacher_interval_initial_sigma='sigma0_times_teacher_decay_to_start_step',
-                      teacher_target_detached=True, extra_teacher_rng_isolated=True)
     return result
 
 
@@ -119,11 +107,3 @@ def summarize_input_stages(totals):
                          teacher_input_loss=teacher_sum / teacher_count if teacher_count else None,
                          student_input_loss=student_sum / student_count if student_count else None))
     return rows
-
-
-def summarize_training_targets(totals):
-    """Counts are samples and additional Teacher sample-steps, not batched calls."""
-    return [dict(stage=index + 1, teacher_node_target_count=int(node_count),
-                 student_input_teacher_target_count=int(matched_count),
-                 extra_teacher_sample_steps=int(steps))
-            for index, (node_count, matched_count, steps) in enumerate(totals)]

@@ -1,5 +1,5 @@
-# Original Mixed input schedule; Teacher labels Student-source actual states.
-# Fixed equal nodes, full20 and per-epoch whole-cloud validation.
+# 原 Mixed 输入策略 + epoch 级全局 PCD 动态节点。
+# 对照 mixed_full20 时使用相同的每 epoch 整云验证；从同一 Teacher 新建 run。
 model:
   NAME: PointTransformer
   cls_dim: 15
@@ -17,7 +17,7 @@ model:
 dataset:
   _base_: cfgs/dataset_configs/ScoreDenoise.yaml
 
-curriculum_mode: fixed
+curriculum_mode: dynamic_pcd
 distillation:
   teacher_nodes: [0, 4, 8, 12, 16]
   teacher_steps: 16
@@ -48,9 +48,11 @@ gpu_mem_headroom_gib: 1
 validation_seed: 2024
 validation_patches_per_cloud: 4
 rollout_val_interval: 1
+
 sor_enable: false
 surface_projection: {enable: false, k: 16, num_iters: 1, blend: 0.6}
 
+# 与第一版 Mixed 完全相同的 q 调度；节点改变时仍监督 canonical T[target]。
 training_input:
   type: scheduled_rollout
   warmup_epochs: 2
@@ -58,4 +60,16 @@ training_input:
   teacher_prob_start: 1.0
   teacher_prob_end: 0.2
   sampling_seed: 2025
-  student_target: teacher_from_student_input
+
+# 使用已有全局 interval-PCD 搜索，单独观察动态节点这一变量。
+# 这不是 rollout-aware / Pilot-A；搜索输入为 Teacher 区间状态。
+curriculum_metric:
+  type: original_pcd
+dynamic_pcd:
+  initial_nodes: [0, 4, 8, 12, 16]
+  target: 0.3
+  lambda_balance: 1.0
+  update_every_epochs: 1
+  calibration_patches: 64
+  calibration_seed: 2025
+  interval_patch_batch: 8
