@@ -59,7 +59,23 @@ mean(abs(stage_PCD - 0.3)) + 1.0 * population_std(stage_PCD)
 模型、数据、噪声分布、q、优化器、20-epoch 预算、SOR=false、projection=false
 均沿用原 Mixed。专用配置 `rollout_val_interval: 1` 对齐实际 Mixed20 run；
 旧固定 Mixed 模板仍保留其历史值 5，不能直接把该模板当成历史有效配置。
-整云验证仍为原 10k/1%，best 仍按 `CD+0.3*P2M`，不根据 3% 测试结果选模型。
+当前下一轮消融将验证条件由 10k/1% 改为 10k/3%，每 epoch 按该条件的
+`CD+0.3*P2M` 选择 best。共享 `cfgs/dataset_configs/ScoreDenoise.yaml` 中
+`VAL_NOISE: 0.030` 与 `VAL_NOISE_LEVELS: [0.03]` 同步修改；后者优先。
+所有引用该共享数据配置的入口均会采用新的验证噪声。TF 验证 patch 与整云
+rollout 验证都由同一配置生成 3% 噪声；训练和动态节点校准仍采样 0.5%–2%，
+六条件测试仍由各自的 TEST_* 配置决定。
+
+历史动态节点实验在 10k/1% 验证下 best 为 epoch11。本轮只改变验证噪声，
+用于观察 best epoch 是否改变；实际轮次需由后续运行的 `train.jsonl` 确认，
+目前尚未运行。后续先核对 `train/manifest.json` 的验证噪声配置，以及
+`validation_manifest.json` 中每个样本的 `sigma0` 是否为 0.03，再比较
+`train.jsonl` 的最终 `best_epoch` 与历史的 11；两种噪声下的验证 Score
+不直接作优劣比较。修改配置不会重新评估历史权重；现有保存逻辑仅保留
+best/last，没有全部 epoch 权重时不能事后重排原 20 轮。
+
+验证继续使用 `VAL_NUM=0` 的 test 形状身份和固定生成噪声，区别于磁盘上
+六条件测试使用的噪声文件；这次属于选模协议消融，不是独立留出验证。
 
 `train.jsonl` 包含输入来源计数、使用节点、stage gaps、下一轮节点、搜索 PCD、
 目标值、forward 数和分阶段耗时。Mixed 的训练 `mean_PCD` 保持 null，不能把

@@ -4,7 +4,8 @@ NOISE_MIN: 0.005
 NOISE_MAX: 0.020
 # σ 对数均匀采样(EDM 式)：范围不变，小 σ 样本占比更高，精细去噪/降 P2M 更充分
 NOISE_LOG_UNIFORM: True
-VAL_NOISE: 0.010
+# 本轮仅将验证噪声改为 3%；与下方 VAL_NOISE_LEVELS 保持一致。
+VAL_NOISE: 0.030
 # TEST_NOISE: val/test 路径 noise_std 的 fallback（PairedEvalDataset 不含 noise_std 字段）
 # 跑 3% noise 测试时改为 0.030
 TEST_NOISE: 0.010
@@ -46,4 +47,4 @@ TRAIN_OVERSAMPLE: 50
 VAL_NUM: 0                     # 0=对齐 baseline（验证看 test）；>0=从 train 留出这么多做独立验证
 VAL_SPLIT_SEED: 2024          # 留出划分随机种子（仅 VAL_NUM>0 时用；固定→可复现）
 VAL_RESOLUTION: 10000_poisson # 验证分辨率（单一，与主基准对齐）
-VAL_NOISE_LEVELS: [0.01]      # 验证噪声级（固定、可复现）；想跨噪声更鲁棒可设 [0.01, 0.02, 0.03]（成倍耗时）
+VAL_NOISE_LEVELS: [0.03]      # 优先于 VAL_NOISE；仅用 3% 验证以观察 best epoch 是否改变
