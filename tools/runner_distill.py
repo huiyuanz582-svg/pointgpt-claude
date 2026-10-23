@@ -118,6 +118,30 @@ def forward_student_interval(student, points, sigma, start_step, target_step):
     return student(points, None, 'val', '', noise_std=sigma, **condition)
 
 
+def terminal_rollout_options(config):
+    """Optional clean endpoint objective; absent from legacy configurations."""
+    raw = getattr(config, 'terminal_rollout', None)
+    if raw is None:
+        return None
+    options = dict(raw)
+    if set(options) != {'weight', 'patch_batch', 'gradient_checkpointing'}:
+        raise ValueError('terminal_rollout requires weight, patch_batch and gradient_checkpointing')
+    weight = options['weight']
+    patch_batch = options['patch_batch']
+    checkpointing = options['gradient_checkpointing']
+    if type(weight) not in (int, float) or not math.isfinite(weight) or weight <= 0:
+        raise ValueError('terminal_rollout.weight must be finite and positive')
+    if type(patch_batch) is not int or patch_batch < 1:
+        raise ValueError('terminal_rollout.patch_batch must be a positive integer')
+    if type(checkpointing) is not bool:
+        raise ValueError('terminal_rollout.gradient_checkpointing must be bool')
+    if (getattr(config, 'curriculum_mode', 'fixed') != 'fixed' or
+            resolve_training_input(config)['type'] != 'scheduled_rollout'):
+        raise ValueError('terminal_rollout currently requires fixed nodes and scheduled_rollout input')
+    return dict(weight=float(weight), patch_batch=patch_batch,
+                gradient_checkpointing=checkpointing)
+
+
 def load_student_state(student, state):
     """Strict backbone loading; only a wholly absent new condition branch is initialized."""
     enable_student_condition(student)
@@ -500,6 +524,49 @@ def backward_student_input_stages(student, nodes, sigma0, teacher_mask, loss_sca
     return losses
 
 
+def backward_terminal_rollout(student, noisy, clean, sigma0, options, loss_scale=1.0,
+                              teacher_nodes=TEACHER_NODES):
+    """Backpropagate clean endpoint MSE through four continuous Student updates.
+
+    This is a second training pass. It starts from T0 and never reads Teacher
+    targets or the scheduled-input mask. The per-patch clean/noisy ordering is
+    preserved by PairedPatchDataset.
+    """
+    import torch
+    from torch.utils.checkpoint import checkpoint
+
+    teacher_nodes = _teacher_nodes(teacher_nodes)
+    if noisy.ndim != 3 or noisy.shape != clean.shape or noisy.shape[-1] != 3 or noisy.shape[0] == 0:
+        raise ValueError('terminal rollout requires aligned nonempty [B, N, 3] patches')
+    device = next(student.parameters()).device
+    sigmas = _sigma_batch(sigma0, noisy.shape[0], device, noisy.dtype)
+    total_error = 0.0
+    for offset in range(0, noisy.shape[0], options['patch_batch']):
+        end = offset + options['patch_batch']
+        state = noisy[offset:end].detach().to(device)
+        target_clean = clean[offset:end].detach().to(device)
+        sigma = sigmas[offset:end]
+        for start, target in zip(teacher_nodes[:-1], teacher_nodes[1:]):
+            interval_sigma = sigma * TEACHER_DECAY ** start
+
+            def step(points, interval_start=start, interval_target=target,
+                     step_sigma=interval_sigma):
+                return forward_student_interval(student, points, step_sigma,
+                                                interval_start, interval_target)
+
+            state = (checkpoint(step, state, use_reentrant=False) if options['gradient_checkpointing']
+                     else step(state))
+        loss = (state - target_clean).square().sum(dim=-1).mean()
+        if not torch.isfinite(loss):
+            raise FloatingPointError('terminal rollout loss is nonfinite')
+        if not loss.requires_grad:
+            raise RuntimeError('terminal rollout loss has no gradient')
+        size = target_clean.shape[0]
+        (loss * options['weight'] * loss_scale * size / noisy.shape[0]).backward()
+        total_error += float(loss.detach()) * size
+    return total_error / noisy.shape[0]
+
+
 def check_gradients(teacher, student):
     """运行时检查冻结与梯度；不要求未参与 forward 的分类参数有梯度。"""
     import torch
@@ -836,6 +903,9 @@ def _save_checkpoint(path, student, optimizer, epoch, teacher_path, config, sele
     if training_input['type'] != 'teacher_forced':
         payload['training_input'] = training_input
         payload['training_input_protocol'] = training_input_metadata(training_input, epoch)
+    terminal_options = terminal_rollout_options(config)
+    if terminal_options is not None:
+        payload['terminal_rollout'] = terminal_options
     if optimizer is not None:
         payload['optimizer'] = optimizer.state_dict()
     torch.save(payload, temporary)
@@ -870,6 +940,7 @@ def save_epoch_checkpoints(output, student, optimizer, epoch, teacher_path, conf
 def train(args, config, builder, device, checkpoint_path, output):
     resolved_curriculum = resolve_curriculum(config)
     training_input = resolved_curriculum['training_input']
+    terminal_options = terminal_rollout_options(config)
     teacher_forced = training_input['type'] == 'teacher_forced'
     if getattr(args, 'resume', None):
         require_supported_resume(resolved_curriculum)
@@ -948,6 +1019,10 @@ def train(args, config, builder, device, checkpoint_path, output):
     print(f'[sampling] dataset_patches={len(loader.dataset)} '
           f'effective_patches={len(loader) * loader.batch_size} '
           f'batch_size={loader.batch_size} drop_last={loader.drop_last}', flush=True)
+    if terminal_options is not None:
+        print(f'[terminal-rollout] clean_endpoint_mse weight={terminal_options["weight"]:g} '
+              f'patch_batch={terminal_options["patch_batch"]} '
+              f'gradient_checkpointing={terminal_options["gradient_checkpointing"]}', flush=True)
     with (output / 'train.jsonl').open('w', encoding='utf-8') as log:
         for epoch in range(start_epoch, epochs + 1):
             epoch_started = timestamp()
@@ -955,6 +1030,7 @@ def train(args, config, builder, device, checkpoint_path, output):
             stage_gaps = [u - t for t, u in zip(teacher_nodes[:-1], teacher_nodes[1:])]
             print(f'[curriculum] epoch={epoch} teacher_nodes={list(teacher_nodes)} stage_gaps={stage_gaps}', flush=True)
             totals = np.zeros(4, dtype=np.float64)
+            terminal_total = 0.0
             pcd_totals = np.zeros((4, 3), dtype=np.float64)
             input_totals = np.zeros((4, 4), dtype=np.float64)
             teacher_probability = teacher_input_probability(training_input, epoch)
@@ -975,8 +1051,10 @@ def train(args, config, builder, device, checkpoint_path, output):
                 if noisy.shape != clean.shape or sigmas is None:
                     raise ValueError('baseline patch 必须 noisy/clean 对齐且提供每个样本的 sigma')
                 if args.max_shapes:
-                    noisy = noisy[:args.max_shapes - seen]
-                    sigmas = sigmas[:args.max_shapes - seen]
+                    limit = args.max_shapes - seen
+                    noisy = noisy[:limit]
+                    clean = clean[:limit]
+                    sigmas = sigmas[:limit]
                 if shadow_options['shadow_enabled']:
                     full_teacher = capture_teacher(teacher, noisy, sigmas, int(config.teacher_patch_batch),
                                                    return_full_trajectory=True)
@@ -1010,6 +1088,12 @@ def train(args, config, builder, device, checkpoint_path, output):
                             input_diagnostics=stage_diagnostics, teacher_nodes=teacher_nodes)
                         # Counts and loss SUMS; conditional means must use the actual source counts.
                         input_totals += np.asarray(stage_diagnostics)
+                    if terminal_options is not None:
+                        terminal_loss = backward_terminal_rollout(
+                            student, batch_nodes[0], clean[offset:offset + batch_size],
+                            sigmas[offset:offset + batch_size], terminal_options,
+                            loss_scale=size / count, teacher_nodes=teacher_nodes)
+                        terminal_total += terminal_loss * size
                     totals += np.asarray(losses) * size
                 nonzero = check_gradients(teacher, student)
                 grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -1027,6 +1111,7 @@ def train(args, config, builder, device, checkpoint_path, output):
             if not seen:
                 raise RuntimeError('没有执行任何 Student 更新')
             means = (totals / seen).tolist()
+            terminal_mean = terminal_total / seen if terminal_options is not None else None
             pcd_means = pcd_totals / seen
             validation_started = timestamp()
             train_seconds = validation_started - epoch_started
@@ -1084,6 +1169,10 @@ def train(args, config, builder, device, checkpoint_path, output):
                           loss_traj=sum(means) / 4, **validation,
                           best_val_rollout_score=best_score if math.isfinite(best_score) else None,
                           best_epoch=best_epoch, is_best=improved)
+            if terminal_options is not None:
+                record.update(terminal_rollout_loss=terminal_mean,
+                              terminal_rollout_weight=terminal_options['weight'],
+                              loss_total=sum(means) / 4 + terminal_options['weight'] * terminal_mean)
             record.update(training_input=training_input['type'],
                           training_input_protocol=training_input_metadata(training_input, epoch),
                           training_input_stages=summarize_input_stages(input_totals),
