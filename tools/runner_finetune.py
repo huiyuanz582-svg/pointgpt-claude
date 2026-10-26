@@ -154,7 +154,7 @@ def sor_filter(pts_tensor, nb_neighbors=20, std_ratio=2.0):
 def patch_based_denoise(base_model, pcl_noisy, noise_std_t, patch_size=1024,
                         seed_ratio=3, patch_batch=4,
                         num_steps=1, step_size=1.0, decay=0.95,
-                        fuse_tau_ratio=0.5):
+                        fuse_tau_ratio=0.5, memory_guard=True):
     """
     完整点云的 patch-based 推理：把 N 点云切成覆盖全部点的重叠 1024-patch，
     逐 patch 去噪后按到种子点距离的高斯权重加权拼回完整点云。
@@ -165,6 +165,7 @@ def patch_based_denoise(base_model, pcl_noisy, noise_std_t, patch_size=1024,
     - seed_ratio:  FPS 种子数 = seed_ratio * N / patch_size，控制重叠/覆盖冗余
     - fuse_tau_ratio: 重叠 patch 拼接的高斯权重宽度 τ = fuse_tau_ratio · patch 半径；
                       边界点降权锐化表面（降 P2M），<=0 退化为等权平均
+    - memory_guard: 常规测试保留显存保护；纯推理计时时关闭 nvidia-smi 子进程开销
 
     多步 Langevin 退火推理（num_steps>1 时启用）：
         x ← x_noisy
@@ -199,7 +200,7 @@ def patch_based_denoise(base_model, pcl_noisy, noise_std_t, patch_size=1024,
     denoised_patches = []
     for i in range(0, patches.shape[0], patch_batch):
         # 每个 patch 批次前硬保护：逼近上限就主动退出，绝不让服务器崩
-        if i > 0 and gpu_mem_ratio() > 0.90:
+        if memory_guard and i > 0 and gpu_mem_ratio() > 0.90:
             torch.cuda.empty_cache()
             if gpu_mem_ratio() > 0.90:
                 print('[测试内存保护] patch 推理中 GPU 显存逼近上限，为防崩溃主动退出；'
