@@ -33,16 +33,17 @@ from utils.config import cfg_from_yaml_file
 
 
 RAW_FIELDS = [
-    'resolution', 'noise', 'steps', 'step_size', 'decay', 'cloud', 'n_points',
+    'resolution', 'noise', 'steps', 'step_size', 'decay', 'seed_ratio', 'cloud', 'n_points',
     'patches', 'model_forwards', 'latency_s', 'peak_allocated_gib',
-    'cd_x1e4', 'p2m_x1e4',
+    'cd_x1e4', 'point_to_face_x1e4', 'face_to_point_x1e4', 'p2m_x1e4',
 ]
 SUMMARY_FIELDS = [
-    'resolution', 'noise', 'steps', 'step_size', 'decay', 'n_clouds',
+    'resolution', 'noise', 'steps', 'step_size', 'decay', 'seed_ratio', 'n_clouds',
     'n_points', 'patches_per_cloud', 'model_forwards_per_cloud',
     'mean_latency_s', 'median_latency_s', 'std_latency_s', 'p95_latency_s',
     'clouds_per_s', 'points_per_s', 'max_peak_allocated_gib',
-    'mean_cd_x1e4', 'mean_p2m_x1e4',
+    'mean_cd_x1e4', 'mean_point_to_face_x1e4',
+    'mean_face_to_point_x1e4', 'mean_p2m_x1e4',
 ]
 
 
@@ -56,6 +57,8 @@ def parse_args():
     parser.add_argument('--steps', type=int, nargs='+', default=[1, 5, 10, 20, 30])
     parser.add_argument('--step-size', type=float, default=None, help='Default: config.langevin.step_size (0.3)')
     parser.add_argument('--decay', type=float, default=None, help='Default: config.langevin.decay (0.95)')
+    parser.add_argument('--seed-ratio', type=float, default=3.0,
+                        help='Overlapping patches per cloud point, r (default: 3)')
     parser.add_argument('--patch-batch', type=int, default=None, help='Default: config.test_patch_batch')
     parser.add_argument('--warmup', type=int, default=1, help='Untimed runs before each T; default 1')
     parser.add_argument('--seed', type=int, default=2024)
@@ -69,6 +72,8 @@ def parse_args():
         parser.error('--warmup and --expected-clouds must be nonnegative')
     if args.patch_batch is not None and args.patch_batch < 1:
         parser.error('--patch-batch must be positive')
+    if not math.isfinite(args.seed_ratio) or args.seed_ratio <= 0:
+        parser.error('--seed-ratio must be a finite positive number')
     return args
 
 
@@ -95,9 +100,10 @@ def checked_names(data_root, resolution, noise, expected_clouds):
     return noisy_label, len(clean)
 
 
-def run_denoise(model, noisy, sigma, patch_size, patch_batch, steps, step_size, decay, fuse_tau):
+def run_denoise(model, noisy, sigma, patch_size, patch_batch,
+                steps, step_size, decay, seed_ratio, fuse_tau):
     return patch_based_denoise(
-        model, noisy, sigma, patch_size=patch_size, seed_ratio=3,
+        model, noisy, sigma, patch_size=patch_size, seed_ratio=seed_ratio,
         patch_batch=patch_batch, num_steps=steps, step_size=step_size,
         decay=decay, fuse_tau_ratio=fuse_tau, memory_guard=False,
     )
@@ -124,6 +130,7 @@ def write_summary(raw_path, summary_path, steps, n_clouds):
                 'steps': t,
                 'step_size': group[0]['step_size'],
                 'decay': group[0]['decay'],
+                'seed_ratio': group[0]['seed_ratio'],
                 'n_clouds': n_clouds,
                 'n_points': group[0]['n_points'],
                 'patches_per_cloud': group[0]['patches'],
@@ -136,6 +143,8 @@ def write_summary(raw_path, summary_path, steps, n_clouds):
                 'points_per_s': sum(n_points) / total_s,
                 'max_peak_allocated_gib': max(float(row['peak_allocated_gib']) for row in group),
                 'mean_cd_x1e4': statistics.mean(float(row['cd_x1e4']) for row in group),
+                'mean_point_to_face_x1e4': statistics.mean(float(row['point_to_face_x1e4']) for row in group),
+                'mean_face_to_point_x1e4': statistics.mean(float(row['face_to_point_x1e4']) for row in group),
                 'mean_p2m_x1e4': statistics.mean(float(row['p2m_x1e4']) for row in group),
             })
 
@@ -161,10 +170,11 @@ def main():
     langevin = config.langevin
     step_size = float(args.step_size if args.step_size is not None else langevin.step_size)
     decay = float(args.decay if args.decay is not None else langevin.decay)
+    seed_ratio = float(args.seed_ratio)
     patch_batch = int(args.patch_batch if args.patch_batch is not None else config.test_patch_batch)
     patch_size = int(config.npoints)
     fuse_tau = float(config.fuse_tau_ratio)
-    if step_size <= 0 or not (0 < decay <= 1) or patch_batch < 1:
+    if not math.isfinite(step_size) or step_size <= 0 or not math.isfinite(decay) or not (0 < decay <= 1) or patch_batch < 1:
         raise ValueError('Invalid step size, decay, or patch batch')
 
     noisy_label, n_clouds = checked_names(data_root, args.resolution, args.noise, args.expected_clouds)
@@ -204,7 +214,8 @@ def main():
         'data_root': str(data_root), 'resolution': args.resolution,
         'noise': args.noise, 'steps': args.steps, 'step_size': step_size,
         'decay': decay, 'patch_batch': patch_batch, 'patch_size': patch_size,
-        'seed_ratio': 3, 'fuse_tau_ratio': fuse_tau, 'warmup': args.warmup,
+        'seed_ratio': seed_ratio, 'fuse_tau_ratio': fuse_tau, 'warmup': args.warmup,
+        'metric_fields': ['cd_x1e4', 'point_to_face_x1e4', 'face_to_point_x1e4', 'p2m_x1e4'],
         'seed': args.seed, 'postprocessing': 'none',
         'timed_region': 'FPS + KNN tiling + all iterative model steps + patch fusion',
         'memory_metric': 'torch.cuda.max_memory_allocated, includes model weights and inference tensors',
@@ -222,7 +233,10 @@ def main():
         if old_metadata != metadata:
             raise ValueError('Existing run_info.json does not match these settings')
         with raw_path.open(newline='', encoding='utf-8') as handle:
-            old_rows = list(csv.DictReader(handle))
+            reader = csv.DictReader(handle)
+            if reader.fieldnames != RAW_FIELDS:
+                raise ValueError('Existing per_cloud.csv has a different metric schema; choose a new output directory')
+            old_rows = list(reader)
         done = {(int(row['steps']), row['cloud']) for row in old_rows}
         if len(done) != len(old_rows):
             raise ValueError('Duplicate rows in per_cloud.csv')
@@ -248,7 +262,7 @@ def main():
                 warm_sigma = torch.tensor([args.noise], dtype=torch.float32, device=device)
                 for _ in range(args.warmup):
                     warm_output = run_denoise(model, warm_input, warm_sigma, patch_size,
-                                              patch_batch, steps, step_size, decay, fuse_tau)
+                                              patch_batch, steps, step_size, decay, seed_ratio, fuse_tau)
                     del warm_output
                 torch.cuda.synchronize(device)
                 del warm_input, warm_sigma, first_noisy
@@ -267,7 +281,7 @@ def main():
                     torch.cuda.reset_peak_memory_stats(device)
                     start = time.perf_counter()
                     denoised = run_denoise(model, noisy_gpu, sigma_gpu, patch_size,
-                                           patch_batch, steps, step_size, decay, fuse_tau)
+                                           patch_batch, steps, step_size, decay, seed_ratio, fuse_tau)
                     torch.cuda.synchronize(device)
                     latency_s = time.perf_counter() - start
                     peak_gib = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
@@ -277,29 +291,35 @@ def main():
                     scale_gpu = scales[0].to(device)
                     clean_world = clean.to(device) * scale_gpu + center_gpu
                     denoised_world = denoised.unsqueeze(0) * scale_gpu + center_gpu
-                    p2m = p2m_loss.compute_p2m(denoised_world[0], cloud, 'test') * 1e4
+                    p2m_components = p2m_loss.compute_p2m_components(denoised_world[0], cloud, 'test')
                     _, clean_center, clean_scale = normalize_unit_sphere(clean_world)
                     cd = cd_metric((denoised_world - clean_center) / clean_scale,
                                    (clean_world - clean_center) / clean_scale) * 1e4
 
                     n_points = int(noisy_gpu.shape[0])
-                    patches = max(1, int(3 * n_points / patch_size))
+                    patches = max(1, int(seed_ratio * n_points / patch_size))
                     row = {
                         'resolution': args.resolution, 'noise': args.noise,
                         'steps': steps, 'step_size': step_size, 'decay': decay,
+                        'seed_ratio': seed_ratio,
                         'cloud': cloud, 'n_points': n_points, 'patches': patches,
                         'model_forwards': math.ceil(patches / patch_batch) * steps,
                         'latency_s': latency_s, 'peak_allocated_gib': peak_gib,
-                        'cd_x1e4': float(cd.item()), 'p2m_x1e4': float(p2m.item()),
+                        'cd_x1e4': float(cd.item()),
+                        'point_to_face_x1e4': float(p2m_components['point_to_face'].item() * 1e4),
+                        'face_to_point_x1e4': float(p2m_components['face_to_point'].item() * 1e4),
+                        'p2m_x1e4': float(p2m_components['p2m'].item() * 1e4),
                     }
                     writer.writerow(row)
                     handle.flush()
                     done.add((steps, cloud))
                     print(f'{args.resolution} {args.noise:.2f} T={steps:2d} {cloud}: '
                           f'{latency_s:.3f}s CD={row["cd_x1e4"]:.3f} '
+                          f'point→face={row["point_to_face_x1e4"]:.3f} '
+                          f'face→point={row["face_to_point_x1e4"]:.3f} '
                           f'P2M={row["p2m_x1e4"]:.3f} peak={peak_gib:.2f} GiB', flush=True)
                     del (noisy_gpu, sigma_gpu, denoised, center_gpu, scale_gpu,
-                         clean_world, denoised_world, clean_center, clean_scale, cd, p2m)
+                         clean_world, denoised_world, clean_center, clean_scale, cd, p2m_components)
 
     write_summary(raw_path, summary_path, args.steps, n_clouds)
     print(f'Complete: {summary_path}')
