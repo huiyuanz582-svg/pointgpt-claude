@@ -21,7 +21,7 @@ import os
 from extensions.chamfer_dist import ChamferDistanceL1,ChamferDistanceL2
 import pytorch3d
 import pytorch3d.loss
-from utils.p2m_loss import compute_p2m, compute_p2m_train
+from utils.p2m_loss import compute_p2m, compute_p2m_components, compute_p2m_train
 
 train_transforms = transforms.Compose(
     [
@@ -808,6 +808,8 @@ def test(base_model, test_dataloader, args, config, logger=None):
     total_cd_10k = 0.0
     total_batches = 0
     total_p2m = 0.0
+    total_point_to_face = 0.0
+    total_face_to_point = 0.0
 
     # Langevin 多步推理超参（从 config 读，缺省退化为单步 Tweedie）
     langevin = getattr(config, 'langevin', None)
@@ -862,6 +864,8 @@ def test(base_model, test_dataloader, args, config, logger=None):
                 print_log(f'[测试内存保护] 样本 {idx} 前 GPU={_mr:.1%} / CPU={_cpu:.1f}% 逼近上限，'
                           f'为防服务器崩溃主动中断测试。已完成 {total_batches} 个样本：'
                           f'CD={ (total_cd/total_batches) if total_batches>0 else float("nan"):.6f} '
+                          f'point_to_face={ (total_point_to_face/total_batches) if total_batches>0 else float("nan"):.6f} '
+                          f'face_to_point={ (total_face_to_point/total_batches) if total_batches>0 else float("nan"):.6f} '
                           f'p2m={ (total_p2m/total_batches) if total_batches>0 else float("nan"):.6f}。'
                           f'请在 yaml 调小 test_patch_batch 后重跑', logger=logger)
                 sys.exit(0)
@@ -908,6 +912,8 @@ def test(base_model, test_dataloader, args, config, logger=None):
             
             best_cd = float('inf')
             best_p2m = None
+            best_point_to_face = None
+            best_face_to_point = None
             best_denoised = None
             for _ in range(vote_times):
                 # patch-based 推理：完整点云切 1024-patch 逐个去噪再拼回，覆盖全部点
@@ -926,7 +932,7 @@ def test(base_model, test_dataloader, args, config, logger=None):
                 denoised_10k = denoised_filtered.unsqueeze(0).to(denoised_10k.device)
                 denoised_world = denoised_10k * scale_gpu + center_gpu
                 clean_world = pcl_clean * scale_gpu + center_gpu
-                p2m_loss = compute_p2m(denoised_world[0], name[0], 'test') * 1e4
+                p2m_components = compute_p2m_components(denoised_world[0], name[0], 'test')
 
                 _, center1, scale1 = normalize_unit_sphere(clean_world)
                 pcl_clean_10k_norm = (clean_world - center1) / scale1
@@ -936,17 +942,24 @@ def test(base_model, test_dataloader, args, config, logger=None):
                 cur_cd = batch_cd.item()
                 if cur_cd < best_cd:
                     best_cd = cur_cd
-                    best_p2m = p2m_loss.item() if isinstance(p2m_loss, torch.Tensor) else float(p2m_loss)
+                    best_p2m = p2m_components['p2m'].item() * 1e4
+                    best_point_to_face = p2m_components['point_to_face'].item() * 1e4
+                    best_face_to_point = p2m_components['face_to_point'].item() * 1e4
                     best_denoised = denoised_world.detach().clone()
 
                 # 每次投票后释放本轮中间张量并清缓存，防 50k×Langevin 多步显存碎片累积崩机
                 del denoised_full, denoised_10k, denoised_filtered, denoised_world
-                del clean_world, denoised_10k_norm, pcl_clean_10k_norm, batch_cd, p2m_loss
+                del clean_world, denoised_10k_norm, pcl_clean_10k_norm, batch_cd, p2m_components
                 torch.cuda.empty_cache()
 
             denoised_10k = best_denoised
             batch_cd = float(best_cd)
             p2m_loss = best_p2m
+            point_to_face = best_point_to_face
+            face_to_point = best_face_to_point
+            print_log(f'[Test] {name[0]} CD={batch_cd:.6f} '
+                      f'point_to_face={point_to_face:.6f} '
+                      f'face_to_point={face_to_point:.6f} P2M={p2m_loss:.6f}', logger=logger)
            
 # 可视化去噪效果--------------------------------------------------------------------------------------------
         # 噪声点------------------------------------------------------------
@@ -1003,17 +1016,21 @@ def test(base_model, test_dataloader, args, config, logger=None):
             # print(pcl_denoised_original,pcl_denoised_original.shape,'point-------------------------------')
             total_cd += batch_cd
             total_p2m += p2m_loss
+            total_point_to_face += point_to_face
+            total_face_to_point += face_to_point
             
             total_batches += 1
 
     avg_cd = total_cd / total_batches
     avg_p2m = total_p2m / total_batches
+    avg_point_to_face = total_point_to_face / total_batches
+    avg_face_to_point = total_face_to_point / total_batches
     
 
     # print_log(' Chamfer Distance = %.6f' %
     #         ( avg_cd), logger=logger)
-    print_log(' Chamfer Distance = %.6f p2m =  %.6f' %
-            ( avg_cd,avg_p2m), logger=logger)
+    print_log(' Chamfer Distance = %.6f point_to_face = %.6f face_to_point = %.6f p2m = %.6f' %
+              (avg_cd, avg_point_to_face, avg_face_to_point, avg_p2m), logger=logger)
 
     print_log(f"[TEST_VOTE] 每个样本在 {vote_times} 次中取最优结果后保存", logger=logger)
 

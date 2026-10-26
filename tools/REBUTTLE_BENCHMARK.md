@@ -56,3 +56,62 @@ and 50K, with one curve per noise level. State the GPU, patch batch size, and
 timing boundary alongside the table. If runtime is costly, the six independent
 commands can be scheduled separately; do not substitute a small timing subset
 for the full-set quality results without saying so.
+
+## Directional P2M and inference-parameter sensitivity
+
+The script now writes `point_to_face_x1e4`, `face_to_point_x1e4`, and their
+sum `p2m_x1e4` alongside `cd_x1e4` in `per_cloud.csv`. `summary.csv` contains
+the corresponding per-cloud means. Both directional terms use the same
+unit-sphere mesh normalization and the same squared-distance reductions as
+PyTorch3D's original bidirectional P2M. The regular `main.py --test` log also
+prints these four metrics per cloud and as final means. Use new output
+directories: older `per_cloud.csv` files do not have the directional columns
+and cannot be resumed with this version. The benchmark bypasses SOR for the
+Gaussian protocol; the checked-in L-model yaml has `sor_enable: True`, so
+disable that option in a copy of the config if using `main.py --test` to
+compare against these benchmark results.
+
+For an inference-only, one-factor-at-a-time sensitivity study, use the same
+fine-tuned checkpoint on representative PUNet Gaussian conditions 10K/1%
+and 50K/3%. Keep `T=30`, SOR off, and the other two parameters at their
+baseline values while varying one of step size `eta`, decay `gamma`, or
+patch overlap `r`. These seven settings include one shared baseline:
+
+| Setting | `--step-size` (eta) | `--decay` (gamma) | `--seed-ratio` (r) |
+|---|---:|---:|---:|
+| baseline | 0.3 | 0.95 | 3 |
+| eta_0.2 | 0.2 | 0.95 | 3 |
+| eta_0.4 | 0.4 | 0.95 | 3 |
+| gamma_0.90 | 0.3 | 0.90 | 3 |
+| gamma_0.98 | 0.3 | 0.98 | 3 |
+| r_2 | 0.3 | 0.95 | 2 |
+| r_4 | 0.3 | 0.95 | 4 |
+
+```bash
+CKPT=/absolute/path/to/ckpt-best.pth
+DATA_ROOT=/absolute/path/to/ScoreDenoise
+for setting in "10000 0.01" "50000 0.03"; do
+  read -r res noise <<< "$setting"
+  for variant in \
+    "baseline 0.3 0.95 3" \
+    "eta_0.2 0.2 0.95 3" "eta_0.4 0.4 0.95 3" \
+    "gamma_0.90 0.3 0.90 3" "gamma_0.98 0.3 0.98 3" \
+    "r_2 0.3 0.95 2" "r_4 0.3 0.95 4"; do
+    read -r label eta gamma overlap <<< "$variant"
+    CUDA_VISIBLE_DEVICES=0 python tools/benchmark_inference.py \
+      --config cfgs/PointGPT-L/finetune_scoredenoise.yaml \
+      --checkpoint "$CKPT" --data-root "$DATA_ROOT" \
+      --resolution "$res" --noise "$noise" --steps 30 \
+      --step-size "$eta" --decay "$gamma" --seed-ratio "$overlap" \
+      --expected-clouds 20 \
+      --output-dir "experiments/rebuttle_sensitivity/${res}_${noise}/${label}"
+  done
+done
+```
+
+Each directory contains its own `run_info.json`, `per_cloud.csv`, and
+`summary.csv`. Compare CD, both directional P2M terms, total P2M, latency,
+and peak memory. `r` changes the number of patches and thus inference cost.
+If the actual test release has a different number of shapes, set
+`--expected-clouds` to that verified count. Re-run an interrupted command
+with the same settings/output directory plus `--resume`.

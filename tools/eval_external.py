@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""用【本仓库 test() 完全同款】的 CD / P2M 评测任意方法的去噪输出。
+"""用【本仓库 test() 同口径】的 CD / 双向 P2M 及两个方向评测任意方法的去噪输出。
 
 动机：让所有对比方法过同一把尺子。本仓库 test() 的 CD = ChamferDistanceL2（按干净云
 单位球归一化），P2M = compute_p2m（双向 point↔face，mesh 归一化到单位球），均 ×1e4。
@@ -31,6 +31,7 @@
 - --pred_dir  : 一个或多个方法的去噪 .xyz 目录；方法名默认取目录 basename
 - --sor       : 加同款 SOR 后再评测（--sor_nb / --sor_std 可调，默认 20 / 2.0）
 - 文件按同名（去 .xyz 后缀）与 clean/mesh 配对；点数可与 GT 不同（CD/P2M 都支持）
+- 对比各方法时须核对相同的 shape 集合，且 n_cd 与 n_p2m 均完整
 - .xyz 若多于 3 列（含法向等），只取前 3 列
 
 前提：别人的去噪点云必须与干净 GT 在**同一世界坐标系**（多数去噪 repo 的输出都做了
@@ -50,7 +51,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from extensions.chamfer_dist import ChamferDistanceL2   # noqa: E402
 import utils.p2m_loss as p2ml                            # noqa: E402
-from utils.p2m_loss import compute_p2m                   # noqa: E402
+from utils.p2m_loss import compute_p2m_components        # noqa: E402
 
 
 def sor_filter(pts_np, nb_neighbors=20, std_ratio=2.0):
@@ -89,9 +90,12 @@ def load_xyz_dir(d):
 
 def eval_one_method(pred_dir, clean, mesh_names, cd_metric, device, verbose=True,
                     use_sor=False, sor_nb=20, sor_std=2.0):
-    """对一个方法目录评测，返回 (mean_cd, mean_p2m, n)。
+    """对一个方法目录评测，返回四项均值及 CD/P2M 样本数。
     use_sor=True 时，对每个预测点云先过同款 SOR 再评（世界坐标系下滤波，不影响归一化口径）。"""
     pred = load_xyz_dir(pred_dir)
+    if set(pred) != set(clean):
+        print(f'  ⚠ 与 clean 的 shape 集合不同：缺少 {sorted(set(clean) - set(pred))}，'
+              f'多出 {sorted(set(pred) - set(clean))}')
     names = sorted(set(pred) & set(clean) & set(mesh_names))
     missing = (set(pred) & set(clean)) - set(mesh_names)
     if missing:
@@ -100,7 +104,7 @@ def eval_one_method(pred_dir, clean, mesh_names, cd_metric, device, verbose=True
         print(f'  ⚠ {pred_dir} 与 clean/mesh 无同名配对，检查文件名/分辨率')
     eval_names = sorted(set(pred) & set(clean))  # CD 只需 clean，P2M 另判 mesh
 
-    cds, p2ms = [], []
+    cds, point_to_faces, face_to_points, p2ms = [], [], [], []
     for nm in eval_names:
         clean_w = clean[nm].unsqueeze(0).to(device)      # [1,N,3]
         pred_pts = pred[nm]                              # [M,3] cpu tensor
@@ -114,22 +118,30 @@ def eval_one_method(pred_dir, clean, mesh_names, cd_metric, device, verbose=True
         _, c1, s1 = normalize_unit_sphere(clean_w)
         cd = cd_metric((pred_w - c1) / s1, (clean_w - c1) / s1).item() * 1e4
         cds.append(cd)
-        # P2M：世界坐标直接喂 compute_p2m（内部按 mesh 归一化），×1e4
-        p2m = float('nan')
+        # P2M：世界坐标传入，内部按同一 mesh 归一化；总量为两个方向之和。
+        point_to_face = face_to_point = p2m = float('nan')
         if nm in mesh_names:
             try:
-                p2m = compute_p2m(pred_w[0], nm, 'test').item() * 1e4
+                components = compute_p2m_components(pred_w[0], nm, 'test')
+                point_to_face = components['point_to_face'].item() * 1e4
+                face_to_point = components['face_to_point'].item() * 1e4
+                p2m = components['p2m'].item() * 1e4
+                point_to_faces.append(point_to_face)
+                face_to_points.append(face_to_point)
                 p2ms.append(p2m)
             except Exception as e:
                 print(f'  ⚠ {nm} P2M 失败: {e}')
         if verbose:
             sor_note = f'  (SOR {n_before}->{pred_pts.shape[0]} pts)' if use_sor \
                 else f'  (pred {pred_pts.shape[0]} pts)'
-            print(f'    {nm:16s} CD={cd:9.4f}  P2M={p2m:9.4f}{sor_note}')
+            print(f'    {nm:16s} CD={cd:9.4f}  point→face={point_to_face:9.4f} '
+                  f'face→point={face_to_point:9.4f}  P2M={p2m:9.4f}{sor_note}')
 
     mcd = float(np.mean(cds)) if cds else float('nan')
+    mpoint_to_face = float(np.mean(point_to_faces)) if point_to_faces else float('nan')
+    mface_to_point = float(np.mean(face_to_points)) if face_to_points else float('nan')
     mp2m = float(np.mean(p2ms)) if p2ms else float('nan')
-    return mcd, mp2m, len(cds)
+    return mcd, mpoint_to_face, mface_to_point, mp2m, len(cds), len(p2ms)
 
 
 def main():
@@ -162,23 +174,28 @@ def main():
     for pd in args.pred_dir:
         name = os.path.basename(pd.rstrip('/'))
         print(f'======== {name} ({pd}) ========')
-        mcd, mp2m, n = eval_one_method(pd, clean, mesh_names, cd_metric, device,
-                                       verbose=not args.quiet,
-                                       use_sor=args.sor, sor_nb=args.sor_nb, sor_std=args.sor_std)
-        print(f'  >>> {name}: CD={mcd:.4f}  P2M={mp2m:.4f}  ({n} 云)\n')
-        rows.append((name, mcd, mp2m, n))
+        mcd, mpoint_to_face, mface_to_point, mp2m, n_cd, n_p2m = eval_one_method(
+            pd, clean, mesh_names, cd_metric, device,
+            verbose=not args.quiet,
+            use_sor=args.sor, sor_nb=args.sor_nb, sor_std=args.sor_std)
+        print(f'  >>> {name}: CD={mcd:.4f}  point→face={mpoint_to_face:.4f} '
+              f'face→point={mface_to_point:.4f}  P2M={mp2m:.4f}  '
+              f'(CD {n_cd} 云 / P2M {n_p2m} 云)\n')
+        rows.append((name, mcd, mpoint_to_face, mface_to_point, mp2m, n_cd, n_p2m))
 
     _sor_tag = f'加同款 SOR nb={args.sor_nb}/std={args.sor_std}' if args.sor else '无 SOR'
     print(f'======== 汇总（本仓库口径 CD/P2M，×1e4，{_sor_tag}）========')
-    print(f'{"method":24s} {"CD":>10s} {"P2M":>10s} {"n":>4s}')
-    for name, mcd, mp2m, n in rows:
-        print(f'{name:24s} {mcd:10.4f} {mp2m:10.4f} {n:4d}')
+    print(f'{"method":24s} {"CD":>10s} {"point→face":>12s} {"face→point":>12s} '
+          f'{"P2M":>10s} {"n_cd":>5s} {"n_p2m":>6s}')
+    for name, mcd, mpoint_to_face, mface_to_point, mp2m, n_cd, n_p2m in rows:
+        print(f'{name:24s} {mcd:10.4f} {mpoint_to_face:12.4f} '
+              f'{mface_to_point:12.4f} {mp2m:10.4f} {n_cd:5d} {n_p2m:6d}')
 
     if args.out_csv:
         import csv
         with open(args.out_csv, 'w', newline='') as f:
             w = csv.writer(f)
-            w.writerow(['method', 'CD', 'P2M', 'n'])
+            w.writerow(['method', 'CD', 'point_to_face', 'face_to_point', 'P2M', 'n_cd', 'n_p2m'])
             w.writerows(rows)
         print(f'\n已写入 {args.out_csv}')
 

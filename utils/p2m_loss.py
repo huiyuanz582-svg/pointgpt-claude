@@ -1,7 +1,7 @@
 import torch
 import os
-import pytorch3d
 from pytorch3d.loss import point_mesh_face_distance
+from pytorch3d.loss.point_mesh_distance import face_point_distance, point_face_distance
 from pytorch3d.structures import Meshes, Pointclouds
 import trimesh
 import numpy as np
@@ -23,14 +23,18 @@ def normalize_sphere(pc, radius=1.0):
 
 def normalize_pcl(pc, center, scale):
     return (pc - center) / scale
-def point_mesh_bidir_distance_single_unit_sphere(pcl, verts, faces):
+
+
+def point_mesh_distance_components_single_unit_sphere(pcl, verts, faces):
     """
     Args:
         pcl:    (N, 3).
         verts:  (M, 3).
         faces:  LongTensor, (T, 3).
     Returns:
-        Squared pointwise distances, (N, ).
+        Dict of squared-distance means: point_to_face, face_to_point, and
+        p2m = point_to_face + face_to_point. This matches PyTorch3D's
+        point_mesh_face_distance for a single mesh/point-cloud pair.
     """
     assert pcl.dim() == 2 and verts.dim() == 2 and faces.dim() == 2, 'Batch is not supported.'
     
@@ -41,31 +45,63 @@ def point_mesh_bidir_distance_single_unit_sphere(pcl, verts, faces):
     pcl = normalize_pcl(pcl.unsqueeze(0), center=center, scale=scale)
     pcl = pcl[0]
 
-    # print('%.6f %.6f' % (verts.abs().max().item(), pcl.abs().max().item()))
+    tris = verts[faces]
+    first_idx = torch.zeros(1, dtype=torch.long, device=pcl.device)
+    # Match PyTorch3D's single-pair reduction: weight each squared distance
+    # before summation by the inverse point/face count, respectively.
+    point_to_face = (
+        point_face_distance(pcl, first_idx, tris, first_idx, pcl.shape[0])
+        * (1.0 / pcl.shape[0])
+    ).sum()
+    face_to_point = (
+        face_point_distance(pcl, first_idx, tris, first_idx, tris.shape[0])
+        * (1.0 / tris.shape[0])
+    ).sum()
+    return {
+        'point_to_face': point_to_face,
+        'face_to_point': face_to_point,
+        'p2m': point_to_face + face_to_point,
+    }
 
-    # Convert them to pytorch3d structures
-    pcls = pytorch3d.structures.Pointclouds([pcl])
-    meshes = pytorch3d.structures.Meshes([verts], [faces])
-    return pytorch3d.loss.point_mesh_face_distance(meshes, pcls)
+
+def point_mesh_bidir_distance_single_unit_sphere(pcl, verts, faces):
+    """Original PyTorch3D bidirectional P2M, kept for existing evaluators."""
+    assert pcl.dim() == 2 and verts.dim() == 2 and faces.dim() == 2, 'Batch is not supported.'
+    verts, center, scale = normalize_sphere(verts.unsqueeze(0))
+    pcl = normalize_pcl(pcl.unsqueeze(0), center=center, scale=scale)
+    return point_mesh_face_distance(
+        Meshes([verts[0]], [faces]), Pointclouds([pcl[0]])
+    )
+
 
 _MESH_ROOT = os.environ.get(
     'PUNET_MESH_ROOT', 'data/ScoreDenoise/PUNet/meshes')
 
-def compute_p2m(pred_points, name, type):
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+def compute_p2m_components(pred_points, name, type):
+    """Evaluate both directional test P2M terms on the same normalized mesh."""
+    device = pred_points.device
     split = 'train' if type == 'train' else 'test'
     off_path = os.path.join(_MESH_ROOT, split, name + ".off")
     mesh = trimesh.load(off_path)
     verts = torch.from_numpy(mesh.vertices.astype(np.float32)).to(device)
     faces = torch.from_numpy(mesh.faces.astype(np.int64)).to(device)
 
-    loss = point_mesh_bidir_distance_single_unit_sphere(
+    return point_mesh_distance_components_single_unit_sphere(
         pred_points,
         verts,
         faces
     )
 
-    return loss
+
+def compute_p2m(pred_points, name, type):
+    """Original bidirectional P2M used by validation and existing evaluators."""
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    split = 'train' if type == 'train' else 'test'
+    off_path = os.path.join(_MESH_ROOT, split, name + ".off")
+    mesh = trimesh.load(off_path)
+    verts = torch.from_numpy(mesh.vertices.astype(np.float32)).to(device)
+    faces = torch.from_numpy(mesh.faces.astype(np.int64)).to(device)
+    return point_mesh_bidir_distance_single_unit_sphere(pred_points, verts, faces)
 
 
 # ============================================================================
@@ -101,8 +137,6 @@ def compute_p2m_train(pred_points_world, name, split='train'):
     Returns:
         标量：均方 point→face 距离（已在 mesh 单位球归一化空间内，量级与 test 的 P2M 可比）
     """
-    from pytorch3d.loss.point_mesh_distance import point_face_distance
-
     device = pred_points_world.device
     verts, faces = _load_mesh_cached(name, split, device)
 
