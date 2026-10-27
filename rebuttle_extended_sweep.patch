@@ -1,0 +1,641 @@
+diff --git a/tools/REBUTTLE_BENCHMARK.md b/tools/REBUTTLE_BENCHMARK.md
+index 373081b..b74a9d4 100644
+--- a/tools/REBUTTLE_BENCHMARK.md
++++ b/tools/REBUTTLE_BENCHMARK.md
+@@ -1,21 +1,28 @@
+-# PUNet inference cost and quality sweep
++# PUNet inference cost, directional P2M, and sensitivity sweeps
+ 
+ Run on one CUDA GPU from the repository root, with the same fine-tuned
+ `ckpt-best.pth` for every setting. This script does not train or alter weights.
+ It uses the existing `patch_based_denoise` implementation and the PUNet test
+ clouds at 10K/50K and 1%/2%/3% Gaussian noise.
+ 
++Before running on the server, check `git rev-parse --short HEAD` and confirm
++that its `tools/benchmark_inference.py` accepts `--seed-ratio` and writes
++`point_to_face_x1e4` and `face_to_point_x1e4`. An older checkout fails at
++argument parsing. Use a fresh output directory for the directional schema;
++older `per_cloud.csv` files cannot be resumed with this version.
++
+ ```bash
+ CKPT=/absolute/path/to/ckpt-best.pth
++DATA_ROOT=/absolute/path/to/ScoreDenoise
+ for res in 10000 50000; do
+   for noise in 0.01 0.02 0.03; do
+     CUDA_VISIBLE_DEVICES=0 python tools/benchmark_inference.py \
+       --config cfgs/PointGPT-L/finetune_scoredenoise.yaml \
+       --checkpoint "$CKPT" \
+-      --data-root data/ScoreDenoise \
++      --data-root "$DATA_ROOT" \
+       --resolution "$res" --noise "$noise" \
+       --steps 1 5 10 20 30 --expected-clouds 20 \
+-      --output-dir "experiments/rebuttle_cost/${res}_${noise}"
++      --output-dir "experiments/rebuttle_directional_baseline/${res}_${noise}"
+   done
+ done
+ ```
+@@ -72,10 +79,11 @@ disable that option in a copy of the config if using `main.py --test` to
+ compare against these benchmark results.
+ 
+ For an inference-only, one-factor-at-a-time sensitivity study, use the same
+-fine-tuned checkpoint on representative PUNet Gaussian conditions 10K/1%
+-and 50K/3%. Keep `T=30`, SOR off, and the other two parameters at their
+-baseline values while varying one of step size `eta`, decay `gamma`, or
+-patch overlap `r`. These seven settings include one shared baseline:
++fine-tuned checkpoint on all six PUNet Gaussian conditions. Keep `T=30`, SOR
++off, and the other two parameters at their baseline values while varying one
++of step size `eta`, decay `gamma`, or patch overlap `r`. These seven settings
++include one shared baseline. Its `T=30` row comes from the baseline sweep
++above; do not run it again in the sensitivity loop:
+ 
+ | Setting | `--step-size` (eta) | `--decay` (gamma) | `--seed-ratio` (r) |
+ |---|---:|---:|---:|
+@@ -90,28 +98,143 @@ patch overlap `r`. These seven settings include one shared baseline:
+ ```bash
+ CKPT=/absolute/path/to/ckpt-best.pth
+ DATA_ROOT=/absolute/path/to/ScoreDenoise
+-for setting in "10000 0.01" "50000 0.03"; do
+-  read -r res noise <<< "$setting"
+-  for variant in \
+-    "baseline 0.3 0.95 3" \
+-    "eta_0.2 0.2 0.95 3" "eta_0.4 0.4 0.95 3" \
+-    "gamma_0.90 0.3 0.90 3" "gamma_0.98 0.3 0.98 3" \
+-    "r_2 0.3 0.95 2" "r_4 0.3 0.95 4"; do
+-    read -r label eta gamma overlap <<< "$variant"
++for res in 10000 50000; do
++  for noise in 0.01 0.02 0.03; do
++    for variant in \
++      "eta_0.2 0.2 0.95 3" "eta_0.4 0.4 0.95 3" \
++      "gamma_0.90 0.3 0.90 3" "gamma_0.98 0.3 0.98 3" \
++      "r_2 0.3 0.95 2" "r_4 0.3 0.95 4"; do
++      read -r label eta gamma overlap <<< "$variant"
++      CUDA_VISIBLE_DEVICES=0 python tools/benchmark_inference.py \
++        --config cfgs/PointGPT-L/finetune_scoredenoise.yaml \
++        --checkpoint "$CKPT" --data-root "$DATA_ROOT" \
++        --resolution "$res" --noise "$noise" --steps 30 \
++        --step-size "$eta" --decay "$gamma" --seed-ratio "$overlap" \
++        --expected-clouds 20 \
++        --output-dir "experiments/rebuttle_sensitivity/${res}_${noise}/${label}"
++    done
++  done
++done
++```
++
++Each directory contains its own `run_info.json`, `per_cloud.csv`, and
++`summary.csv`. The two loops make 42 condition/setting invocations: six
++baseline runs with five T values each, and 36 nonbaseline runs at T=30.
++Together they yield 66 aggregate rows if every run completes. For the
++directional P2M reviewer table, use the baseline `T=30` row in each of the
++six conditions and compare both directional terms and total P2M against
++competitor outputs evaluated on the same shapes with `tools/eval_external.py`.
++For the separate sensitivity reviewer table, use those same six baseline
++`T=30` rows alongside the 36 nonbaseline rows. Compare CD, both directional
++P2M terms, total P2M, latency, and peak memory; `r` changes the number of
++patches and thus inference cost. Do not infer the cause of a P2M difference
++from the directional split alone. If the actual test release has a different
++number of shapes, set `--expected-clouds` to that verified count. Re-run an
++interrupted command with the same settings/output directory plus `--resume`.
++
++Before writing either reviewer response, check that every selected
++`summary.csv` row has the expected `n_clouds`, the same checkpoint and data
++root in `run_info.json`, and a complete `per_cloud.csv`. For the directional
++P2M table, use columns: resolution, noise, method, shape count, CD,
++point-to-face, face-to-point, and total P2M (all distance metrics x1e4).
++For the sensitivity table, use: resolution, noise, setting, eta, gamma, r,
++shape count, CD, both directional terms, total P2M, mean latency, and peak
++allocated GiB. The competitor evaluator prints `n_cd` and `n_p2m`; require
++both to equal the baseline shape count, and confirm identical shape names
++before comparing rows. Numerical reviewer claims must wait for those outputs.
++
++## Extended T sweep: Gaussian, covariance noise, and Laplace noise
++
++The current benchmark accepts `--steps 15 25 35`, `--noise-family`, an explicit
++`--noisy-dir`, and `--sor on|off`. It records the two directional P2M terms,
++core inference time, separate SOR time, both throughput definitions, PyTorch
++allocated-memory peak, and model forward count. `--profile-flops` adds
++`profiled_matmul_conv_gflops`: this is a PyTorch profiler estimate for the
++model's supported matrix multiplication/2D convolution operators, scaled by
++the actual patch-batch count and T. It is **not** complete pipeline FLOPs:
++unsupported/custom CUDA operators and FPS/KNN/fusion may be omitted. Profiling
++is outside the timing boundary. Do not label that column simply "total FLOPs"
++in a paper. See `run_info.json` for its scope and the actual noisy directory.
++
++The following server paths are examples from the previous run and the supplied
++cov/lap directory. Check them before starting. These commands deliberately
++use new output directories because older CSV files have a different schema.
++Copy the locally edited `tools/benchmark_inference.py` to the server first;
++these edits are uncommitted, so `git pull` alone will not transfer them.
++The filename suffix is used as the nominal inference sigma for cov/lap; if
++the dataset generator defines that value differently, set
++`--inference-sigma` to the validated model input instead.
++
++```bash
++cd /home/sapi/zhy/pointgpt-claude
++CKPT=/workspace/experiments/L_consistency_plus/ckpt-best.pth
++DATA_ROOT=/workspace/data/ScoreDenoise
++OTHER_NOISE_ROOT=/home/sapi/zhy/pointgpt-claude/data/other-noise
++```
++
++For five Gaussian conditions, run the three new T values with SOR off. The
++50K/3% condition is handled by the full visualization sweep below.
++
++```bash
++for res in 10000 50000; do
++  for noise in 0.01 0.02 0.03; do
++    if [[ "$res" == 50000 && "$noise" == 0.03 ]]; then continue; fi
+     CUDA_VISIBLE_DEVICES=0 python tools/benchmark_inference.py \
+       --config cfgs/PointGPT-L/finetune_scoredenoise.yaml \
+       --checkpoint "$CKPT" --data-root "$DATA_ROOT" \
+-      --resolution "$res" --noise "$noise" --steps 30 \
+-      --step-size "$eta" --decay "$gamma" --seed-ratio "$overlap" \
+-      --expected-clouds 20 \
+-      --output-dir "experiments/rebuttle_sensitivity/${res}_${noise}/${label}"
++      --noise-family gaussian --resolution "$res" --noise "$noise" \
++      --steps 15 25 35 --sor off --profile-flops --expected-clouds 20 \
++      --output-dir "experiments/rebuttle_Textra/gaussian/${res}_${noise}" || break 2
+   done
+ done
+ ```
+ 
+-Each directory contains its own `run_info.json`, `per_cloud.csv`, and
+-`summary.csv`. Compare CD, both directional P2M terms, total P2M, latency,
+-and peak memory. `r` changes the number of patches and thus inference cost.
+-If the actual test release has a different number of shapes, set
+-`--expected-clouds` to that verified count. Re-run an interrupted command
+-with the same settings/output directory plus `--resume`.
++For Gaussian 50K/3%, produce all seven T values in one directory and save
++every test shape as full-resolution world-coordinate `.xyz` files plus a
++fixed-camera `overview.png`. The PNG samples 4000 points per panel for quick
++inspection; use the `.xyz` files for detailed 3D inspection. Image creation
++and file output are outside the timed region.
++
++```bash
++CUDA_VISIBLE_DEVICES=0 python tools/benchmark_inference.py \
++  --config cfgs/PointGPT-L/finetune_scoredenoise.yaml \
++  --checkpoint "$CKPT" --data-root "$DATA_ROOT" \
++  --noise-family gaussian --resolution 50000 --noise 0.03 \
++  --steps 5 10 15 20 25 30 35 --sor off --profile-flops \
++  --visualize-clouds all --expected-clouds 20 \
++  --output-dir experiments/rebuttle_Textra/gaussian/50000_0.03
++```
++
++For covariance and Laplace noise, use the supplied `data/other-noise`
++directory pattern. Run SOR on for the paper-protocol table. The script also
++supports SOR off for a separate controlled analysis: change `for sor in on`
++to `for sor in on off` below if that additional sweep is needed. The two
++settings go to separate directories and have separate core versus
++SOR-inclusive latency/throughput columns.
++
++```bash
++for family in cov lap; do
++  for sor in on; do
++    for res in 10000 50000; do
++      for noise in 0.01 0.02 0.03; do
++        noisy_dir="$OTHER_NOISE_ROOT/PUNet_${res}_poisson_${noise}_${family}"
++        CUDA_VISIBLE_DEVICES=0 python tools/benchmark_inference.py \
++          --config cfgs/PointGPT-L/finetune_scoredenoise.yaml \
++          --checkpoint "$CKPT" --data-root "$DATA_ROOT" \
++          --noise-family "$family" --noisy-dir "$noisy_dir" \
++          --resolution "$res" --noise "$noise" --inference-sigma "$noise" \
++          --steps 5 10 15 20 25 30 35 --sor "$sor" \
++          --profile-flops --expected-clouds 20 \
++          --output-dir "experiments/rebuttle_Textra/${family}/${sor}/${res}_${noise}" || break 4
++      done
++    done
++  done
++done
++```
++
++The script checks exact clean/noisy shape-name pairing and mesh availability
++before any output is written. If a directory has a verified count other than
++20, adjust `--expected-clouds`; do not silently compare subsets. To resume,
++repeat the identical command for that one condition with `--resume`. Do not
++mix SOR-on and SOR-off rows, or profiler-covered FLOPs and total FLOPs, in
++the same comparison column.
+diff --git a/tools/benchmark_inference.py b/tools/benchmark_inference.py
+index 54948ce..391dd32 100644
+--- a/tools/benchmark_inference.py
++++ b/tools/benchmark_inference.py
+@@ -1,9 +1,9 @@
+-"""PUNet Gaussian inference cost/quality sweep for a fine-tuned PointGPT.
++"""PUNet inference cost/quality sweep for a fine-tuned PointGPT.
+ 
+ Run from the repository root on the same GPU used for the paper's evaluation.
+ The timed region is the existing full-cloud patch_based_denoise pipeline only:
+ FPS/KNN tiling, T network steps per patch, and cross-patch fusion. Loading,
+-host-to-device transfer, CD/P2M, and file output are outside the timer.
++host-to-device transfer, CD/P2M, SOR, and file output are outside that timer.
+ """
+ 
+ import argparse
+@@ -23,25 +23,35 @@ sys.path.insert(0, str(REPO_ROOT))
+ 
+ import numpy as np
+ import torch
++import matplotlib
++
++matplotlib.use('Agg')
+ 
+ from datasets.ScoreDenoiseDataset import ScoreDenoise
+ from extensions.chamfer_dist import ChamferDistanceL2
+ from tools import builder
+-from tools.runner_finetune import normalize_unit_sphere, patch_based_denoise
++from tools.runner_finetune import normalize_unit_sphere, patch_based_denoise, sor_filter
+ from utils import p2m_loss
+ from utils.config import cfg_from_yaml_file
+ 
+ 
+ RAW_FIELDS = [
+-    'resolution', 'noise', 'steps', 'step_size', 'decay', 'seed_ratio', 'cloud', 'n_points',
+-    'patches', 'model_forwards', 'latency_s', 'peak_allocated_gib',
++    'resolution', 'noise_family', 'noise', 'inference_sigma', 'sor',
++    'steps', 'step_size', 'decay', 'seed_ratio', 'cloud', 'n_points', 'output_points',
++    'patches', 'model_forwards', 'profiled_matmul_conv_gflops',
++    'latency_s', 'sor_latency_s', 'inference_plus_sor_latency_s', 'peak_allocated_gib',
+     'cd_x1e4', 'point_to_face_x1e4', 'face_to_point_x1e4', 'p2m_x1e4',
+ ]
+ SUMMARY_FIELDS = [
+-    'resolution', 'noise', 'steps', 'step_size', 'decay', 'seed_ratio', 'n_clouds',
+-    'n_points', 'patches_per_cloud', 'model_forwards_per_cloud',
++    'resolution', 'noise_family', 'noise', 'inference_sigma', 'sor',
++    'steps', 'step_size', 'decay', 'seed_ratio', 'n_clouds',
++    'n_points', 'mean_output_points', 'patches_per_cloud', 'model_forwards_per_cloud',
++    'profiled_matmul_conv_gflops_per_cloud',
+     'mean_latency_s', 'median_latency_s', 'std_latency_s', 'p95_latency_s',
+-    'clouds_per_s', 'points_per_s', 'max_peak_allocated_gib',
++    'mean_sor_latency_s', 'mean_inference_plus_sor_latency_s',
++    'clouds_per_s', 'points_per_s', 'clouds_per_s_including_sor',
++    'points_per_s_including_sor',
++    'max_peak_allocated_gib',
+     'mean_cd_x1e4', 'mean_point_to_face_x1e4',
+     'mean_face_to_point_x1e4', 'mean_p2m_x1e4',
+ ]
+@@ -54,6 +64,13 @@ def parse_args():
+     parser.add_argument('--data-root', default='data/ScoreDenoise')
+     parser.add_argument('--resolution', type=int, choices=(10000, 50000), required=True)
+     parser.add_argument('--noise', type=float, choices=(0.01, 0.02, 0.03), required=True)
++    parser.add_argument('--noise-family', choices=('gaussian', 'cov', 'lap'), default='gaussian')
++    parser.add_argument('--noisy-dir', default=None,
++                        help='Directory of paired noisy .xyz files; required for cov/lap')
++    parser.add_argument('--inference-sigma', type=float, default=None,
++                        help='Model noise input; default is the nominal --noise level')
++    parser.add_argument('--sor', choices=('off', 'on'), default='off',
++                        help='Apply the same SOR as main.py --test after core inference')
+     parser.add_argument('--steps', type=int, nargs='+', default=[1, 5, 10, 20, 30])
+     parser.add_argument('--step-size', type=float, default=None, help='Default: config.langevin.step_size (0.3)')
+     parser.add_argument('--decay', type=float, default=None, help='Default: config.langevin.decay (0.95)')
+@@ -63,6 +80,10 @@ def parse_args():
+     parser.add_argument('--warmup', type=int, default=1, help='Untimed runs before each T; default 1')
+     parser.add_argument('--seed', type=int, default=2024)
+     parser.add_argument('--expected-clouds', type=int, default=0, help='Optional completeness check, e.g. 20')
++    parser.add_argument('--profile-flops', action='store_true',
++                        help='Estimate counted model matmul/conv FLOPs outside the timed region')
++    parser.add_argument('--visualize-clouds', nargs='+', default=None, metavar='NAME',
++                        help='Save full .xyz and a comparison PNG for named clouds, or use all')
+     parser.add_argument('--output-dir', required=True)
+     parser.add_argument('--resume', action='store_true', help='Continue an interrupted run with identical settings')
+     args = parser.parse_args()
+@@ -74,14 +95,20 @@ def parse_args():
+         parser.error('--patch-batch must be positive')
+     if not math.isfinite(args.seed_ratio) or args.seed_ratio <= 0:
+         parser.error('--seed-ratio must be a finite positive number')
++    if args.noise_family != 'gaussian' and not args.noisy_dir:
++        parser.error('--noisy-dir is required for cov/lap noise')
++    if args.inference_sigma is not None and (not math.isfinite(args.inference_sigma) or args.inference_sigma <= 0):
++        parser.error('--inference-sigma must be a finite positive number')
++    if args.visualize_clouds and 'all' in args.visualize_clouds and len(args.visualize_clouds) != 1:
++        parser.error('Use --visualize-clouds all by itself, or list cloud names')
+     return args
+ 
+ 
+-def checked_names(data_root, resolution, noise, expected_clouds):
++def checked_names(data_root, resolution, noise, expected_clouds, noisy_dir_override=None):
+     resolution_dir = f'{resolution}_poisson'
+     noisy_label = f'PUNet_{resolution_dir}_{noise:.2f}'
+     clean_dir = data_root / 'PUNet' / 'pointclouds' / 'test' / resolution_dir
+-    noisy_dir = data_root / 'examples' / 'pointclouds' / 'test' / noisy_label
++    noisy_dir = noisy_dir_override or data_root / 'examples' / 'pointclouds' / 'test' / noisy_label
+     mesh_dir = data_root / 'PUNet' / 'meshes' / 'test'
+     for path in (clean_dir, noisy_dir, mesh_dir):
+         if not path.is_dir():
+@@ -97,7 +124,91 @@ def checked_names(data_root, resolution, noise, expected_clouds):
+         )
+     if expected_clouds and len(clean) != expected_clouds:
+         raise ValueError(f'Expected {expected_clouds} clouds, found {len(clean)}')
+-    return noisy_label, len(clean)
++    return noisy_label, noisy_dir, sorted(clean)
++
++
++def profile_model_flops(model, sample, sigma, patch_size, patch_batch, patches):
++    """Count profiler-supported model ops for each patch-batch size, then scale by T.
++
++    PyTorch counts matmul and 2D convolution FLOPs, not all model/custom CUDA
++    operations or FPS/KNN/fusion. Run this once, outside latency measurements.
++    """
++    full_batches, remainder = divmod(patches, patch_batch)
++    batch_sizes = ([patch_batch] if full_batches else []) + ([remainder] if remainder else [])
++    per_batch = {}
++    patch = sample[:patch_size].unsqueeze(0)
++    for batch_size in batch_sizes:
++        points = patch.repeat(batch_size, 1, 1)
++        noise_std = torch.full((batch_size,), sigma, dtype=points.dtype, device=points.device)
++        with torch.no_grad(), torch.profiler.profile(
++                activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
++                record_shapes=True, with_flops=True) as profiler:
++            output = model(points, None, 'val', '', noise_std=noise_std)
++            torch.cuda.synchronize(points.device)
++        per_batch[batch_size] = sum(int(event.flops or 0) for event in profiler.key_averages())
++        del output, points, noise_std
++    counted = full_batches * per_batch.get(patch_batch, 0) + per_batch.get(remainder, 0)
++    if counted <= 0:
++        raise RuntimeError('PyTorch profiler counted no FLOPs; rerun without --profile-flops and report this limitation')
++    return counted, per_batch
++
++
++def save_visualization_clouds(output_dir, cloud, steps, noisy_world, clean_world, denoised_world):
++    """Save full-resolution world-coordinate clouds outside the timed region."""
++    cloud_dir = output_dir / 'visualization' / cloud
++    cloud_dir.mkdir(parents=True, exist_ok=True)
++    for name, points in (
++            ('noisy.xyz', noisy_world), ('clean.xyz', clean_world),
++            (f'T{steps:02d}.xyz', denoised_world)):
++        path = cloud_dir / name
++        if name.startswith('T') or not path.exists():
++            np.savetxt(path, points.detach().cpu().numpy(), fmt='%.8f')
++
++
++def write_visualization_overviews(output_dir, clouds, steps, raw_path):
++    """Render the same camera and point sample for every T; retain full .xyz for zooming."""
++    import matplotlib.pyplot as plt
++
++    with raw_path.open(newline='', encoding='utf-8') as handle:
++        rows = {(row['cloud'], int(row['steps'])): row for row in csv.DictReader(handle)}
++    for cloud in clouds:
++        cloud_dir = output_dir / 'visualization' / cloud
++        panels = [('Noisy', cloud_dir / 'noisy.xyz'), ('Clean', cloud_dir / 'clean.xyz')]
++        panels += [(f'T={t}', cloud_dir / f'T{t:02d}.xyz') for t in steps]
++        missing = [str(path) for _, path in panels if not path.is_file()]
++        if missing:
++            raise RuntimeError(f'Missing visualization files for {cloud}: {missing}')
++        points = [np.loadtxt(path, dtype=np.float32) for _, path in panels]
++        if any(pcl.ndim != 2 or pcl.shape[1] != 3 or len(pcl) == 0 or not np.isfinite(pcl).all()
++               for pcl in points):
++            raise ValueError(f'Invalid visualization point cloud for {cloud}')
++        bounds = np.concatenate(points, axis=0)
++        mid = (bounds.max(axis=0) + bounds.min(axis=0)) / 2
++        half_span = max(float((bounds.max(axis=0) - bounds.min(axis=0)).max()) * 0.55, 1e-6)
++        ncols = 3
++        nrows = math.ceil(len(panels) / ncols)
++        fig = plt.figure(figsize=(4.5 * ncols, 4.3 * nrows))
++        for i, ((label, _), pcl) in enumerate(zip(panels, points), start=1):
++            ax = fig.add_subplot(nrows, ncols, i, projection='3d')
++            sample = pcl[np.linspace(0, len(pcl) - 1, min(len(pcl), 4000), dtype=int)]
++            ax.scatter(sample[:, 0], sample[:, 1], sample[:, 2], s=0.25, c='#243b53', rasterized=True)
++            ax.set(xlim=(mid[0] - half_span, mid[0] + half_span),
++                   ylim=(mid[1] - half_span, mid[1] + half_span),
++                   zlim=(mid[2] - half_span, mid[2] + half_span))
++            if hasattr(ax, 'set_box_aspect'):
++                ax.set_box_aspect((1, 1, 1))
++            ax.view_init(elev=20, azim=-60)
++            ax.set_axis_off()
++            if label.startswith('T='):
++                row = rows[(cloud, int(label[2:]))]
++                label += (f'\nCD={float(row["cd_x1e4"]):.3f}  P2M={float(row["p2m_x1e4"]):.3f}'
++                          f'\np2f={float(row["point_to_face_x1e4"]):.3f}  '
++                          f'f2p={float(row["face_to_point_x1e4"]):.3f}')
++            ax.set_title(label, fontsize=9)
++        fig.suptitle(f'{cloud} | same camera and axes | CD/P2M x1e4', fontsize=12)
++        fig.tight_layout()
++        fig.savefig(cloud_dir / 'overview.png', dpi=180)
++        plt.close(fig)
+ 
+ 
+ def run_denoise(model, noisy, sigma, patch_size, patch_batch,
+@@ -122,25 +233,37 @@ def write_summary(raw_path, summary_path, steps, n_clouds):
+             if len(group) != n_clouds or len({row['cloud'] for row in group}) != n_clouds:
+                 raise RuntimeError(f'Incomplete or duplicate results for T={t}')
+             latency = [float(row['latency_s']) for row in group]
++            sor_latency = [float(row['sor_latency_s']) for row in group]
++            inference_plus_sor = [float(row['inference_plus_sor_latency_s']) for row in group]
+             n_points = [int(row['n_points']) for row in group]
+             total_s = sum(latency)
++            total_with_sor_s = sum(inference_plus_sor)
+             writer.writerow({
+                 'resolution': group[0]['resolution'],
++                'noise_family': group[0]['noise_family'],
+                 'noise': group[0]['noise'],
++                'inference_sigma': group[0]['inference_sigma'],
++                'sor': group[0]['sor'],
+                 'steps': t,
+                 'step_size': group[0]['step_size'],
+                 'decay': group[0]['decay'],
+                 'seed_ratio': group[0]['seed_ratio'],
+                 'n_clouds': n_clouds,
+                 'n_points': group[0]['n_points'],
++                'mean_output_points': statistics.mean(int(row['output_points']) for row in group),
+                 'patches_per_cloud': group[0]['patches'],
+                 'model_forwards_per_cloud': group[0]['model_forwards'],
++                'profiled_matmul_conv_gflops_per_cloud': group[0]['profiled_matmul_conv_gflops'],
+                 'mean_latency_s': statistics.mean(latency),
+                 'median_latency_s': statistics.median(latency),
+                 'std_latency_s': statistics.stdev(latency) if n_clouds > 1 else 0.0,
+                 'p95_latency_s': float(np.percentile(latency, 95)),
++                'mean_sor_latency_s': statistics.mean(sor_latency),
++                'mean_inference_plus_sor_latency_s': statistics.mean(inference_plus_sor),
+                 'clouds_per_s': n_clouds / total_s,
+                 'points_per_s': sum(n_points) / total_s,
++                'clouds_per_s_including_sor': n_clouds / total_with_sor_s,
++                'points_per_s_including_sor': sum(n_points) / total_with_sor_s,
+                 'max_peak_allocated_gib': max(float(row['peak_allocated_gib']) for row in group),
+                 'mean_cd_x1e4': statistics.mean(float(row['cd_x1e4']) for row in group),
+                 'mean_point_to_face_x1e4': statistics.mean(float(row['point_to_face_x1e4']) for row in group),
+@@ -155,7 +278,11 @@ def main():
+     config_path = (launch_dir / args.config).resolve()
+     checkpoint_path = (launch_dir / args.checkpoint).resolve()
+     data_root = (launch_dir / args.data_root).resolve()
++    noisy_dir_override = (launch_dir / args.noisy_dir).resolve() if args.noisy_dir else None
+     output_dir = (launch_dir / args.output_dir).resolve()
++    inference_sigma = float(args.inference_sigma if args.inference_sigma is not None else args.noise)
++    if not args.resume and ((output_dir / 'run_info.json').exists() or (output_dir / 'per_cloud.csv').exists()):
++        raise FileExistsError(f'{output_dir} already contains a run; choose a new directory or use --resume')
+     for path in (config_path, checkpoint_path):
+         if not path.is_file():
+             raise FileNotFoundError(path)
+@@ -166,7 +293,7 @@ def main():
+     os.chdir(REPO_ROOT)
+     config = cfg_from_yaml_file(str(config_path))
+     if bool(getattr(config.surface_projection, 'enable', False)):
+-        raise ValueError('Disable surface_projection for the Gaussian no-post-processing comparison')
++        raise ValueError('Disable surface_projection for a comparable iteration sweep')
+     langevin = config.langevin
+     step_size = float(args.step_size if args.step_size is not None else langevin.step_size)
+     decay = float(args.decay if args.decay is not None else langevin.decay)
+@@ -177,13 +304,22 @@ def main():
+     if not math.isfinite(step_size) or step_size <= 0 or not math.isfinite(decay) or not (0 < decay <= 1) or patch_batch < 1:
+         raise ValueError('Invalid step size, decay, or patch batch')
+ 
+-    noisy_label, n_clouds = checked_names(data_root, args.resolution, args.noise, args.expected_clouds)
++    noisy_label, noisy_dir, cloud_names = checked_names(
++        data_root, args.resolution, args.noise, args.expected_clouds, noisy_dir_override)
++    n_clouds = len(cloud_names)
++    if args.visualize_clouds == ['all']:
++        visualize_clouds = cloud_names
++    else:
++        visualize_clouds = args.visualize_clouds or []
++        unknown = sorted(set(visualize_clouds) - set(cloud_names))
++        if unknown:
++            raise ValueError(f'Unknown --visualize-clouds names: {unknown}')
+     test_config = config.dataset.test._base_
+     test_config.ROOT = str(data_root)
+     test_config.TEST_RESOLUTION = f'{args.resolution}_poisson'
+     test_config.TEST_NOISY_DIR = noisy_label
+-    test_config.TEST_NOISE = args.noise
+-    test_config.TEST_NOISY_PATH = None
++    test_config.TEST_NOISE = inference_sigma
++    test_config.TEST_NOISY_PATH = str(noisy_dir)
+     test_config.TEST_CLEAN_PATH = None
+     test_config.TEST_MESH_ROOT = None
+     test_config.NUM_WORKERS = 0
+@@ -206,18 +342,37 @@ def main():
+     builder.load_model(model, str(checkpoint_path))
+     model = model.to(device).eval()
+     cd_metric = ChamferDistanceL2().to(device)
++    patches = max(1, int(seed_ratio * args.resolution / patch_size))
++    profiled_flops_per_step = None
++    profiled_flops_by_batch = None
++    if args.profile_flops:
++        first_noisy = next(iter(loader))[0][0].to(device)
++        profiled_flops_per_step, profiled_flops_by_batch = profile_model_flops(
++            model, first_noisy, inference_sigma, patch_size, patch_batch, patches)
++        del first_noisy
++        torch.cuda.synchronize(device)
+     checkpoint_stat = checkpoint_path.stat()
+     metadata = {
+         'config': str(config_path), 'checkpoint': str(checkpoint_path),
+         'checkpoint_bytes': checkpoint_stat.st_size,
+         'checkpoint_mtime_ns': checkpoint_stat.st_mtime_ns,
+-        'data_root': str(data_root), 'resolution': args.resolution,
+-        'noise': args.noise, 'steps': args.steps, 'step_size': step_size,
++        'data_root': str(data_root), 'noisy_dir': str(noisy_dir),
++        'resolution': args.resolution, 'noise_family': args.noise_family,
++        'noise': args.noise, 'inference_sigma': inference_sigma,
++        'sor': args.sor, 'visualize_clouds': visualize_clouds,
++        'steps': args.steps, 'step_size': step_size,
+         'decay': decay, 'patch_batch': patch_batch, 'patch_size': patch_size,
+         'seed_ratio': seed_ratio, 'fuse_tau_ratio': fuse_tau, 'warmup': args.warmup,
+         'metric_fields': ['cd_x1e4', 'point_to_face_x1e4', 'face_to_point_x1e4', 'p2m_x1e4'],
+-        'seed': args.seed, 'postprocessing': 'none',
++        'profile_flops': args.profile_flops,
++        'profiled_matmul_conv_flops_per_step': profiled_flops_per_step,
++        'profiled_matmul_conv_flops_by_patch_batch': (
++            {str(k): v for k, v in profiled_flops_by_batch.items()}
++            if profiled_flops_by_batch is not None else None),
++        'flops_scope': 'PyTorch profiler-counted model matmul/2D-conv only; excludes unsupported ops and FPS/KNN/fusion',
++        'seed': args.seed, 'postprocessing': 'SOR nb=20/std=2.0' if args.sor == 'on' else 'none',
+         'timed_region': 'FPS + KNN tiling + all iterative model steps + patch fusion',
++        'sor_timing': 'separate wall time after core inference; excludes CD/P2M and file output',
+         'memory_metric': 'torch.cuda.max_memory_allocated, includes model weights and inference tensors',
+         'gpu': torch.cuda.get_device_name(device), 'torch': torch.__version__,
+         'cuda': torch.version.cuda,
+@@ -246,7 +401,10 @@ def main():
+         metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding='utf-8')
+         done = set()
+ 
+-    print(f'GPU: {metadata["gpu"]}; clouds: {n_clouds}; steps: {args.steps}')
++    print(f'GPU: {metadata["gpu"]}; noise: {args.noise_family}/{args.noise:.2f}; '
++          f'SOR: {args.sor}; clouds: {n_clouds}; steps: {args.steps}')
++    if args.profile_flops:
++        print('FLOPs are profiler-counted model matmul/2D-conv estimates, not full-pipeline FLOPs.')
+     print('T=1 uses the same step_size as other rows; this is a one-step partial update.')
+     with raw_path.open('a' if args.resume else 'w', newline='', encoding='utf-8') as handle:
+         writer = csv.DictWriter(handle, fieldnames=RAW_FIELDS)
+@@ -259,7 +417,7 @@ def main():
+                     continue
+                 first_noisy, _, _, _, _, _ = next(iter(loader))
+                 warm_input = first_noisy[0].to(device)
+-                warm_sigma = torch.tensor([args.noise], dtype=torch.float32, device=device)
++                warm_sigma = torch.tensor([inference_sigma], dtype=torch.float32, device=device)
+                 for _ in range(args.warmup):
+                     warm_output = run_denoise(model, warm_input, warm_sigma, patch_size,
+                                               patch_batch, steps, step_size, decay, seed_ratio, fuse_tau)
+@@ -274,7 +432,7 @@ def main():
+                     if noisy.shape[1] != args.resolution or clean.shape[1] != args.resolution:
+                         raise ValueError(f'{cloud}: expected {args.resolution} points in both clouds')
+                     noisy_gpu = noisy[0].to(device)
+-                    sigma_gpu = torch.tensor([args.noise], dtype=torch.float32, device=device)
++                    sigma_gpu = torch.tensor([inference_sigma], dtype=torch.float32, device=device)
+                     torch.manual_seed(args.seed)
+                     torch.cuda.manual_seed_all(args.seed)
+                     torch.cuda.synchronize(device)
+@@ -286,11 +444,19 @@ def main():
+                     latency_s = time.perf_counter() - start
+                     peak_gib = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+ 
++                    sor_latency_s = 0.0
++                    if args.sor == 'on':
++                        sor_start = time.perf_counter()
++                        denoised_eval = sor_filter(denoised)
++                        sor_latency_s = time.perf_counter() - sor_start
++                    else:
++                        denoised_eval = denoised
++
+                     # Match test() metrics, but keep mesh loading and CUDA metric kernels untimed.
+                     center_gpu = centers[0].to(device)
+                     scale_gpu = scales[0].to(device)
+                     clean_world = clean.to(device) * scale_gpu + center_gpu
+-                    denoised_world = denoised.unsqueeze(0) * scale_gpu + center_gpu
++                    denoised_world = denoised_eval.to(device).unsqueeze(0) * scale_gpu + center_gpu
+                     p2m_components = p2m_loss.compute_p2m_components(denoised_world[0], cloud, 'test')
+                     _, clean_center, clean_scale = normalize_unit_sphere(clean_world)
+                     cd = cd_metric((denoised_world - clean_center) / clean_scale,
+@@ -299,17 +465,30 @@ def main():
+                     n_points = int(noisy_gpu.shape[0])
+                     patches = max(1, int(seed_ratio * n_points / patch_size))
+                     row = {
+-                        'resolution': args.resolution, 'noise': args.noise,
++                        'resolution': args.resolution, 'noise_family': args.noise_family,
++                        'noise': args.noise, 'inference_sigma': inference_sigma,
++                        'sor': args.sor,
+                         'steps': steps, 'step_size': step_size, 'decay': decay,
+                         'seed_ratio': seed_ratio,
+-                        'cloud': cloud, 'n_points': n_points, 'patches': patches,
++                        'cloud': cloud, 'n_points': n_points,
++                        'output_points': int(denoised_world.shape[1]), 'patches': patches,
+                         'model_forwards': math.ceil(patches / patch_batch) * steps,
+-                        'latency_s': latency_s, 'peak_allocated_gib': peak_gib,
++                        'profiled_matmul_conv_gflops': (
++                            profiled_flops_per_step * steps / 1e9
++                            if profiled_flops_per_step is not None else ''),
++                        'latency_s': latency_s, 'sor_latency_s': sor_latency_s,
++                        'inference_plus_sor_latency_s': latency_s + sor_latency_s,
++                        'peak_allocated_gib': peak_gib,
+                         'cd_x1e4': float(cd.item()),
+                         'point_to_face_x1e4': float(p2m_components['point_to_face'].item() * 1e4),
+                         'face_to_point_x1e4': float(p2m_components['face_to_point'].item() * 1e4),
+                         'p2m_x1e4': float(p2m_components['p2m'].item() * 1e4),
+                     }
++                    if cloud in visualize_clouds:
++                        noisy_world = noisy_gpu.unsqueeze(0) * scale_gpu + center_gpu
++                        save_visualization_clouds(
++                            output_dir, cloud, steps, noisy_world[0], clean_world[0], denoised_world[0])
++                        del noisy_world
+                     writer.writerow(row)
+                     handle.flush()
+                     done.add((steps, cloud))
+@@ -317,11 +496,14 @@ def main():
+                           f'{latency_s:.3f}s CD={row["cd_x1e4"]:.3f} '
+                           f'point→face={row["point_to_face_x1e4"]:.3f} '
+                           f'face→point={row["face_to_point_x1e4"]:.3f} '
+-                          f'P2M={row["p2m_x1e4"]:.3f} peak={peak_gib:.2f} GiB', flush=True)
+-                    del (noisy_gpu, sigma_gpu, denoised, center_gpu, scale_gpu,
++                          f'P2M={row["p2m_x1e4"]:.3f} peak={peak_gib:.2f} GiB '
++                          f'SOR={sor_latency_s:.3f}s', flush=True)
++                    del (noisy_gpu, sigma_gpu, denoised, denoised_eval, center_gpu, scale_gpu,
+                          clean_world, denoised_world, clean_center, clean_scale, cd, p2m_components)
+ 
+     write_summary(raw_path, summary_path, args.steps, n_clouds)
++    if visualize_clouds:
++        write_visualization_overviews(output_dir, visualize_clouds, args.steps, raw_path)
+     print(f'Complete: {summary_path}')
+ 
+ 
