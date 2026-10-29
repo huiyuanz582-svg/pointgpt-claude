@@ -64,7 +64,8 @@ def parse_args():
     parser.add_argument('--data-root', default='data/ScoreDenoise')
     parser.add_argument('--dataset', choices=('PUNet', 'PCNet'), default='PUNet')
     parser.add_argument('--resolution', type=int, choices=(10000, 50000), required=True)
-    parser.add_argument('--noise', type=float, choices=(0.01, 0.02, 0.03), required=True)
+    parser.add_argument('--noise', type=float, required=True,
+                        help='Nominal noise level (e.g. 0.01, 0.025); selects the test condition and default model sigma')
     parser.add_argument('--noise-family', choices=('gaussian', 'cov', 'lap'), default='gaussian')
     parser.add_argument('--noisy-dir', default=None,
                         help='Directory of paired noisy .xyz files; required for cov/lap and PCNet')
@@ -72,8 +73,11 @@ def parse_args():
                         help='Clean point-cloud root containing <resolution>_poisson/; required for PCNet')
     parser.add_argument('--mesh-root', default=None,
                         help='Mesh root containing test/<cloud>.off; required for PCNet')
-    parser.add_argument('--inference-sigma', type=float, default=None,
-                        help='Model noise input; default is the nominal --noise level')
+    sigma_group = parser.add_mutually_exclusive_group()
+    sigma_group.add_argument('--inference-sigma', type=float, default=None,
+                             help='Model noise input; default is the nominal --noise level')
+    sigma_group.add_argument('--inference-sigma-ratio', type=float, default=None,
+                             help='Model noise input as a multiple of nominal --noise, for sigma0 sensitivity sweeps')
     parser.add_argument('--sor', choices=('off', 'on'), default='off',
                         help='Apply the same SOR as main.py --test after core inference')
     parser.add_argument('--steps', type=int, nargs='+', default=[1, 5, 10, 20, 30])
@@ -100,12 +104,17 @@ def parse_args():
         parser.error('--patch-batch must be positive')
     if not math.isfinite(args.seed_ratio) or args.seed_ratio <= 0:
         parser.error('--seed-ratio must be a finite positive number')
+    if not math.isfinite(args.noise) or args.noise <= 0:
+        parser.error('--noise must be a finite positive number')
     if args.noise_family != 'gaussian' and not args.noisy_dir:
         parser.error('--noisy-dir is required for cov/lap noise')
     if args.dataset == 'PCNet' and not (args.noisy_dir and args.clean_root and args.mesh_root):
         parser.error('PCNet requires --noisy-dir, --clean-root, and --mesh-root')
     if args.inference_sigma is not None and (not math.isfinite(args.inference_sigma) or args.inference_sigma <= 0):
         parser.error('--inference-sigma must be a finite positive number')
+    if args.inference_sigma_ratio is not None and (
+            not math.isfinite(args.inference_sigma_ratio) or args.inference_sigma_ratio <= 0):
+        parser.error('--inference-sigma-ratio must be a finite positive number')
     if args.visualize_clouds and 'all' in args.visualize_clouds and len(args.visualize_clouds) != 1:
         parser.error('Use --visualize-clouds all by itself, or list cloud names')
     return args
@@ -114,7 +123,7 @@ def parse_args():
 def checked_names(data_root, dataset, resolution, noise, expected_clouds,
                   clean_root_override=None, noisy_dir_override=None, mesh_root_override=None):
     resolution_dir = f'{resolution}_poisson'
-    noisy_label = f'{dataset}_{resolution_dir}_{noise:.2f}'
+    noisy_label = f'{dataset}_{resolution_dir}_{noise:g}'
     clean_root = clean_root_override or data_root / dataset / 'pointclouds' / 'test'
     noisy_dir = noisy_dir_override or data_root / 'examples' / 'pointclouds' / 'test' / noisy_label
     mesh_root = mesh_root_override or data_root / dataset / 'meshes'
@@ -293,7 +302,10 @@ def main():
     noisy_dir_override = (launch_dir / args.noisy_dir).resolve() if args.noisy_dir else None
     mesh_root_override = (launch_dir / args.mesh_root).resolve() if args.mesh_root else None
     output_dir = (launch_dir / args.output_dir).resolve()
-    inference_sigma = float(args.inference_sigma if args.inference_sigma is not None else args.noise)
+    inference_sigma = float(
+        args.inference_sigma if args.inference_sigma is not None else
+        args.noise * args.inference_sigma_ratio if args.inference_sigma_ratio is not None else
+        args.noise)
     if not args.resume and ((output_dir / 'run_info.json').exists() or (output_dir / 'per_cloud.csv').exists()):
         raise FileExistsError(f'{output_dir} already contains a run; choose a new directory or use --resume')
     for path in (config_path, checkpoint_path):
@@ -416,7 +428,7 @@ def main():
         metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding='utf-8')
         done = set()
 
-    print(f'GPU: {metadata["gpu"]}; dataset: {args.dataset}; noise: {args.noise_family}/{args.noise:.2f}; '
+    print(f'GPU: {metadata["gpu"]}; dataset: {args.dataset}; noise: {args.noise_family}/{args.noise:g}; '
           f'SOR: {args.sor}; clouds: {n_clouds}; steps: {args.steps}')
     if args.profile_flops:
         print('FLOPs are profiler-counted model matmul/2D-conv estimates, not full-pipeline FLOPs.')
@@ -508,7 +520,7 @@ def main():
                     writer.writerow(row)
                     handle.flush()
                     done.add((steps, cloud))
-                    print(f'{args.resolution} {args.noise:.2f} T={steps:2d} {cloud}: '
+                    print(f'{args.resolution} {args.noise:g} T={steps:2d} {cloud}: '
                           f'{latency_s:.3f}s CD={row["cd_x1e4"]:.3f} '
                           f'point→face={row["point_to_face_x1e4"]:.3f} '
                           f'face→point={row["face_to_point_x1e4"]:.3f} '
