@@ -2,9 +2,11 @@ data/
 KNN_CUDA/
 pretrainModel/
 experiments/
+rebuttle修改实验结果/
 /extensions/
 # 忽略所有 .pyc 文件
 *.pyc
 
 # 忽略 Python 缓存目录
 __pycache__/
+diagnostics/
