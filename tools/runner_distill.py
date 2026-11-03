@@ -1,4 +1,4 @@
-"""16 -> 4 trajectory distillation with fixed or epoch-level PCD curriculum."""
+"""10/16 -> 4 trajectory distillation; epoch-level PCD remains 16 -> 4 only."""
 
 import argparse
 import copy
@@ -22,6 +22,7 @@ from utils.training_input import (resolve_training_input, teacher_input_probabil
                                   summarize_input_stages, summarize_training_targets)
 
 TEACHER_NODES = (0, 4, 8, 12, 16)
+TEACHER10_NODES = (0, 2, 5, 7, 10)
 NONUNIFORM_NODES = (0, 7, 10, 13, 16)
 TEACHER_ETA = 0.3
 TEACHER_DECAY = 0.95
@@ -31,8 +32,9 @@ PCD_EPS = 1e-12
 def _teacher_nodes(nodes):
     nodes = tuple(nodes)
     if (len(nodes) != 5 or any(type(t) is not int for t in nodes) or
-            nodes[0] != 0 or nodes[-1] != 16 or any(t >= u for t, u in zip(nodes[:-1], nodes[1:]))):
-        raise ValueError('Teacher nodes require integer 0 < t1 < t2 < t3 < 16, with endpoints 0 and 16')
+            nodes[0] != 0 or nodes[-1] not in (10, 16) or
+            any(t >= u for t, u in zip(nodes[:-1], nodes[1:]))):
+        raise ValueError('Teacher nodes require five increasing integers, starting at 0 and ending at 10 or 16')
     return nodes
 
 
@@ -46,6 +48,8 @@ def dynamic_pcd_options(config):
     if any(key not in options for key in required):
         raise ValueError('dynamic_pcd requires ' + ', '.join(required))
     options['initial_nodes'] = list(_teacher_nodes(options['initial_nodes']))
+    if options['initial_nodes'][-1] != 16:
+        raise ValueError('dynamic_pcd is supported only for the legacy 16-to-4 schedule')
     for key in ('target', 'lambda_balance'):
         options[key] = float(options[key])
         if not math.isfinite(options[key]) or options[key] < 0:
@@ -67,11 +71,14 @@ def configured_teacher_nodes(config):
     dynamic = dynamic_pcd_options(config)
     nodes = _teacher_nodes(dynamic['initial_nodes'] if dynamic is not None else
                            specification['teacher_nodes'] if specification is not None else TEACHER_NODES)
-    expected = {'fixed': TEACHER_NODES, 'fixed_nonuniform': NONUNIFORM_NODES}
-    if dynamic is None and (mode not in expected or nodes != expected[mode]):
+    expected = {'fixed': (TEACHER_NODES, TEACHER10_NODES),
+                'fixed_nonuniform': (NONUNIFORM_NODES,)}
+    if dynamic is None and (mode not in expected or nodes not in expected[mode]):
         raise ValueError('curriculum_mode and distillation.teacher_nodes must match')
     if specification is not None and dict(specification) != schedule(nodes):
-        raise ValueError('Teacher/Student schedule differs from the supported 16-to-4 protocol')
+        raise ValueError('Teacher/Student schedule differs from the supported 10/16-to-4 protocol')
+    if nodes[-1] == 10 and getattr(config, 'pcd_dynamic', {}).get('shadow_enabled', False):
+        raise ValueError('10-to-4 uses fixed nodes; shadow search is supported only for 16-to-4')
     return nodes
 
 
@@ -80,7 +87,7 @@ def schedule(teacher_nodes=TEACHER_NODES):
     # Preserve legacy equal-interval checkpoint metadata exactly.
     decay = TEACHER_DECAY ** 4 if nodes == TEACHER_NODES else [
         TEACHER_DECAY ** (u - t) for t, u in zip(nodes[:-1], nodes[1:])]
-    return dict(teacher_nodes=list(nodes), teacher_steps=16,
+    return dict(teacher_nodes=list(nodes), teacher_steps=nodes[-1],
                 teacher_eta=TEACHER_ETA, teacher_decay=TEACHER_DECAY,
                 student_steps=4, student_eta=1.0,
                 student_decay=decay)
@@ -214,7 +221,7 @@ def restore_student_optimizer(optimizer, state, student):
 
 def capture_teacher(teacher, noisy, sigma0, patch_batch=1, return_full_trajectory=False,
                     teacher_nodes=TEACHER_NODES):
-    """同一 baseline patch 的原 16 步；可额外缓存所有状态，更新公式和模型调用不变。"""
+    """Capture the configured 10/16-step Teacher endpoint with baseline updates."""
     import torch
     teacher_nodes = _teacher_nodes(teacher_nodes)
     if noisy.ndim != 3 or noisy.shape[-1] != 3 or noisy.shape[0] < 1 or patch_batch < 1:
@@ -228,7 +235,7 @@ def capture_teacher(teacher, noisy, sigma0, patch_batch=1, return_full_trajector
             x = noisy[offset:offset + patch_batch].detach().to(device)
             sigma = sigmas[offset:offset + patch_batch].clone()
             states = [x.detach().cpu().clone()]
-            for step in range(16):
+            for step in range(teacher_nodes[-1]):
                 # 与 runner_finetune.patch_based_denoise 的 patch 内更新逐式一致。
                 out = teacher(x, None, 'val', '', noise_std=sigma)
                 eps = (out - x) / sigma[:, None, None]
@@ -795,10 +802,10 @@ def validate_trajectory(student, bank, patch_batch, teacher_nodes=TEACHER_NODES)
     try:
         with torch.no_grad():
             for nodes, sigma0 in bank:
-                if nodes.shape[0] == 17:
+                if nodes.shape[0] == teacher_nodes[-1] + 1:
                     nodes = nodes[list(teacher_nodes)]
                 if nodes.shape[0] != 5:
-                    raise ValueError('Validation bank requires five selected or seventeen full Teacher states')
+                    raise ValueError('Validation bank requires five selected or all configured Teacher states')
                 sigmas = _sigma_batch(sigma0, nodes.shape[1], device, nodes.dtype)
                 for offset in range(0, nodes.shape[1], patch_batch):
                     batch_nodes = nodes[:, offset:offset + patch_batch].detach().to(device)
@@ -1162,6 +1169,7 @@ def train(args, config, builder, device, checkpoint_path, output):
             saved_at = timestamp()
             record = dict(epoch=epoch, patches=seen, stage_losses=means,
                           curriculum_mode=getattr(config, 'curriculum_mode', 'fixed'),
+                          teacher_steps=teacher_nodes[-1], student_steps=4,
                           teacher_nodes=list(teacher_nodes), stage_gaps=stage_gaps,
                           mean_D_move=pcd_means[:, 0].tolist() if teacher_forced else None,
                           mean_E_imit=pcd_means[:, 1].tolist() if teacher_forced else None,
@@ -1302,6 +1310,7 @@ def test(args, config, builder, device, checkpoint_path, output):
     options = _patch_options(config, config.test_patch_batch)
     ops = baseline_metric_ops(config, device)
     protocol = dict(mode='student_continuous_4_step_rollout', reference='tools/runner_finetune.py::test',
+                    teacher_steps=teacher_nodes[-1], student_steps=4,
                     teacher_nodes=list(teacher_nodes),
                     cd='ChamferDistanceL2; clean-cloud unit sphere; x1e4',
                     p2m='compute_p2m(test); bidirectional mesh unit sphere; x1e4',
