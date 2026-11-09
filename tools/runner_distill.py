@@ -20,6 +20,8 @@ from utils.curriculum_config import resolve_curriculum, require_supported_resume
 from utils.training_input import (resolve_training_input, teacher_input_probability,
                                   training_input_metadata, sample_teacher_input_mask,
                                   summarize_input_stages, summarize_training_targets)
+from utils.teacher_endpoint import (resolve_teacher_endpoint, endpoint_grad_ratio,
+                                    endpoint_metadata, accumulate_teacher_endpoint)
 
 TEACHER_NODES = (0, 4, 8, 12, 16)
 TEACHER10_NODES = (0, 2, 5, 7, 10)
@@ -915,6 +917,10 @@ def _save_checkpoint(path, student, optimizer, epoch, teacher_path, config, sele
     if training_input['type'] != 'teacher_forced':
         payload['training_input'] = training_input
         payload['training_input_protocol'] = training_input_metadata(training_input, epoch)
+    endpoint = resolve_teacher_endpoint(config)
+    if endpoint is not None:
+        payload['teacher_endpoint'] = endpoint
+        payload['teacher_endpoint_protocol'] = endpoint_metadata(endpoint)
     if optimizer is not None:
         payload['optimizer'] = optimizer.state_dict()
     torch.save(payload, temporary)
@@ -949,6 +955,7 @@ def save_epoch_checkpoints(output, student, optimizer, epoch, teacher_path, conf
 def train(args, config, builder, device, checkpoint_path, output):
     resolved_curriculum = resolve_curriculum(config)
     training_input = resolved_curriculum['training_input']
+    endpoint = resolve_teacher_endpoint(config)
     teacher_forced = training_input['type'] == 'teacher_forced'
     matched_targets = training_input.get('student_target') == 'teacher_from_student_input'
     if getattr(args, 'resume', None):
@@ -1028,6 +1035,9 @@ def train(args, config, builder, device, checkpoint_path, output):
     print(f'[sampling] dataset_patches={len(loader.dataset)} '
           f'effective_patches={len(loader) * loader.batch_size} '
           f'batch_size={loader.batch_size} drop_last={loader.drop_last}', flush=True)
+    if endpoint is not None:
+        print('[teacher-endpoint] continuous Student4 -> cached Teacher10 from same T0; '
+              f'eval-mode autograd; options={endpoint}', flush=True)
     with (output / 'train.jsonl').open('w', encoding='utf-8') as log:
         for epoch in range(start_epoch, epochs + 1):
             epoch_started = timestamp()
@@ -1038,6 +1048,12 @@ def train(args, config, builder, device, checkpoint_path, output):
             pcd_totals = np.zeros((4, 3), dtype=np.float64)
             input_totals = np.zeros((4, 4), dtype=np.float64)
             target_totals = np.zeros((4, 3), dtype=np.int64) if matched_targets else None
+            if endpoint is not None:
+                endpoint_totals = dict(loss=0.0, weighted_loss=0.0, weight=0.0,
+                                       actual_grad_ratio=0.0, local_grad_norm=0.0,
+                                       endpoint_grad_norm=0.0)
+                endpoint_weight_min, endpoint_weight_max = float('inf'), 0.0
+                endpoint_ratio = endpoint_grad_ratio(endpoint, epoch)
             teacher_probability = teacher_input_probability(training_input, epoch)
             input_generator = None
             if training_input['type'] == 'scheduled_rollout':
@@ -1104,6 +1120,16 @@ def train(args, config, builder, device, checkpoint_path, output):
                         if matched_targets:
                             target_totals += np.asarray(target_diagnostics, dtype=np.int64)
                     totals += np.asarray(losses) * size
+                if endpoint is not None:
+                    endpoint_result = accumulate_teacher_endpoint(
+                        student, nodes, sigmas, endpoint, epoch, forward_student_interval,
+                        teacher_nodes=teacher_nodes, teacher_decay=TEACHER_DECAY)
+                    for key in endpoint_totals:
+                        value = endpoint_result[key]
+                        if value is not None:
+                            endpoint_totals[key] += value * count
+                    endpoint_weight_min = min(endpoint_weight_min, endpoint_result['weight'])
+                    endpoint_weight_max = max(endpoint_weight_max, endpoint_result['weight'])
                 nonzero = check_gradients(teacher, student)
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     student.parameters(), float(config.grad_norm_clip), error_if_nonfinite=True)
@@ -1178,6 +1204,19 @@ def train(args, config, builder, device, checkpoint_path, output):
                           loss_traj=sum(means) / 4, **validation,
                           best_val_rollout_score=best_score if math.isfinite(best_score) else None,
                           best_epoch=best_epoch, is_best=improved)
+            if endpoint is not None:
+                endpoint_means = {key: value / seen for key, value in endpoint_totals.items()}
+                record.update(
+                    loss_teacher_endpoint=endpoint_means['loss'] if endpoint_ratio > 0 else None,
+                    loss_teacher_endpoint_weighted=endpoint_means['weighted_loss'],
+                    loss_total=sum(means) / 4 + endpoint_means['weighted_loss'],
+                    endpoint_target_grad_ratio=endpoint_ratio,
+                    endpoint_actual_grad_ratio_mean=endpoint_means['actual_grad_ratio'],
+                    endpoint_weight_mean=endpoint_means['weight'],
+                    endpoint_weight_min=endpoint_weight_min, endpoint_weight_max=endpoint_weight_max,
+                    endpoint_local_grad_norm_mean=endpoint_means['local_grad_norm'] if endpoint_ratio > 0 else None,
+                    endpoint_grad_norm_mean=endpoint_means['endpoint_grad_norm'] if endpoint_ratio > 0 else None,
+                    endpoint_log_aggregation='sample_weighted_optimizer_batch_means_before_combined_clipping')
             record.update(training_input=training_input['type'],
                           training_input_protocol=training_input_metadata(training_input, epoch),
                           training_input_stages=summarize_input_stages(input_totals),
@@ -1423,6 +1462,7 @@ def main():
     from utils.config import cfg_from_yaml_file
     config = cfg_from_yaml_file(str(config_path))
     resolved_curriculum = resolve_curriculum(config)
+    endpoint = resolve_teacher_endpoint(config)
     if args.resume:
         require_supported_resume(resolved_curriculum)
     teacher_nodes = configured_teacher_nodes(config)
@@ -1448,6 +1488,14 @@ def main():
                        gpu_memory_limit=gpu_memory_limit)
         if args.mode == 'train':
             manifest['training_input_protocol'] = training_input_metadata(resolved_curriculum['training_input'])
+        if endpoint is not None:
+            manifest['teacher_endpoint_protocol'] = endpoint_metadata(endpoint)
+            source_files = ('tools/runner_distill.py', 'utils/teacher_endpoint.py',
+                            'utils/training_input.py', 'models/PointGPT.py', 'models/step_condition.py',
+                            'tools/runner_finetune.py', 'datasets/ScoreDenoiseDataset.py')
+            manifest['source_sha256'] = {
+                name: hashlib.sha256((REPO_ROOT / name).read_bytes()).hexdigest()
+                for name in source_files}
         if resolved_curriculum['metric']['type'] == 'rollout_aware':
             manifest['rollout_curriculum'] = resolved_curriculum
         json.dump(manifest, handle, indent=2, ensure_ascii=False)
