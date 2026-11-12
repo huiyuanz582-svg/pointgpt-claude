@@ -12,7 +12,8 @@ import numpy as np
 import torch
 
 from utils.teacher_endpoint import (accumulate_teacher_endpoint, endpoint_grad_ratio,
-                                    gradient_norm, resolve_teacher_endpoint)
+                                    endpoint_metadata, gradient_norm, pre_bn_conv_biases,
+                                    resolve_teacher_endpoint)
 
 
 def options(patch_batch=1, checkpointing=True):
@@ -38,6 +39,23 @@ class ToyStudent(torch.nn.Module):
         return points * self.weights[stage] + self.bias * sigma[:, None, None]
 
 
+class ToyConvStudent(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.encoder = torch.nn.Sequential(torch.nn.Conv1d(3, 3, 1), torch.nn.BatchNorm1d(3))
+        self.decoder = torch.nn.Linear(3, 3)
+        self.double()
+        with torch.no_grad():
+            self.encoder[0].weight.copy_(torch.eye(3, dtype=torch.float64).unsqueeze(-1) * 0.8)
+            self.encoder[0].bias.fill_(0.2)
+            self.decoder.weight.copy_(torch.eye(3, dtype=torch.float64) * 0.9)
+            self.decoder.bias.fill_(0.01)
+
+    def forward(self, points, sigma, start, stop):
+        encoded = self.encoder(points.transpose(1, 2)).transpose(1, 2)
+        return self.decoder(encoded) + sigma[:, None, None] * 0.1
+
+
 def forward(model, points, sigma, start, stop):
     return model(points, sigma, start, stop)
 
@@ -54,6 +72,104 @@ def set_local_gradients(model):
 
 
 class TeacherEndpointTests(unittest.TestCase):
+    def test_optional_mask_preserves_legacy_options_and_rejects_non_bool(self):
+        config = dict(curriculum_mode='fixed', distillation=dict(teacher_nodes=[0, 2, 5, 7, 10]),
+                      training_input=dict(type='scheduled_rollout', student_target='teacher_from_student_input'),
+                      teacher_endpoint=options())
+        self.assertEqual(resolve_teacher_endpoint(config), options())
+        config['teacher_endpoint']['mask_pre_bn_conv_bias'] = True
+        self.assertEqual(resolve_teacher_endpoint(config), config['teacher_endpoint'])
+        config['teacher_endpoint']['mask_pre_bn_conv_bias'] = False
+        self.assertEqual(resolve_teacher_endpoint(config), config['teacher_endpoint'])
+        config['teacher_endpoint']['mask_pre_bn_conv_bias'] = 1
+        with self.assertRaisesRegex(ValueError, 'must be bool'):
+            resolve_teacher_endpoint(config)
+
+    def test_masked_gradient_matches_reference_and_preserves_excluded_local_gradient(self):
+        model = ToyConvStudent().train()
+        set_local_gradients(model)
+        model.encoder[0].bias.grad.fill_(1e4)
+        reference = copy.deepcopy(model).eval()
+        nodes, sigma = fixtures()
+        state = nodes[0]
+        for start, stop in zip((0, 2, 5, 7), (2, 5, 7, 10)):
+            state = reference(state, sigma * 0.95 ** start, start, stop)
+        loss = (state - nodes[-1]).square().sum(-1).mean()
+        endpoint = dict(zip(dict(reference.named_parameters()),
+                            torch.autograd.grad(loss, list(reference.parameters()))))
+        self.assertGreater(float(endpoint['encoder.0.bias'].norm()), 0)
+        excluded = pre_bn_conv_biases(model, torch)
+        self.assertEqual(excluded, ['encoder.0.bias'])
+        local = {name: parameter.grad.clone() for name, parameter in model.named_parameters()}
+        values = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
+        eligible = [name for name in local if name not in excluded]
+        local_norm = gradient_norm(local[name] for name in eligible)
+        endpoint_norm = gradient_norm(endpoint[name] for name in eligible)
+        weight = min(1.0, 0.1 * local_norm / endpoint_norm)
+        settings = dict(options(), mask_pre_bn_conv_bias=True)
+        original_bias_grad = model.encoder[0].bias.grad
+        buffers = {name: value.clone() for name, value in model.named_buffers()}
+        result = accumulate_teacher_endpoint(model, nodes, sigma, settings, 6, forward)
+        self.assertEqual(result['excluded_parameters'], excluded)
+        self.assertIs(model.encoder[0].bias.grad, original_bias_grad)
+        self.assertAlmostEqual(result['weight'], weight, places=12)
+        self.assertAlmostEqual(result['local_grad_norm'], local_norm, places=12)
+        self.assertAlmostEqual(result['endpoint_grad_norm'], endpoint_norm, places=12)
+        self.assertAlmostEqual(result['actual_grad_ratio'], 0.1, places=12)
+        for name, parameter in model.named_parameters():
+            expected = local[name] if name in excluded else local[name] + weight * endpoint[name]
+            torch.testing.assert_close(parameter.grad, expected)
+            torch.testing.assert_close(parameter, values[name])
+            self.assertTrue(parameter.requires_grad)
+        for name, value in model.named_buffers():
+            torch.testing.assert_close(value, buffers[name])
+        self.assertTrue(all(module.training for module in model.modules()))
+        expected_dot = sum(float(torch.dot(local[name].reshape(-1), endpoint[name].reshape(-1)))
+                           for name in eligible)
+        self.assertAlmostEqual(result['grad_cosine'], expected_dot / (local_norm * endpoint_norm), places=12)
+        for group, metrics in result['group_diagnostics'].items():
+            names = [name for name in eligible if name.split('.')[0] == group]
+            left = gradient_norm(local[name] for name in names)
+            right = gradient_norm(endpoint[name] for name in names)
+            dot = sum(float(torch.dot(local[name].reshape(-1), endpoint[name].reshape(-1))) for name in names)
+            self.assertAlmostEqual(metrics['local_norm'], left, places=12)
+            self.assertAlmostEqual(metrics['endpoint_norm'], right, places=12)
+            self.assertAlmostEqual(metrics['weighted_endpoint_to_local_ratio'], weight * right / left, places=12)
+            self.assertAlmostEqual(metrics['cosine_to_local'], dot / (left * right), places=12)
+        self.assertAlmostEqual(sum(g['endpoint_squared_norm_fraction']
+                                   for g in result['group_diagnostics'].values()), 1.0, places=12)
+        self.assertEqual(endpoint_metadata(settings, model)['excluded_parameters'], excluded)
+
+    def test_masked_microbatching_and_checkpointing_preserve_gradient_and_weight(self):
+        nodes, sigma = fixtures()
+        results = []
+        for batch, checkpointing in ((1, True), (3, True), (1, False), (3, False)):
+            model = ToyConvStudent().train()
+            set_local_gradients(model)
+            settings = dict(options(batch, checkpointing), mask_pre_bn_conv_bias=True)
+            result = accumulate_teacher_endpoint(model, nodes, sigma, settings, 6, forward)
+            results.append((result, [p.grad.clone() for p in model.parameters()]))
+        for result, gradients in results[1:]:
+            self.assertAlmostEqual(result['weight'], results[0][0]['weight'], places=12)
+            self.assertAlmostEqual(result['grad_cosine'], results[0][0]['grad_cosine'], places=12)
+            for actual, expected in zip(gradients, results[0][1]):
+                torch.testing.assert_close(actual, expected)
+
+    def test_masked_zero_local_norm_logs_undefined_cosine_and_preserves_bias(self):
+        model = ToyConvStudent()
+        model.encoder[0].bias.grad = torch.full_like(model.encoder[0].bias, 1e4)
+        original = model.encoder[0].bias.grad.clone()
+        nodes, sigma = fixtures()
+        result = accumulate_teacher_endpoint(model, nodes, sigma,
+                                             dict(options(), mask_pre_bn_conv_bias=True), 6, forward)
+        self.assertEqual(result['local_grad_norm'], 0)
+        self.assertEqual(result['weight'], 0)
+        self.assertIsNone(result['grad_cosine'])
+        for metrics in result['group_diagnostics'].values():
+            self.assertIsNone(metrics['cosine_to_local'])
+            self.assertIsNone(metrics['weighted_endpoint_to_local_ratio'])
+        torch.testing.assert_close(model.encoder[0].bias.grad, original)
+
     def test_balanced_gradient_matches_full_four_step_reference_and_detaches_teacher(self):
         model = ToyStudent()
         reference = copy.deepcopy(model)

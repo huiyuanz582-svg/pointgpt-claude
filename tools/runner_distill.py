@@ -920,7 +920,7 @@ def _save_checkpoint(path, student, optimizer, epoch, teacher_path, config, sele
     endpoint = resolve_teacher_endpoint(config)
     if endpoint is not None:
         payload['teacher_endpoint'] = endpoint
-        payload['teacher_endpoint_protocol'] = endpoint_metadata(endpoint)
+        payload['teacher_endpoint_protocol'] = endpoint_metadata(endpoint, student)
     if optimizer is not None:
         payload['optimizer'] = optimizer.state_dict()
     torch.save(payload, temporary)
@@ -956,6 +956,7 @@ def train(args, config, builder, device, checkpoint_path, output):
     resolved_curriculum = resolve_curriculum(config)
     training_input = resolved_curriculum['training_input']
     endpoint = resolve_teacher_endpoint(config)
+    masked_endpoint = endpoint is not None and endpoint.get('mask_pre_bn_conv_bias', False)
     teacher_forced = training_input['type'] == 'teacher_forced'
     matched_targets = training_input.get('student_target') == 'teacher_from_student_input'
     if getattr(args, 'resume', None):
@@ -988,6 +989,14 @@ def train(args, config, builder, device, checkpoint_path, output):
     student.requires_grad_(True)
     freeze_teacher(teacher)
     student.train()
+    if masked_endpoint:
+        endpoint_protocol = endpoint_metadata(endpoint, student)
+        manifest_path = output / 'manifest.json'
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+        manifest['teacher_endpoint_protocol'] = endpoint_protocol
+        manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding='utf-8')
+        print(f'[teacher-endpoint] excluded endpoint parameters={endpoint_protocol["excluded_parameters"]}; '
+              'local gradients preserved; both norms use the remaining parameters', flush=True)
     optimizer = torch.optim.AdamW(student.parameters(), lr=float(config.learning_rate),
                                  weight_decay=float(config.weight_decay))
     start_epoch = 1
@@ -1054,6 +1063,9 @@ def train(args, config, builder, device, checkpoint_path, output):
                                        endpoint_grad_norm=0.0)
                 endpoint_weight_min, endpoint_weight_max = float('inf'), 0.0
                 endpoint_ratio = endpoint_grad_ratio(endpoint, epoch)
+                if masked_endpoint:
+                    endpoint_cosine_total, endpoint_cosine_samples = 0.0, 0
+                    endpoint_group_totals = {}
             teacher_probability = teacher_input_probability(training_input, epoch)
             input_generator = None
             if training_input['type'] == 'scheduled_rollout':
@@ -1130,6 +1142,17 @@ def train(args, config, builder, device, checkpoint_path, output):
                             endpoint_totals[key] += value * count
                     endpoint_weight_min = min(endpoint_weight_min, endpoint_result['weight'])
                     endpoint_weight_max = max(endpoint_weight_max, endpoint_result['weight'])
+                    if masked_endpoint:
+                        if endpoint_result['grad_cosine'] is not None:
+                            endpoint_cosine_total += endpoint_result['grad_cosine'] * count
+                            endpoint_cosine_samples += count
+                        for group, metrics in endpoint_result['group_diagnostics'].items():
+                            group_totals = endpoint_group_totals.setdefault(
+                                group, {metric: [0.0, 0] for metric in metrics})
+                            for metric, value in metrics.items():
+                                if value is not None:
+                                    group_totals[metric][0] += value * count
+                                    group_totals[metric][1] += count
                 nonzero = check_gradients(teacher, student)
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     student.parameters(), float(config.grad_norm_clip), error_if_nonfinite=True)
@@ -1217,6 +1240,20 @@ def train(args, config, builder, device, checkpoint_path, output):
                     endpoint_local_grad_norm_mean=endpoint_means['local_grad_norm'] if endpoint_ratio > 0 else None,
                     endpoint_grad_norm_mean=endpoint_means['endpoint_grad_norm'] if endpoint_ratio > 0 else None,
                     endpoint_log_aggregation='sample_weighted_optimizer_batch_means_before_combined_clipping')
+                if masked_endpoint:
+                    group_means = {}
+                    for group, metrics in endpoint_group_totals.items():
+                        group_means[group] = {
+                            metric + '_mean': total / samples if samples else None
+                            for metric, (total, samples) in metrics.items()}
+                        group_means[group]['valid_patches'] = {
+                            metric: samples for metric, (_, samples) in metrics.items()}
+                    record.update(
+                        endpoint_grad_cosine_mean=(endpoint_cosine_total / endpoint_cosine_samples
+                                                   if endpoint_cosine_samples else None),
+                        endpoint_grad_cosine_valid_patches=endpoint_cosine_samples,
+                        endpoint_gradient_groups=group_means,
+                        endpoint_excluded_parameters=endpoint_protocol['excluded_parameters'])
             record.update(training_input=training_input['type'],
                           training_input_protocol=training_input_metadata(training_input, epoch),
                           training_input_stages=summarize_input_stages(input_totals),

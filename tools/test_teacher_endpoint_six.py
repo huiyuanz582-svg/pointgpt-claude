@@ -95,14 +95,20 @@ def main():
     saved = torch.load(checkpoint, **load_options)
     if (saved['epoch'] != best['epoch'] or saved['distillation'] != training['schedule']
             or saved.get('teacher_endpoint') != endpoint
-            or saved.get('training_input') != config['training_input']):
+            or saved.get('training_input') != config['training_input']
+            or saved.get('teacher_endpoint_protocol') != training.get('teacher_endpoint_protocol')):
         raise ValueError('ckpt-best.pth does not match this run / best epoch / objective')
+    endpoint_protocol = saved.get('teacher_endpoint_protocol')
+    if (endpoint.get('mask_pre_bn_conv_bias', False)
+            and (not isinstance(endpoint_protocol, dict) or not endpoint_protocol.get('excluded_parameters'))):
+        raise ValueError('Masked endpoint run is missing its actual excluded parameter names')
     del saved
 
     import yaml
     stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    variant = 'endpoint_masked' if endpoint.get('mask_pre_bn_conv_bias', False) else 'endpoint'
     result_root = (args.output_root.expanduser().resolve() if args.output_root else
-                   train.parent / f'six_condition_metrics_10to4_endpoint_{stamp}_{os.getpid()}')
+                   train.parent / f'six_condition_metrics_10to4_{variant}_{stamp}_{os.getpid()}')
     archive_path = result_root.with_suffix('.zip')
     if archive_path.exists():
         raise FileExistsError(archive_path)
@@ -112,6 +118,7 @@ def main():
     selection = dict(checkpoint=str(checkpoint), checkpoint_sha256=sha256_file(checkpoint),
                      epoch=best['epoch'], validation_score=best['val_rollout_score'],
                      schedule=training['schedule'], teacher_endpoint=endpoint,
+                     teacher_endpoint_protocol=endpoint_protocol,
                      test_seed=args.seed, results=[])
     print(f'TRAIN_ROOT={train}\nbest_epoch={best["epoch"]}\nRESULT_ROOT={result_root}', flush=True)
     outputs = []

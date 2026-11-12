@@ -114,3 +114,73 @@ manual verification of the full four-step gradient, gradient balancing,
 micro-batch/checkpoint equivalence, RNG isolation, and unchanged BatchNorm
 buffers. Static parsing/review cannot establish CUDA correctness, memory usage,
 or numerical benefits on the benchmark.
+
+## Masked endpoint experiment
+
+The follow-up configuration is
+`cfgs/PointGPT-L/distill_10to4_input_endpoint_masked.yaml`. It adds
+`teacher_endpoint.mask_pre_bn_conv_bias: true` to the endpoint configuration.
+The detector is shared with the checkpoint diagnostic. For the current
+PointGPT-L encoder it finds these trainable parameters.
+
+- `encoder.first_conv.0.bias`
+- `encoder.first_conv.3.bias`
+- `encoder.second_conv.0.bias`
+
+The endpoint forward uses the existing parameter values and eval-mode
+BatchNorm statistics. The four-step chain remains connected. Both gradient
+norms use the same trainable parameter set after excluding these biases.
+Each excluded bias receives its original local gradient. The remaining
+parameters receive `g_local + lambda * g_end`, followed by the existing
+combined gradient clipping and optimizer step.
+
+The gradient budget ramps to 0.1 with warmup 2, ramp 4 and maximum lambda 1.
+Training uses the existing 0.5%-2% noise range, Mixed input schedule,
+input-matched Teacher targets, fixed nodes, optimizer and validation selection.
+The training manifest and checkpoints record the detected excluded names.
+
+Start a fresh run from the original Teacher checkpoint after syncing this
+branch's implementation to the server.
+
+```bash
+cd /workspace
+RUN_ROOT="experiments/input_ablation/mixed_10to4_endpoint_masked_seed0_$(date +%Y%m%d_%H%M%S)_$$"
+CUDA_VISIBLE_DEVICES=0 python -u tools/runner_distill.py --mode train \
+  --config cfgs/PointGPT-L/distill_10to4_input_endpoint_masked.yaml \
+  --teacher_ckpt experiments/L_consistency_plus/ckpt-best.pth \
+  --output_dir "$RUN_ROOT/train" --device 0 --seed 0
+```
+
+The masked run adds the following fields to each epoch record.
+
+- `endpoint_excluded_parameters` records the actual mask.
+- `endpoint_grad_cosine_mean` is the sample-weighted mean of optimizer-batch
+  cosines between the eligible local and raw endpoint gradients before mixing.
+- `endpoint_grad_cosine_valid_patches` counts samples with a defined cosine.
+- `endpoint_gradient_groups` groups parameters by their top-level module name.
+  It reports sample-weighted local and endpoint norms, weighted endpoint/local
+  norm ratios, cosines and endpoint squared-norm fractions. `valid_patches`
+  records the denominator for each metric. Zero-norm cosines and zero-local-norm
+  ratios are null and excluded from their respective means.
+
+These diagnostics are measured before combined clipping. Their epoch means
+average per-optimizer-batch measurements. Positive and negative cosines are
+retained in the log. The measurements transfer scalar reductions from the GPU.
+
+After all 20 epochs, use the new run's `train` directory for the complete six
+conditions and ZIP packaging. In the training shell, `TRAIN_ROOT="$RUN_ROOT/train"`
+selects that directory directly. In a new shell, supply its absolute path.
+
+```bash
+cd /workspace
+TRAIN_ROOT="/workspace/experiments/input_ablation/<new_masked_run>/train"
+CUDA_VISIBLE_DEVICES=0 python -u tools/test_teacher_endpoint_six.py \
+  --train_root "$TRAIN_ROOT" --device 0 --seed 0
+```
+
+The ZIP prefix is `six_condition_metrics_10to4_endpoint_masked_`. Its selected
+checkpoint record also includes the saved endpoint protocol and excluded names.
+Static review covers the parameter filtering, matching norm scope, preserved
+local gradients, metadata and logging paths. The added manual regression tests
+cover masked gradient accumulation, gradient diagnostics, micro-batching and
+checkpointing. Runtime correctness and benchmark improvement await manual runs.

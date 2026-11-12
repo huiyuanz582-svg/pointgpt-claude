@@ -144,19 +144,8 @@ def cosine_to_reference(gradients, reference, norm, reference_norm, torch):
 
 
 def pre_bn_conv_biases(student, torch):
-    """Find biases of consecutive Conv -> BatchNorm children in Sequential."""
-    names = set()
-    conv_types = (torch.nn.Conv1d, torch.nn.Conv2d, torch.nn.Conv3d)
-    bn_types = (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d)
-    for prefix, module in student.named_modules():
-        if not isinstance(module, torch.nn.Sequential):
-            continue
-        children = list(module.named_children())
-        for (key, layer), (_, following) in zip(children[:-1], children[1:]):
-            if (isinstance(layer, conv_types) and isinstance(following, bn_types)
-                    and layer.bias is not None and layer.out_channels == following.num_features):
-                names.add('.'.join(value for value in (prefix, key, 'bias') if value))
-    return sorted(names)
+    from utils.teacher_endpoint import pre_bn_conv_biases as find_biases
+    return find_biases(student, torch)
 
 
 def virtual_endpoint_balance(local, endpoint, excluded, ratio, max_weight, torch):
