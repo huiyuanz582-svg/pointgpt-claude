@@ -33,6 +33,30 @@ RUNNER = SimpleNamespace(forward_student_interval=forward, TEACHER_DECAY=0.95)
 
 
 class DiagnosticTests(unittest.TestCase):
+    def test_bias_mask_detects_only_consecutive_conv_bn(self):
+        model = torch.nn.Module()
+        model.encoder = torch.nn.Sequential(
+            torch.nn.Conv1d(3, 4, 1), torch.nn.BatchNorm1d(4),
+            torch.nn.Conv1d(4, 4, 1), torch.nn.ReLU(), torch.nn.BatchNorm1d(4))
+        self.assertEqual(audit.pre_bn_conv_biases(model, torch), ['encoder.0.bias'])
+
+    def test_virtual_mask_rebalances_remaining_parameters_without_mutation(self):
+        bias = 'encoder.first_conv.0.bias'
+        local = {bias: torch.tensor([0.0]), 'blocks.weight': torch.tensor([3.0, 4.0])}
+        endpoint = {bias: torch.tensor([1000.0]), 'blocks.weight': torch.tensor([3.0, 4.0])}
+        before = {key: value.clone() for key, value in endpoint.items()}
+        original = audit.virtual_endpoint_balance(local, endpoint, (), 0.1, 1.0, torch)
+        masked = audit.virtual_endpoint_balance(local, endpoint, [bias], 0.1, 1.0, torch)
+        self.assertAlmostEqual(masked['effective_weight'], 0.1)
+        self.assertAlmostEqual(masked['groups']['blocks']['weighted_endpoint_to_local_ratio'], 0.1)
+        self.assertLess(original['groups']['blocks']['weighted_endpoint_to_local_ratio'], 0.001)
+        self.assertAlmostEqual(masked['combined_norm_relative_to_original_local'], 1.1)
+        self.assertAlmostEqual(masked['cosine_to_allowed_local'], 1.0)
+        self.assertFalse(masked['update_applied'])
+        self.assertTrue(masked['forward_unchanged'])
+        for key, value in endpoint.items():
+            torch.testing.assert_close(value, before[key])
+
     def test_full_and_last_only_share_outputs_but_have_different_early_gradients(self):
         model = Toy().eval()
         nodes = torch.arange(180, dtype=torch.float64).reshape(5, 3, 4, 3) / 200

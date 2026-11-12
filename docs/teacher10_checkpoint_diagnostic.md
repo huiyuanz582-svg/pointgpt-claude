@@ -77,6 +77,43 @@ optimization intervention. In particular, changing BN statistics can change
 both predictions and gradients, and full-versus-last-only also changes which
 uses of the shared parameters contribute.
 
+### Targeted pre-BN bias mask comparison
+
+The audit now also writes `gradient_mask_comparison.json`. For each
+`endpoint_eval_full` probe, it uses the already computed CPU gradient tensors
+to compare the original global balancing rule with a hypothetical mask. No
+extra forward/backward pass or parameter update is performed for this comparison.
+
+The mask is found from consecutive Conv -> matching BatchNorm children inside
+`Sequential`. In this Student these are expected to be
+`encoder.first_conv.0.bias`, `encoder.first_conv.3.bias`, and
+`encoder.second_conv.0.bias`. Their values are not zeroed, deleted or changed.
+
+In the masked calculation both the local norm and endpoint norm use the same
+allowed parameter set. Excluded biases retain their local gradient but receive
+zero hypothetical endpoint contribution. The auxiliary weight is then
+recomputed using the configured full target ratio (0.1), independently of
+best5's historical warmup ratio. The report includes:
+
+- Raw and masked effective weight and achieved allowed gradient ratio.
+- The largest remaining endpoint-gradient parameters and their concentration.
+- Per-group weighted endpoint/local gradient ratios and gradient cosine.
+- The excluded biases' separate local and endpoint norms.
+- The hypothetical combined gradient norm and its cosine with the original
+  local gradient, including the preserved local gradient on excluded biases.
+
+The original and masked calculations use identical forward predictions,
+Teacher targets, masks, and gradient tensors. This can confirm whether those
+bias gradients dominate the coefficient and expose the remaining gradient
+directions. It cannot establish that masked training will improve CD/P2M.
+Training code and checkpoint loading remain unchanged until that result is
+reviewed.
+
+Use `--gradient_only` for this follow-up. It skips the already measured
+trajectory-error forwards, while retaining the same Teacher-bank preparation
+order, fixed patches, gradient cases, and RNG isolation. It produces the
+gradient/mask JSON reports with an empty stage summary and no stage CSV.
+
 Every probe restores modes, running buffers, RNGs, and clears gradients.
 Checkpoint parameter version checks and file size/mtime checks guard against
 updates. Teacher parameters remain frozen. Any temporary BN running-stat
@@ -93,7 +130,7 @@ CUDA_VISIBLE_DEVICES=0 python -u tools/diagnose_teacher10_checkpoint.py \
   --reference_train_root /workspace/experiments/input_ablation/mixed_10to4_seed0_20261103_091537_40/train \
   --teacher_ckpt /workspace/experiments/L_consistency_plus/ckpt-best.pth \
   --max_shapes 4 --patches_per_shape 2 \
-  --gradient_conditions 10k_1pct 50k_3pct \
+  --gradient_only --gradient_conditions 10k_1pct 50k_3pct \
   --teacher_probability 0.2 --seed 2024 --device 0
 ```
 
@@ -101,7 +138,8 @@ The default output is a fresh `teacher10_diagnostic_<timestamp>_<pid>` directory
 next to the endpoint run's `train` directory. It refuses to overwrite an
 existing directory or ZIP. On success, the last line prints `ZIP=<path>`.
 The ZIP contains the manifest, full log, patch-level stage errors, aggregated
-stage errors, and gradient probes. It contains no checkpoint tensors or clouds.
+stage errors, gradient probes, and the targeted bias-mask comparison. It
+contains no checkpoint tensors or clouds.
 On failure, the directory and failed manifest are preserved; no success ZIP is
 created. Send the error log before changing sample counts or memory settings.
 

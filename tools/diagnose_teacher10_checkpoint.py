@@ -143,6 +143,81 @@ def cosine_to_reference(gradients, reference, norm, reference_norm, torch):
     return max(-1.0, min(1.0, dot / (norm * reference_norm)))
 
 
+def pre_bn_conv_biases(student, torch):
+    """Find biases of consecutive Conv -> BatchNorm children in Sequential."""
+    names = set()
+    conv_types = (torch.nn.Conv1d, torch.nn.Conv2d, torch.nn.Conv3d)
+    bn_types = (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d)
+    for prefix, module in student.named_modules():
+        if not isinstance(module, torch.nn.Sequential):
+            continue
+        children = list(module.named_children())
+        for (key, layer), (_, following) in zip(children[:-1], children[1:]):
+            if (isinstance(layer, conv_types) and isinstance(following, bn_types)
+                    and layer.bias is not None and layer.out_channels == following.num_features):
+                names.add('.'.join(value for value in (prefix, key, 'bias') if value))
+    return sorted(names)
+
+
+def virtual_endpoint_balance(local, endpoint, excluded, ratio, max_weight, torch):
+    """Recalculate weights from existing CPU gradients without altering tensors.
+
+    Both norms use the same allowed parameter set. The excluded parameters
+    retain their local gradient and receive zero endpoint contribution in the
+    hypothetical combined gradient. No hypothetical gradient is applied.
+    """
+    excluded = set(excluded)
+    groups = {}
+    endpoint_parameters = []
+    for name in sorted(set(local) | set(endpoint)):
+        if name in excluded:
+            continue
+        left, right = local.get(name), endpoint.get(name)
+        left_norm = float(left.norm()) if left is not None else 0.0
+        right_norm = float(right.norm()) if right is not None else 0.0
+        dot = float(torch.dot(left.reshape(-1), right.reshape(-1))) if left is not None and right is not None else 0.0
+        group = groups.setdefault(name.split('.')[0], dict(local_squared=0.0, endpoint_squared=0.0, dot=0.0))
+        group['local_squared'] += left_norm ** 2
+        group['endpoint_squared'] += right_norm ** 2
+        group['dot'] += dot
+        if right is not None:
+            endpoint_parameters.append(dict(parameter=name, norm=right_norm))
+    local_squared = sum(g['local_squared'] for g in groups.values())
+    endpoint_squared = sum(g['endpoint_squared'] for g in groups.values())
+    dot = sum(g['dot'] for g in groups.values())
+    local_norm, endpoint_norm = math.sqrt(local_squared), math.sqrt(endpoint_squared)
+    weight = min(max_weight, ratio * local_norm / endpoint_norm) if local_norm > 0 and endpoint_norm > 0 else 0.0
+    def cosine(product, left_squared, right_squared):
+        return (max(-1.0, min(1.0, product / math.sqrt(left_squared * right_squared)))
+                if left_squared > 0 and right_squared > 0 else None)
+    group_metrics = {}
+    for name, group in groups.items():
+        group_metrics[name] = dict(
+            local_norm=math.sqrt(group['local_squared']), endpoint_norm=math.sqrt(group['endpoint_squared']),
+            weighted_endpoint_to_local_ratio=(weight * math.sqrt(group['endpoint_squared'] / group['local_squared'])
+                                              if group['local_squared'] > 0 else None),
+            cosine_to_local=cosine(group['dot'], group['local_squared'], group['endpoint_squared']),
+            endpoint_squared_norm_fraction=group['endpoint_squared'] / endpoint_squared if endpoint_squared else 0.0)
+    original_local_squared = sum(float(g.norm()) ** 2 for g in local.values())
+    combined_squared = max(0.0, original_local_squared + weight ** 2 * endpoint_squared + 2 * weight * dot)
+    top = sorted(endpoint_parameters, key=lambda r: r['norm'], reverse=True)[:12]
+    excluded_metrics = [dict(parameter=name,
+                             local_norm=float(local[name].norm()) if name in local else 0.0,
+                             endpoint_norm=float(endpoint[name].norm()) if name in endpoint else 0.0)
+                        for name in sorted(excluded)]
+    return dict(local_allowed_norm=local_norm, endpoint_allowed_norm=endpoint_norm,
+                target_grad_ratio=ratio, effective_weight=weight,
+                achieved_allowed_grad_ratio=weight * endpoint_norm / local_norm if local_norm > 0 else 0.0,
+                cosine_to_allowed_local=cosine(dot, local_squared, endpoint_squared),
+                combined_norm_relative_to_original_local=(math.sqrt(combined_squared / original_local_squared)
+                                                          if original_local_squared > 0 else None),
+                combined_cosine_to_original_local=cosine(
+                    original_local_squared + weight * dot, original_local_squared, combined_squared),
+                groups=group_metrics, excluded_parameters=excluded_metrics, top_allowed_endpoint_parameters=top,
+                top_parameter_squared_norm_fraction=top[0]['norm'] ** 2 / endpoint_squared if endpoint_squared and top else 0.0,
+                forward_unchanged=True, local_gradient_preserved=True, update_applied=False)
+
+
 def make_bank(config, points, noise, args, teacher, runner, torch):
     from datasets.ScoreDenoiseDataset import ScoreDenoise
     dataset_config = copy.deepcopy(config.dataset._base_)
@@ -259,6 +334,9 @@ def gradient_probes(student, teacher, bank, args, config, runner, torch, np):
     rows = []
     reference = None
     reference_norm = None
+    excluded_biases = pre_bn_conv_biases(student, torch)
+    if not excluded_biases:
+        raise ValueError('Expected at least one consecutive Conv -> BN bias for the targeted probe')
     for case, module_mode in cases:
         print(f'[gradient] {bank["label"]}: {case}', flush=True)
         with isolated_mode(student, module_mode, seed, torch, np):
@@ -285,6 +363,16 @@ def gradient_probes(student, teacher, bank, args, config, runner, torch, np):
                        state_and_rng_restored=True, patches=count,
                        teacher_probability=args.teacher_probability,
                        teacher_counts=mask.sum(1).tolist())
+            if case == 'endpoint_eval_full':
+                settings = config.teacher_endpoint
+                row['bias_mask_comparison'] = dict(
+                    excluded_biases=excluded_biases,
+                    ratio_scope='full configured target ratio, not the saved epoch warmup ratio',
+                    source='same local and endpoint gradient tensors; no additional model calls',
+                    original_balance=virtual_endpoint_balance(
+                        reference, gradients, (), settings.target_grad_ratio, settings.max_weight, torch),
+                    masked_balance=virtual_endpoint_balance(
+                        reference, gradients, excluded_biases, settings.target_grad_ratio, settings.max_weight, torch))
             rows.append(row)
             if case != 'local_train':
                 del gradients
@@ -348,6 +436,7 @@ def run(args, output, manifest):
                     teacher_checkpoint=str(teacher_path), teacher_sha256=sha256(teacher_path),
                     effective_config=config,
                     diagnostic_subset=True, benchmark_metrics=False,
+                    gradient_only=args.gradient_only,
                     protocol=dict(nodes=list(NODES), teacher_eta=0.3, teacher_decay=0.95,
                                   patch_size=int(config.inference_patch_size),
                                   patch_selection='sorted_first_shapes_then_fixed_random_seed_and_noisy_KNN',
@@ -356,6 +445,8 @@ def run(args, output, manifest):
                                   gradient_batch_size=int(config.total_bs),
                                   gradient_endpoint_patch_batch=1,
                                   gradient_conditions=args.gradient_conditions,
+                                  bias_mask_comparison='virtual; same gradients; no forward or parameter changes',
+                                  mask='Conv bias immediately followed by matching BatchNorm in Sequential',
                                   exact_training_batch_replay=False,
                                   no_optimizer=True, no_parameter_update=True,
                                   bn_buffers_restored=True, three_percent_is_diagnostic_only=True))
@@ -379,16 +470,21 @@ def run(args, output, manifest):
         versions = {name: p._version for name, p in student.named_parameters()}
         initial_buffers = {name: b.detach().clone() for name, b in student.named_buffers()}
         for bank in banks:
-            print(f'[trajectory] {checkpoint_label}: {bank["label"]}', flush=True)
-            with isolated_mode(student, 'eval', stable_seed(args.seed, 'trajectory', bank['label']), torch, np):
-                rows = trajectory_errors(student, teacher, bank, runner, torch)
-            for row in rows:
-                row.update(checkpoint_label=checkpoint_label, condition=bank['label'])
-            all_rows.extend(rows)
+            if not args.gradient_only:
+                print(f'[trajectory] {checkpoint_label}: {bank["label"]}', flush=True)
+                with isolated_mode(student, 'eval', stable_seed(args.seed, 'trajectory', bank['label']), torch, np):
+                    rows = trajectory_errors(student, teacher, bank, runner, torch)
+                for row in rows:
+                    row.update(checkpoint_label=checkpoint_label, condition=bank['label'])
+                all_rows.extend(rows)
             if bank['label'] in args.gradient_conditions:
                 results = gradient_probes(student, teacher, bank, args, config, runner, torch, np)
                 probes.append(dict(checkpoint_label=checkpoint_label, condition=bank['label'], cases=results))
             write_json(output / 'gradient_probes.json', probes)
+            mask_comparisons = [dict(checkpoint_label=probe['checkpoint_label'], condition=probe['condition'],
+                                     **case['bias_mask_comparison'])
+                                for probe in probes for case in probe['cases'] if 'bias_mask_comparison' in case]
+            write_json(output / 'gradient_mask_comparison.json', mask_comparisons)
             write_json(output / 'stage_summary.json', summarize_stages(all_rows))
         if any(p._version != versions[n] or p.grad is not None for n, p in student.named_parameters()):
             raise RuntimeError('Student integrity check failed')
@@ -399,11 +495,13 @@ def run(args, output, manifest):
     for path in protected_paths:
         if (path.stat().st_size, path.stat().st_mtime_ns) != protected_stats[str(path)]:
             raise RuntimeError(f'A checkpoint file changed during the audit: {path}')
-    with (output / 'stage_errors.csv').open('x', encoding='utf-8', newline='') as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(all_rows[0]))
-        writer.writeheader()
-        writer.writerows(all_rows)
-    expected_rows = len(configurations) * len(banks) * args.max_shapes * args.patches_per_shape * 4
+    if all_rows:
+        with (output / 'stage_errors.csv').open('x', encoding='utf-8', newline='') as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(all_rows[0]))
+            writer.writeheader()
+            writer.writerows(all_rows)
+    expected_rows = (0 if args.gradient_only else
+                     len(configurations) * len(banks) * args.max_shapes * args.patches_per_shape * 4)
     if len(all_rows) != expected_rows or len(probes) != len(configurations) * len(args.gradient_conditions):
         raise RuntimeError('Incomplete diagnostic enumeration')
     manifest.update(status='completed', stage_rows=len(all_rows), gradient_probe_batches=len(probes),
@@ -436,6 +534,7 @@ def main():
     parser.add_argument('--max_shapes', type=int, default=4)
     parser.add_argument('--patches_per_shape', type=int, default=2)
     parser.add_argument('--gradient_conditions', nargs='*', default=['10k_1pct', '50k_3pct'])
+    parser.add_argument('--gradient_only', action='store_true', help='Skip the previously measured stage-error forwards')
     parser.add_argument('--teacher_probability', type=float, default=0.2)
     parser.add_argument('--seed', type=int, default=2024)
     parser.add_argument('--device', type=int, default=0)
@@ -447,6 +546,8 @@ def main():
     if len(set(args.gradient_conditions)) != len(args.gradient_conditions) or any(
             key not in [label_for(*condition) for condition in CONDITIONS] for key in args.gradient_conditions):
         raise ValueError('Unknown or duplicate gradient condition')
+    if args.gradient_only and not args.gradient_conditions:
+        raise ValueError('--gradient_only requires at least one gradient condition')
     for key in ('train_root', 'reference_train_root'):
         value = getattr(args, key)
         if value is not None:
