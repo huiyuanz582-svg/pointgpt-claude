@@ -1,8 +1,10 @@
 """Manual-only checks for diagnostic gradient connectivity and state isolation."""
 
 import importlib.util
+import json
 from pathlib import Path
 import random
+import tempfile
 from types import SimpleNamespace
 import unittest
 
@@ -33,6 +35,77 @@ RUNNER = SimpleNamespace(forward_student_interval=forward, TEACHER_DECAY=0.95)
 
 
 class DiagnosticTests(unittest.TestCase):
+    def test_best_last_selection_checks_last_epoch_against_completed_log(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = dict(epochs=3, training_input=dict(type='scheduled_rollout'))
+            schedule = dict(teacher_nodes=[0, 2, 5, 7, 10])
+            manifest = dict(config=config, arguments=dict(epochs=None), schedule=schedule)
+            (root / 'manifest.json').write_text(json.dumps(manifest), encoding='utf-8')
+            rows = [dict(epoch=epoch, val_rollout_score=score) for epoch, score in [(1, 3), (2, 1), (3, 2)]]
+            (root / 'train.jsonl').write_text('\n'.join(json.dumps(row) for row in rows), encoding='utf-8')
+            for name in ('ckpt-best.pth', 'ckpt-last.pth'):
+                (root / name).write_bytes(b'fixture')
+            def load(path, **kwargs):
+                return dict(epoch=2 if path.name == 'ckpt-best.pth' else 3,
+                            distillation=schedule, training_input=config['training_input'], best_epoch=2)
+            loader = SimpleNamespace(load=load)
+            _, best = audit.inspect_run(root, loader)
+            _, last = audit.inspect_run(root, loader, 'last')
+            self.assertEqual(best['epoch'], 2)
+            self.assertEqual(last['epoch'], 3)
+            self.assertEqual(last['validation_score'], 2)
+            self.assertTrue(last['checkpoint'].endswith('ckpt-last.pth'))
+            (root / 'train.jsonl').write_text('\n'.join(json.dumps(row) for row in rows[:-1]), encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'completed training log'):
+                audit.inspect_run(root, loader, 'last')
+
+    def test_bn_swap_changes_eval_output_and_restores_buffers_after_failure(self):
+        model = Toy().eval()
+        original = audit.batchnorm_buffers(model, torch)
+        swapped = {name: tensor.clone() for name, tensor in original.items()}
+        swapped['bn.running_mean'].fill_(0.5)
+        swapped['bn.running_var'].fill_(4.0)
+        swapped['bn.num_batches_tracked'].fill_(30)
+        parameters = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
+        points = torch.ones((2, 3, 4), dtype=torch.float64)
+        before = model.bn(points).detach()
+        with self.assertRaisesRegex(RuntimeError, 'probe failure'):
+            with audit.isolated_mode(model, 'eval', 42, torch, np):
+                audit.copy_batchnorm_buffers(model, swapped, torch)
+                with torch.no_grad():
+                    actual = model.bn(points)
+                expected = torch.full_like(points, 0.5 / (4.0 + model.bn.eps) ** 0.5)
+                torch.testing.assert_close(actual, expected)
+                self.assertFalse(torch.allclose(actual, before))
+                raise RuntimeError('probe failure')
+        for name, value in audit.batchnorm_buffers(model, torch).items():
+            torch.testing.assert_close(value, original[name])
+        for name, parameter in model.named_parameters():
+            torch.testing.assert_close(parameter, parameters[name])
+            self.assertIsNone(parameter.grad)
+        self.assertFalse(model.training)
+
+    def test_bn_summary_pairs_four_cases_and_decomposes_interaction(self):
+        rows = []
+        for (weights, bn), errors in {('best', 'best'): [1.0, 3.0], ('best', 'last'): [3.0, 5.0],
+                                      ('last', 'best'): [4.0, 6.0], ('last', 'last'): [8.0, 10.0]}.items():
+            for patch, error in enumerate(errors):
+                rows.append(dict(condition='10k_1pct', stage=4, name='cloud', patch=patch,
+                                 weights_checkpoint=weights, bn_checkpoint=bn, free_to_canonical_mse=error))
+        summary = audit.summarize_best_last_bn(rows)[0]
+        self.assertEqual(summary['total_last_minus_best'], 7.0)
+        self.assertEqual(summary['bn_effect_at_best_weights'], 2.0)
+        self.assertEqual(summary['bn_effect_at_last_weights'], 4.0)
+        self.assertEqual(summary['weights_effect_at_best_bn'], 3.0)
+        self.assertEqual(summary['weights_effect_at_last_bn'], 5.0)
+        self.assertEqual(summary['interaction'], 2.0)
+        self.assertEqual(summary['patches'], 2)
+        with self.assertRaisesRegex(ValueError, 'identical patches'):
+            audit.summarize_best_last_bn(rows[:-1])
+        with self.assertRaisesRegex(ValueError, 'Duplicate patch'):
+            audit.summarize_best_last_bn(rows + rows[:1])
+
     def test_bias_mask_detects_only_consecutive_conv_bn(self):
         model = torch.nn.Module()
         model.encoder = torch.nn.Sequential(

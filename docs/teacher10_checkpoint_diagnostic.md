@@ -1,5 +1,71 @@
 # Diagnose existing Teacher10 / Student4 checkpoints
 
+## Masked run best/last and BN comparison
+
+Use `--compare_best_last_bn` for the completed masked endpoint run. The script
+selects best from the minimum logged validation Score and last from the final
+epoch of the completed training plan, then checks the actual checkpoint
+metadata. The supplied masked run has best at epoch 6 and last at epoch 20.
+
+Each learned-parameter set is evaluated with both checkpoints' BN running
+buffers. The four combinations use identical cached noisy patches, Teacher
+targets, RNG seeds and continuous four-step Student rollouts in eval mode.
+BN affine weights and all other learned parameters come from the selected
+weights checkpoint. The swapped buffers are `running_mean`, `running_var`
+and `num_batches_tracked`. Each probe restores the buffers afterward.
+
+This mode performs forward-only measurements. It produces corresponding-point
+MSE at all four stages for six conditions, using four sorted clouds and two
+fixed patches per cloud by default. The 3% condition is a diagnostic input.
+The measurements describe this fixed subset and support a decision about
+subsequent optimization experiments.
+
+Sync `tools/diagnose_teacher10_checkpoint.py` to the server and run this block.
+
+```bash
+cd /workspace
+TRAIN_ROOT="/workspace/experiments/input_ablation/mixed_10to4_endpoint_masked_seed0_20261112_075942_40/train"
+CUDA_VISIBLE_DEVICES=0 python -u tools/diagnose_teacher10_checkpoint.py \
+  --train_root "$TRAIN_ROOT" \
+  --teacher_ckpt /workspace/experiments/L_consistency_plus/ckpt-best.pth \
+  --compare_best_last_bn \
+  --max_shapes 4 --patches_per_shape 2 --seed 2024 --device 0
+```
+
+The default output is a fresh `teacher10_best_last_bn_<timestamp>_<pid>` folder
+beside `train`, followed by a ZIP at the same location. The final line prints
+`ZIP=<absolute_path>`. The archive includes the following records.
+
+- `run_manifest.json` records checkpoint epochs, hashes, shared patch hashes,
+  the exact protocol and completion checks.
+- `stage_errors.csv` contains 768 rows under the default sampling settings,
+  covering four combinations, six conditions, eight patches and four stages.
+- `best_last_bn_summary.json` contains 24 condition/stage summaries. Stage 4
+  measures the distance between the continuous Student4 output and Teacher10.
+- `bn_buffer_differences.json` reports per-buffer drift, including running-mean
+  shifts in units of the best checkpoint's running standard deviation and
+  last/best running-variance ratios.
+- `run.log` and the three original training records accompany the measurements.
+
+For a summary row, denote the four MSE values by A (best weights/best BN),
+B (best weights/last BN), C (last weights/best BN), D (last weights/last BN).
+`total_last_minus_best` is D-A. `bn_effect_at_best_weights` is B-A and
+`bn_effect_at_last_weights` is D-C. Positive values indicate greater MSE
+using last's BN statistics at that fixed weight set. The corresponding
+weight effects are C-A and D-B. `interaction` is D-C-B+A and measures how
+the BN effect depends on the learned weights.
+
+When D exceeds A and C is lower than D, best's running statistics improve the
+last weights on the measured patches. When both C and D exceed A, the learned
+weight changes also warrant inspection. A large interaction means the effects
+depend strongly on the weight/statistic combination. Buffer swaps provide a
+controlled sensitivity measurement. Whole-cloud benchmark improvements and
+any BN recalibration strategy require their own evaluation.
+
+The best/last comparison has received static syntax and code review only.
+The added manual regression checks cover last-checkpoint selection, restoration
+after a failed buffer-swap probe and the four-case summary arithmetic.
+
 Entry point: `tools/diagnose_teacher10_checkpoint.py`. Use the current endpoint
 alignment branch. This is an observational audit with no optimizer, training
 loop, parameter updates, or saved model weights. It does perform backward

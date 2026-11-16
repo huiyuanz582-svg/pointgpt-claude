@@ -50,7 +50,7 @@ def label_for(points, noise):
     return f'{points // 1000}k_{round(noise * 100)}pct'
 
 
-def inspect_run(train_root, torch):
+def inspect_run(train_root, torch, checkpoint_kind='best'):
     manifest = json.loads((train_root / 'manifest.json').read_text(encoding='utf-8'))
     rows = [json.loads(line) for line in (train_root / 'train.jsonl').read_text(encoding='utf-8-sig').splitlines()
             if line.strip()]
@@ -58,22 +58,34 @@ def inspect_run(train_root, torch):
     if not selected:
         raise ValueError(f'No validation records in {train_root}')
     best = min(selected, key=lambda r: r['val_rollout_score'])
-    path = train_root / 'ckpt-best.pth'
+    if checkpoint_kind not in ('best', 'last'):
+        raise ValueError('checkpoint_kind must be best or last')
+    record = best if checkpoint_kind == 'best' else rows[-1]
+    if checkpoint_kind == 'last':
+        planned = manifest['arguments'].get('epochs') or manifest['config']['epochs']
+        if [row['epoch'] for row in rows] != list(range(1, planned + 1)):
+            raise ValueError('Best/last comparison requires the completed training log')
+    path = train_root / f'ckpt-{checkpoint_kind}.pth'
     options = dict(map_location='cpu')
     if 'weights_only' in inspect.signature(torch.load).parameters:
         options['weights_only'] = False
     saved = torch.load(path, **options)
-    if saved['epoch'] != best['epoch'] or saved['distillation'] != manifest['schedule']:
-        raise ValueError(f'Checkpoint and best log disagree: {path}')
+    if saved['epoch'] != record['epoch'] or saved['distillation'] != manifest['schedule']:
+        raise ValueError(f'Checkpoint and selected log disagree: {path}')
     if saved['distillation']['teacher_nodes'] != list(NODES):
         raise ValueError('This audit requires Teacher10 / Student4 nodes [0,2,5,7,10]')
     if saved.get('teacher_endpoint') != manifest['config'].get('teacher_endpoint'):
         raise ValueError(f'Checkpoint endpoint objective differs from manifest: {path}')
     if saved.get('training_input') != manifest['config']['training_input']:
         raise ValueError(f'Checkpoint local objective differs from manifest: {path}')
+    if saved.get('teacher_endpoint_protocol') != manifest.get('teacher_endpoint_protocol'):
+        raise ValueError(f'Checkpoint endpoint protocol differs from manifest: {path}')
+    if saved.get('best_epoch') != best['epoch']:
+        raise ValueError(f'Checkpoint best tracking differs from log: {path}')
     del saved
-    return manifest, dict(train_root=str(train_root), checkpoint=str(path), epoch=best['epoch'],
-                          checkpoint_sha256=sha256(path), validation_score=best['val_rollout_score'],
+    return manifest, dict(train_root=str(train_root), checkpoint=str(path), epoch=record['epoch'],
+                          checkpoint_kind=checkpoint_kind,
+                          checkpoint_sha256=sha256(path), validation_score=record.get('val_rollout_score'),
                           objective=manifest['config'].get('teacher_endpoint'))
 
 
@@ -383,6 +395,137 @@ def summarize_stages(rows):
     return result
 
 
+def batchnorm_buffers(student, torch):
+    buffers = {}
+    for name, module in student.named_modules():
+        if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+            if not module.track_running_stats:
+                raise ValueError(f'{name}: BN buffer comparison requires running statistics')
+            for key, value in module.named_buffers(recurse=False):
+                if key in ('running_mean', 'running_var', 'num_batches_tracked'):
+                    buffers['.'.join(part for part in (name, key) if part)] = value.detach().cpu().clone()
+    if not buffers:
+        raise ValueError('Student has no BatchNorm running statistics')
+    return buffers
+
+
+def copy_batchnorm_buffers(student, buffers, torch):
+    current = dict(student.named_buffers())
+    if set(buffers) != set(batchnorm_buffers(student, torch)):
+        raise ValueError('BN buffer names differ between checkpoints')
+    for name, source in buffers.items():
+        target = current[name]
+        if target.shape != source.shape or target.dtype != source.dtype:
+            raise ValueError(f'BN buffer shape or dtype mismatch: {name}')
+        if not torch.isfinite(source).all() or (name.endswith('running_var') and (source < 0).any()):
+            raise ValueError(f'Invalid BN statistics: {name}')
+    with torch.no_grad():
+        for name, source in buffers.items():
+            current[name].copy_(source)
+
+
+def compare_batchnorm_buffers(best, last):
+    if set(best) != set(last):
+        raise ValueError('BN buffer names differ between best and last')
+    rows = []
+    for name, before in best.items():
+        after = last[name]
+        if before.shape != after.shape or before.dtype != after.dtype:
+            raise ValueError(f'BN buffer shape or dtype mismatch: {name}')
+        left, right = before.double(), after.double()
+        row = dict(buffer=name, elements=left.numel(),
+                   best_mean=float(left.mean()), last_mean=float(right.mean()),
+                   delta_rms=float((right - left).square().mean().sqrt()),
+                   delta_max_abs=float((right - left).abs().max()))
+        if name.endswith('running_mean'):
+            variance = best[name[:-len('running_mean')] + 'running_var'].double()
+            row['mean_shift_rms_in_best_std_units'] = float(
+                ((right - left) / variance.clamp_min(1e-12).sqrt()).square().mean().sqrt())
+        if name.endswith('running_var'):
+            ratio = right / left.clamp_min(1e-12)
+            row.update(last_to_best_variance_ratio_mean=float(ratio.mean()),
+                       last_to_best_variance_ratio_min=float(ratio.min()),
+                       last_to_best_variance_ratio_max=float(ratio.max()))
+        rows.append(row)
+    return rows
+
+
+def continuous_stage_errors(student, bank, runner, torch):
+    rows = []
+    device = next(student.parameters()).device
+    with torch.no_grad():
+        for patch, sample in enumerate(bank['samples']):
+            nodes = bank['nodes'][:, patch:patch + 1].to(device)
+            sigma0 = bank['sigmas'][patch:patch + 1].to(device)
+            state = nodes[0]
+            for stage, (start, stop) in enumerate(zip(NODES[:-1], NODES[1:])):
+                state = runner.forward_student_interval(
+                    student, state, sigma0 * runner.TEACHER_DECAY ** start, start, stop)
+                error = float((state - nodes[stage + 1]).square().sum(-1).mean())
+                if not math.isfinite(error):
+                    raise FloatingPointError('Nonfinite continuous Student trajectory error')
+                rows.append(dict(**sample, stage=stage + 1, start_step=start, target_step=stop,
+                                 free_to_canonical_mse=error))
+    return rows
+
+
+def summarize_best_last_bn(rows):
+    groups = {}
+    for row in rows:
+        group = groups.setdefault((row['condition'], row['stage']), {})
+        case = (row['weights_checkpoint'], row['bn_checkpoint'])
+        samples = group.setdefault(case, {})
+        sample_key = (row['name'], row['patch'])
+        if sample_key in samples:
+            raise ValueError('Duplicate patch in BN comparison')
+        samples[sample_key] = row['free_to_canonical_mse']
+    summary = []
+    expected_cases = {('best', 'best'), ('best', 'last'), ('last', 'best'), ('last', 'last')}
+    for (condition, stage), cases in groups.items():
+        if set(cases) != expected_cases or any(set(v) != set(cases[('best', 'best')]) for v in cases.values()):
+            raise ValueError('BN comparison requires four cases on identical patches')
+        means = {key: sum(values.values()) / len(values) for key, values in cases.items()}
+        a, b, c, d = (means[key] for key in [('best', 'best'), ('best', 'last'), ('last', 'best'), ('last', 'last')])
+        summary.append(dict(
+            condition=condition, stage=stage, patches=len(cases[('best', 'best')]),
+            best_weights_best_bn_mse=a, best_weights_last_bn_mse=b,
+            last_weights_best_bn_mse=c, last_weights_last_bn_mse=d,
+            total_last_minus_best=d - a,
+            bn_effect_at_best_weights=b - a, bn_effect_at_last_weights=d - c,
+            weights_effect_at_best_bn=c - a, weights_effect_at_last_bn=d - b,
+            interaction=d - c - b + a))
+    return summary
+
+
+def best_last_bn_probes(student, configurations, banks, args, output, runner, builder, torch, np):
+    checkpoints = {name: item for name, _, item in configurations}
+    runner.load_student_checkpoint(student, checkpoints['last']['checkpoint'], builder, expected_nodes=NODES)
+    buffers = {'last': batchnorm_buffers(student, torch)}
+    all_rows = []
+    for weights_label in ('best', 'last'):
+        runner.load_student_checkpoint(student, checkpoints[weights_label]['checkpoint'], builder, expected_nodes=NODES)
+        student.requires_grad_(False).eval()
+        buffers[weights_label] = batchnorm_buffers(student, torch)
+        initial_buffers = {name: value.detach().clone() for name, value in student.named_buffers()}
+        versions = {name: parameter._version for name, parameter in student.named_parameters()}
+        for bn_label in ('best', 'last'):
+            for bank in banks:
+                print(f'[best-last BN] weights={weights_label} stats={bn_label} {bank["label"]}', flush=True)
+                with isolated_mode(student, 'eval', stable_seed(args.seed, 'best-last-bn', bank['label']), torch, np):
+                    copy_batchnorm_buffers(student, buffers[bn_label], torch)
+                    rows = continuous_stage_errors(student, bank, runner, torch)
+                for row in rows:
+                    row.update(weights_checkpoint=weights_label, bn_checkpoint=bn_label, condition=bank['label'])
+                all_rows.extend(rows)
+        if any(p._version != versions[name] or p.grad is not None for name, p in student.named_parameters()):
+            raise RuntimeError('Student parameters changed during best/last BN comparison')
+        if any(not torch.equal(value, initial_buffers[name]) for name, value in student.named_buffers()):
+            raise RuntimeError('Student buffers were not restored after BN comparison')
+    write_json(output / 'bn_buffer_differences.json', compare_batchnorm_buffers(buffers['best'], buffers['last']))
+    write_json(output / 'best_last_bn_summary.json', summarize_best_last_bn(all_rows))
+    return all_rows
+
+
 def run(args, output, manifest):
     import numpy as np
     import torch
@@ -392,6 +535,11 @@ def run(args, output, manifest):
 
     primary_manifest, primary = inspect_run(args.train_root, torch)
     configurations = [('endpoint', primary_manifest, primary)]
+    if args.compare_best_last_bn:
+        last_manifest, last = inspect_run(args.train_root, torch, checkpoint_kind='last')
+        if last_manifest != primary_manifest:
+            raise ValueError('Training manifest changed during checkpoint inspection')
+        configurations = [('best', primary_manifest, primary), ('last', last_manifest, last)]
     if args.reference_train_root is not None:
         control_manifest, control = inspect_run(args.reference_train_root, torch)
         before = copy.deepcopy(primary_manifest['config'])
@@ -439,6 +587,21 @@ def run(args, output, manifest):
                                   exact_training_batch_replay=False,
                                   no_optimizer=True, no_parameter_update=True,
                                   bn_buffers_restored=True, three_percent_is_diagnostic_only=True))
+    if args.compare_best_last_bn:
+        manifest.update(
+            diagnostic_mode='best_last_bn',
+            protocol=dict(
+                nodes=list(NODES), teacher_eta=0.3, teacher_decay=0.95,
+                patch_size=int(config.inference_patch_size),
+                patch_selection='sorted_first_shapes_then_fixed_random_seed_and_noisy_KNN',
+                stage_metric='corresponding_point_squared_l2_in_normalized_patch_coordinates',
+                combinations='best/last learned parameters crossed with best/last BN running buffers',
+                swapped_buffers=['running_mean', 'running_var', 'num_batches_tracked'],
+                bn_affine_parameters='from_weights_checkpoint',
+                student_mode='eval', student_patch_batch=1, teacher_target='shared_cached_teacher_nodes',
+                same_input_and_rng_for_all_combinations=True,
+                no_backward=True, no_optimizer=True, no_parameter_update=True,
+                bn_buffers_restored=True, three_percent_is_diagnostic_only=True))
     write_json(output / 'run_manifest.json', manifest)
     teacher = runner.freeze_teacher(builder.model_builder(config.model).to(device))
     builder.load_model(teacher, str(teacher_path))
@@ -453,32 +616,35 @@ def run(args, output, manifest):
     write_json(output / 'run_manifest.json', manifest)
     student = builder.model_builder(config.model).to(device)
     all_rows, probes = [], []
-    for checkpoint_label, _, checkpoint_info in configurations:
-        runner.load_student_checkpoint(student, checkpoint_info['checkpoint'], builder, expected_nodes=NODES)
-        student.requires_grad_(True).eval()
-        versions = {name: p._version for name, p in student.named_parameters()}
-        initial_buffers = {name: b.detach().clone() for name, b in student.named_buffers()}
-        for bank in banks:
-            if not args.gradient_only:
-                print(f'[trajectory] {checkpoint_label}: {bank["label"]}', flush=True)
-                with isolated_mode(student, 'eval', stable_seed(args.seed, 'trajectory', bank['label']), torch, np):
-                    rows = trajectory_errors(student, teacher, bank, runner, torch)
-                for row in rows:
-                    row.update(checkpoint_label=checkpoint_label, condition=bank['label'])
-                all_rows.extend(rows)
-            if bank['label'] in args.gradient_conditions:
-                results = gradient_probes(student, teacher, bank, args, config, runner, torch, np)
-                probes.append(dict(checkpoint_label=checkpoint_label, condition=bank['label'], cases=results))
-            write_json(output / 'gradient_probes.json', probes)
-            mask_comparisons = [dict(checkpoint_label=probe['checkpoint_label'], condition=probe['condition'],
-                                     **case['bias_mask_comparison'])
-                                for probe in probes for case in probe['cases'] if 'bias_mask_comparison' in case]
-            write_json(output / 'gradient_mask_comparison.json', mask_comparisons)
-            write_json(output / 'stage_summary.json', summarize_stages(all_rows))
-        if any(p._version != versions[n] or p.grad is not None for n, p in student.named_parameters()):
-            raise RuntimeError('Student integrity check failed')
-        if any(not torch.equal(b, initial_buffers[n]) for n, b in student.named_buffers()):
-            raise RuntimeError('Student running statistics changed')
+    if args.compare_best_last_bn:
+        all_rows = best_last_bn_probes(student, configurations, banks, args, output, runner, builder, torch, np)
+    else:
+        for checkpoint_label, _, checkpoint_info in configurations:
+            runner.load_student_checkpoint(student, checkpoint_info['checkpoint'], builder, expected_nodes=NODES)
+            student.requires_grad_(True).eval()
+            versions = {name: p._version for name, p in student.named_parameters()}
+            initial_buffers = {name: b.detach().clone() for name, b in student.named_buffers()}
+            for bank in banks:
+                if not args.gradient_only:
+                    print(f'[trajectory] {checkpoint_label}: {bank["label"]}', flush=True)
+                    with isolated_mode(student, 'eval', stable_seed(args.seed, 'trajectory', bank['label']), torch, np):
+                        rows = trajectory_errors(student, teacher, bank, runner, torch)
+                    for row in rows:
+                        row.update(checkpoint_label=checkpoint_label, condition=bank['label'])
+                    all_rows.extend(rows)
+                if bank['label'] in args.gradient_conditions:
+                    results = gradient_probes(student, teacher, bank, args, config, runner, torch, np)
+                    probes.append(dict(checkpoint_label=checkpoint_label, condition=bank['label'], cases=results))
+                write_json(output / 'gradient_probes.json', probes)
+                mask_comparisons = [dict(checkpoint_label=probe['checkpoint_label'], condition=probe['condition'],
+                                         **case['bias_mask_comparison'])
+                                    for probe in probes for case in probe['cases'] if 'bias_mask_comparison' in case]
+                write_json(output / 'gradient_mask_comparison.json', mask_comparisons)
+                write_json(output / 'stage_summary.json', summarize_stages(all_rows))
+            if any(p._version != versions[n] or p.grad is not None for n, p in student.named_parameters()):
+                raise RuntimeError('Student integrity check failed')
+            if any(not torch.equal(b, initial_buffers[n]) for n, b in student.named_buffers()):
+                raise RuntimeError('Student running statistics changed')
     if teacher.training or any(p.requires_grad or p.grad is not None for p in teacher.parameters()):
         raise RuntimeError('Teacher integrity check failed')
     for path in protected_paths:
@@ -491,6 +657,8 @@ def run(args, output, manifest):
             writer.writerows(all_rows)
     expected_rows = (0 if args.gradient_only else
                      len(configurations) * len(banks) * args.max_shapes * args.patches_per_shape * 4)
+    if args.compare_best_last_bn:
+        expected_rows *= 2  # Both BN-buffer sets are evaluated for each learned-parameter set.
     if len(all_rows) != expected_rows or len(probes) != len(configurations) * len(args.gradient_conditions):
         raise RuntimeError('Incomplete diagnostic enumeration')
     manifest.update(status='completed', stage_rows=len(all_rows), gradient_probe_batches=len(probes),
@@ -524,10 +692,16 @@ def main():
     parser.add_argument('--patches_per_shape', type=int, default=2)
     parser.add_argument('--gradient_conditions', nargs='*', default=['10k_1pct', '50k_3pct'])
     parser.add_argument('--gradient_only', action='store_true', help='Skip the previously measured stage-error forwards')
+    parser.add_argument('--compare_best_last_bn', action='store_true',
+                        help='Forward-only best/last comparison with both BN-buffer sets; disables gradient probes')
     parser.add_argument('--teacher_probability', type=float, default=0.2)
     parser.add_argument('--seed', type=int, default=2024)
     parser.add_argument('--device', type=int, default=0)
     args = parser.parse_args()
+    if args.compare_best_last_bn:
+        if args.reference_train_root is not None or args.gradient_only:
+            raise ValueError('--compare_best_last_bn uses best and last from one run with forward-only probes')
+        args.gradient_conditions = []
     if (not 1 <= args.max_shapes <= 20 or args.patches_per_shape < 1 or args.device < 0
             or not 0 <= args.seed < 2 ** 32 or not 0 <= args.teacher_probability <= 1
             or not math.isfinite(args.teacher_probability)):
@@ -545,8 +719,13 @@ def main():
                 if not (value / name).is_file():
                     raise FileNotFoundError(value / name)
             setattr(args, key, value)
+    if args.compare_best_last_bn:
+        for name in ('ckpt-last.pth', 'validation_manifest.json'):
+            if not (args.train_root / name).is_file():
+                raise FileNotFoundError(args.train_root / name)
+    output_prefix = 'teacher10_best_last_bn' if args.compare_best_last_bn else 'teacher10_diagnostic'
     output = (args.output_dir.expanduser().resolve() if args.output_dir else
-              args.train_root.parent / f'teacher10_diagnostic_{datetime.now():%Y%m%d_%H%M%S}_{os.getpid()}')
+              args.train_root.parent / f'{output_prefix}_{datetime.now():%Y%m%d_%H%M%S}_{os.getpid()}')
     archive_path = output.with_suffix('.zip')
     if archive_path.exists():
         raise FileExistsError(archive_path)
@@ -573,6 +752,9 @@ def main():
         for path in sorted(output.iterdir()):
             if path.is_file():
                 archive.write(path, path.name)
+        if args.compare_best_last_bn:
+            for name in ('train.jsonl', 'manifest.json', 'validation_manifest.json'):
+                archive.write(args.train_root / name, f'training/{name}')
     print(f'ZIP={archive_path}', flush=True)
 
 
