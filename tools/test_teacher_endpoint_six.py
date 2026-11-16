@@ -69,16 +69,18 @@ def main():
             raise FileNotFoundError(path)
     training = json.loads((train / 'manifest.json').read_text(encoding='utf-8'))
     config = training['config']
-    from utils.teacher_endpoint import resolve_teacher_endpoint
+    from utils.teacher_endpoint import resolve_teacher_endpoint, resolve_endpoint_finetune
     endpoint = resolve_teacher_endpoint(config)
-    if endpoint is None:
+    finetune = resolve_endpoint_finetune(config)
+    if endpoint is None and finetune is None:
         raise ValueError('This command requires a Teacher10 endpoint-alignment run')
     if config['dataset']['_base_']['DATASET'] != 'PUNet':
         raise ValueError('This six-condition command requires the PUNet benchmark')
     logs = [json.loads(line) for line in (train / 'train.jsonl').read_text(encoding='utf-8-sig').splitlines()
             if line.strip()]
     planned_epochs = training['arguments'].get('epochs') or config['epochs']
-    if [r['epoch'] for r in logs] != list(range(1, planned_epochs + 1)):
+    first_epoch = 0 if finetune is not None else 1
+    if [r['epoch'] for r in logs] != list(range(first_epoch, planned_epochs + 1)):
         raise ValueError('Training has not completed the full declared epoch plan')
     best = min(logs, key=lambda row: row['val_rollout_score'])
     if logs[-1]['best_epoch'] != best['epoch']:
@@ -95,18 +97,28 @@ def main():
     saved = torch.load(checkpoint, **load_options)
     if (saved['epoch'] != best['epoch'] or saved['distillation'] != training['schedule']
             or saved.get('teacher_endpoint') != endpoint
-            or saved.get('training_input') != config['training_input']
-            or saved.get('teacher_endpoint_protocol') != training.get('teacher_endpoint_protocol')):
+            or saved.get('training_input') != config.get('training_input')
+            or saved.get('teacher_endpoint_protocol') != training.get('teacher_endpoint_protocol')
+            or saved.get('endpoint_finetune') != finetune
+            or saved.get('endpoint_finetune_protocol') != training.get('endpoint_finetune_protocol')):
         raise ValueError('ckpt-best.pth does not match this run / best epoch / objective')
     endpoint_protocol = saved.get('teacher_endpoint_protocol')
-    if (endpoint.get('mask_pre_bn_conv_bias', False)
+    if ((endpoint or {}).get('mask_pre_bn_conv_bias', False)
             and (not isinstance(endpoint_protocol, dict) or not endpoint_protocol.get('excluded_parameters'))):
         raise ValueError('Masked endpoint run is missing its actual excluded parameter names')
+    if finetune is not None:
+        if (saved.get('initialization') != training.get('initialization')
+                or not saved.get('endpoint_finetune_protocol', {}).get('frozen_parameters')
+                or logs[0].get('phase') != 'initial_validation'
+                or not all(row.get('frozen_buffers_verified') and row.get('frozen_biases_verified') for row in logs)):
+            raise ValueError('Endpoint fine-tuning initialization or frozen-state verification is incomplete')
     del saved
 
     import yaml
     stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    variant = 'endpoint_masked' if endpoint.get('mask_pre_bn_conv_bias', False) else 'endpoint'
+    variant = 'endpoint_masked' if (endpoint or {}).get('mask_pre_bn_conv_bias', False) else 'endpoint'
+    if finetune is not None:
+        variant = 'endpoint_finetune'
     result_root = (args.output_root.expanduser().resolve() if args.output_root else
                    train.parent / f'six_condition_metrics_10to4_{variant}_{stamp}_{os.getpid()}')
     archive_path = result_root.with_suffix('.zip')
@@ -120,6 +132,11 @@ def main():
                      schedule=training['schedule'], teacher_endpoint=endpoint,
                      teacher_endpoint_protocol=endpoint_protocol,
                      test_seed=args.seed, results=[])
+    if finetune is not None:
+        selection.update(endpoint_finetune=finetune,
+                         endpoint_finetune_protocol=training['endpoint_finetune_protocol'],
+                         initialization=training['initialization'],
+                         epoch0_validation_score=logs[0]['val_rollout_score'])
     print(f'TRAIN_ROOT={train}\nbest_epoch={best["epoch"]}\nRESULT_ROOT={result_root}', flush=True)
     outputs = []
     for points in (10000, 50000):

@@ -21,7 +21,9 @@ from utils.training_input import (resolve_training_input, teacher_input_probabil
                                   training_input_metadata, sample_teacher_input_mask,
                                   summarize_input_stages, summarize_training_targets)
 from utils.teacher_endpoint import (resolve_teacher_endpoint, endpoint_grad_ratio,
-                                    endpoint_metadata, accumulate_teacher_endpoint)
+                                    endpoint_metadata, accumulate_teacher_endpoint,
+                                    resolve_endpoint_finetune, finetune_metadata,
+                                    pre_bn_conv_biases, continuous_endpoint_loss)
 
 TEACHER_NODES = (0, 4, 8, 12, 16)
 TEACHER10_NODES = (0, 2, 5, 7, 10)
@@ -921,6 +923,11 @@ def _save_checkpoint(path, student, optimizer, epoch, teacher_path, config, sele
     if endpoint is not None:
         payload['teacher_endpoint'] = endpoint
         payload['teacher_endpoint_protocol'] = endpoint_metadata(endpoint, student)
+    finetune = resolve_endpoint_finetune(config)
+    if finetune is not None:
+        payload['endpoint_finetune'] = finetune
+        payload['endpoint_finetune_protocol'] = finetune_metadata(finetune, student)
+        payload['initialization'] = student.endpoint_finetune_initialization
     if optimizer is not None:
         payload['optimizer'] = optimizer.state_dict()
     torch.save(payload, temporary)
@@ -950,6 +957,165 @@ def save_epoch_checkpoints(output, student, optimizer, epoch, teacher_path, conf
                          teacher_path, config, selection,
                          best_val_rollout_score=best_score, best_epoch=best_epoch, curriculum_state=curriculum_state)
     return best_score, best_epoch, improved
+
+
+def validate_endpoint(student, bank, seed):
+    import numpy as np
+    import torch
+    device = next(student.parameters()).device
+    python_state, numpy_state = random.getstate(), np.random.get_state()
+    total, count = 0.0, 0
+    try:
+        with torch.random.fork_rng(devices=[device.index] if device.type == 'cuda' else []), torch.no_grad():
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.random.default_generator.manual_seed(seed)
+            if device.type == 'cuda':
+                with torch.cuda.device(device):
+                    torch.cuda.manual_seed(seed)
+            for nodes, sigma0 in bank:
+                sigmas = _sigma_batch(sigma0, nodes.shape[1], device, nodes.dtype)
+                for index in range(nodes.shape[1]):
+                    loss = continuous_endpoint_loss(
+                        student, nodes[0, index:index + 1].to(device), nodes[-1, index:index + 1].to(device),
+                        sigmas[index:index + 1], forward_student_interval, gradient_checkpointing=False)
+                    total += float(loss)
+                    count += 1
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+    if not count:
+        raise ValueError('Endpoint validation bank is empty')
+    return dict(val_loss_teacher_endpoint=total / count, val_patches=count)
+
+
+def finetune_endpoint(args, config, builder, device, teacher_path, output):
+    import inspect
+    import torch
+    options = resolve_endpoint_finetune(config)
+    run_started = time.perf_counter()
+    epochs = args.epochs or int(config.epochs)
+    stop_epoch = args.stop_after_epoch or epochs
+    if not 1 <= stop_epoch <= epochs:
+        raise ValueError('stop_after_epoch must be within the declared fine-tuning plan')
+    dataset = config.dataset._base_
+    if not (0.005 <= float(dataset.NOISE_MIN) <= float(dataset.NOISE_MAX) <= 0.02):
+        raise ValueError('Endpoint fine-tuning requires training noise within 0.5%-2%')
+    initial_path = Path(args.init_student_ckpt)
+    load_options = dict(map_location='cpu')
+    if 'weights_only' in inspect.signature(torch.load).parameters:
+        load_options['weights_only'] = False
+    initial = torch.load(initial_path, **load_options)
+    if initial.get('distillation') != schedule(TEACHER10_NODES) or initial.get('model_config') != dict(config.model):
+        raise ValueError('Initial Student checkpoint must match this Teacher10/Student4 model and schedule')
+    initial_state = initial.get('base_model')
+    if not initial_state or not any(key.replace('module.', '').startswith('step_condition.') for key in initial_state):
+        raise ValueError('Initial Student checkpoint requires the complete step-conditioned state')
+    digest = hashlib.sha256()
+    with initial_path.open('rb') as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(block)
+    initialization = dict(checkpoint=str(initial_path), checkpoint_sha256=digest.hexdigest(),
+                          source_epoch=initial['epoch'], source_selection=initial.get('selection'),
+                          source_teacher_checkpoint=initial.get('teacher_checkpoint'),
+                          source_teacher_endpoint=initial.get('teacher_endpoint'), optimizer_state='fresh')
+    teacher = builder.model_builder(config.model).to(device)
+    builder.load_model(teacher, str(teacher_path))
+    freeze_teacher(teacher)
+    student = builder.model_builder(config.model).to(device)
+    load_student_state(student, initial_state)
+    del initial_state, initial
+    student.requires_grad_(True).eval()
+    excluded = pre_bn_conv_biases(student, torch)
+    if not excluded:
+        raise ValueError('Expected pre-BatchNorm Conv biases in the initial Student')
+    parameters_by_name = dict(student.named_parameters())
+    for name in excluded:
+        parameters_by_name[name].requires_grad_(False)
+    student.endpoint_finetune_initialization = initialization
+    frozen_values = {name: parameters_by_name[name].detach().clone() for name in excluded}
+    frozen_buffers = {name: value.detach().clone() for name, value in student.named_buffers()}
+    trainable = [parameter for parameter in student.parameters() if parameter.requires_grad]
+    optimizer = torch.optim.AdamW(trainable, lr=float(config.learning_rate), weight_decay=float(config.weight_decay))
+    manifest_path = output / 'manifest.json'
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    manifest.update(initialization=initialization, endpoint_finetune_protocol=finetune_metadata(options, student))
+    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding='utf-8')
+    loader = _train_loader(config)
+    bank, metadata = _validation_bank(config, teacher)
+    metadata.update(metric='val_loss_teacher_endpoint', teacher_forced=False,
+                    target='cached_teacher_T10_from_same_noisy_T0', selection_metric='val_rollout_score')
+    (output / 'validation_manifest.json').write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding='utf-8')
+    best_score, best_epoch = float('inf'), None
+    print(f'[endpoint-finetune] source_epoch={initialization["source_epoch"]}; frozen_biases={excluded}; '
+          f'epochs={epochs}; lr={config.learning_rate}; epoch0 included in selection', flush=True)
+    with (output / 'train.jsonl').open('w', encoding='utf-8') as log:
+        for epoch in range(stop_epoch + 1):
+            epoch_started = time.perf_counter()
+            total, seen, grad_norm_sum = 0.0, 0, 0.0
+            student.eval()
+            if epoch > 0:
+                for batch_index, (noisy, clean, sigmas, _centers, _scales, _names) in enumerate(loader):
+                    if args.max_patch_batches and batch_index >= args.max_patch_batches:
+                        break
+                    if args.max_shapes and seen >= args.max_shapes:
+                        break
+                    if noisy.shape != clean.shape or sigmas is None:
+                        raise ValueError('Training requires aligned noisy/clean patches and per-patch sigma')
+                    if args.max_shapes:
+                        noisy, sigmas = noisy[:args.max_shapes - seen], sigmas[:args.max_shapes - seen]
+                    count = noisy.shape[0]
+                    nodes = capture_teacher(teacher, noisy, sigmas, int(config.teacher_patch_batch),
+                                            teacher_nodes=TEACHER10_NODES)
+                    sigma_batch = _sigma_batch(sigmas, count, device, nodes.dtype)
+                    optimizer.zero_grad(set_to_none=True)
+                    for offset in range(0, count, options['patch_batch']):
+                        end = min(count, offset + options['patch_batch'])
+                        size = end - offset
+                        loss = continuous_endpoint_loss(
+                            student, nodes[0, offset:end].to(device), nodes[-1, offset:end].to(device),
+                            sigma_batch[offset:end], forward_student_interval,
+                            gradient_checkpointing=options['gradient_checkpointing'])
+                        (loss * (size / count)).backward()
+                        total += float(loss.detach()) * size
+                        del loss
+                    check_gradients(teacher, student)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(trainable, float(config.grad_norm_clip), error_if_nonfinite=True)
+                    grad_norm_sum += float(grad_norm) * count
+                    optimizer.step()
+                    seen += count
+                    del nodes
+                    print(f'[endpoint-finetune] epoch={epoch} batch={batch_index + 1}/{len(loader)} '
+                          f'patches_seen={seen}', flush=True)
+                if not seen:
+                    raise RuntimeError('No endpoint fine-tuning updates were performed')
+            torch.cuda.synchronize(device)
+            train_seconds = time.perf_counter() - epoch_started
+            validation = validate_endpoint(student, bank, int(config.validation_seed))
+            validation.update(validate_rollout(student, config, teacher_nodes=TEACHER10_NODES))
+            if any(module.training for module in student.modules()):
+                raise RuntimeError('Endpoint fine-tuning requires eval mode for all Student modules')
+            if any(not torch.equal(value, frozen_buffers[name]) for name, value in student.named_buffers()):
+                raise RuntimeError('Student buffers changed during endpoint fine-tuning')
+            if any(parameters_by_name[name].grad is not None or not torch.equal(parameters_by_name[name], value)
+                   for name, value in frozen_values.items()):
+                raise RuntimeError('Frozen pre-BN Conv bias changed during endpoint fine-tuning')
+            best_score, best_epoch, improved = save_epoch_checkpoints(
+                output, student, optimizer, epoch, teacher_path, config, validation, best_score, best_epoch)
+            record = dict(epoch=epoch, phase='initial_validation' if epoch == 0 else 'endpoint_finetune',
+                          patches=seen, teacher_steps=10, student_steps=4, teacher_nodes=list(TEACHER10_NODES),
+                          loss_teacher_endpoint=total / seen if seen else None,
+                          loss_total=total / seen if seen else None,
+                          endpoint_grad_norm_mean=grad_norm_sum / seen if seen else None,
+                          best_epoch=best_epoch, best_val_rollout_score=best_score, is_best=improved,
+                          initial_student_epoch=initialization['source_epoch'], frozen_buffers_verified=True,
+                          frozen_biases_verified=True, total_planned_epochs=epochs,
+                          stop_after_epoch=args.stop_after_epoch, train_seconds=train_seconds,
+                          epoch_seconds=time.perf_counter() - epoch_started,
+                          run_elapsed_seconds=time.perf_counter() - run_started, **validation)
+            log.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + '\n')
+            log.flush()
+            print(json.dumps(record, ensure_ascii=False, allow_nan=False), flush=True)
 
 
 def train(args, config, builder, device, checkpoint_path, output):
@@ -1452,6 +1618,7 @@ def _build_parser():
     parser.add_argument('--mode', choices=['train', 'test'], required=True)
     parser.add_argument('--teacher_ckpt', help='训练必填：最佳 PointGPT-L 去噪 checkpoint')
     parser.add_argument('--student_ckpt', help='测试必填：蒸馏后的 Student checkpoint')
+    parser.add_argument('--init_student_ckpt', help='endpoint_finetune 训练初始化用的完整 Student checkpoint')
     parser.add_argument('--resume', help='训练续跑已有 ckpt-last.pth；仍需 teacher_ckpt，使用新输出目录')
     parser.add_argument('--output_dir', required=True, help='新的输出目录，拒绝覆盖已有文件')
     parser.add_argument('--device', type=int, default=0)
@@ -1500,6 +1667,18 @@ def main():
     config = cfg_from_yaml_file(str(config_path))
     resolved_curriculum = resolve_curriculum(config)
     endpoint = resolve_teacher_endpoint(config)
+    finetune = resolve_endpoint_finetune(config)
+    if args.init_student_ckpt:
+        if args.mode != 'train' or finetune is None:
+            raise ValueError('--init_student_ckpt requires endpoint_finetune training')
+        args.init_student_ckpt = str(Path(args.init_student_ckpt).expanduser().resolve())
+        if not Path(args.init_student_ckpt).is_file():
+            raise FileNotFoundError(args.init_student_ckpt)
+        if Path(args.init_student_ckpt) == checkpoint_path:
+            raise ValueError('Teacher and initial Student must be separate checkpoints')
+    if finetune is not None and args.mode == 'train':
+        if not args.init_student_ckpt or args.resume:
+            raise ValueError('endpoint_finetune starts from --init_student_ckpt with a fresh optimizer')
     if args.resume:
         require_supported_resume(resolved_curriculum)
     teacher_nodes = configured_teacher_nodes(config)
@@ -1524,9 +1703,15 @@ def main():
                        config=config, arguments=vars(args), schedule=schedule(teacher_nodes),
                        gpu_memory_limit=gpu_memory_limit)
         if args.mode == 'train':
-            manifest['training_input_protocol'] = training_input_metadata(resolved_curriculum['training_input'])
+            manifest['training_input_protocol'] = (
+                dict(type='continuous_student_rollout', first_stage='noisy_T0',
+                     target='cached_teacher_T10', student_state_detached=False)
+                if finetune is not None else training_input_metadata(resolved_curriculum['training_input']))
         if endpoint is not None:
             manifest['teacher_endpoint_protocol'] = endpoint_metadata(endpoint)
+        if finetune is not None:
+            manifest['endpoint_finetune_protocol'] = finetune_metadata(finetune)
+        if endpoint is not None or finetune is not None:
             source_files = ('tools/runner_distill.py', 'utils/teacher_endpoint.py',
                             'utils/training_input.py', 'models/PointGPT.py', 'models/step_condition.py',
                             'tools/runner_finetune.py', 'datasets/ScoreDenoiseDataset.py')
@@ -1538,7 +1723,10 @@ def main():
         json.dump(manifest, handle, indent=2, ensure_ascii=False)
     device = torch.device(f'cuda:{args.device}')
     if args.mode == 'train':
-        train(args, config, builder, device, checkpoint_path, output)
+        if finetune is not None:
+            finetune_endpoint(args, config, builder, device, checkpoint_path, output)
+        else:
+            train(args, config, builder, device, checkpoint_path, output)
     else:
         test(args, config, builder, device, checkpoint_path, output)
 

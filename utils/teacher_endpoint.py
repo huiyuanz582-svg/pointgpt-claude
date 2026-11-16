@@ -51,6 +51,61 @@ def endpoint_grad_ratio(options, epoch):
     return options['target_grad_ratio'] * progress
 
 
+def resolve_endpoint_finetune(config):
+    get = config.get if isinstance(config, Mapping) else lambda key, default=None: getattr(config, key, default)
+    supplied = get('endpoint_finetune')
+    if supplied is None:
+        return None
+    keys = {'patch_batch', 'gradient_checkpointing', 'freeze_pre_bn_conv_bias'}
+    if not isinstance(supplied, Mapping) or set(supplied) != keys:
+        raise ValueError('endpoint_finetune requires: ' + ', '.join(sorted(keys)))
+    options = dict(supplied)
+    if type(options['patch_batch']) is not int or options['patch_batch'] < 1:
+        raise ValueError('endpoint_finetune.patch_batch must be a positive integer')
+    if type(options['gradient_checkpointing']) is not bool or options['freeze_pre_bn_conv_bias'] is not True:
+        raise ValueError('endpoint_finetune requires boolean checkpointing and freeze_pre_bn_conv_bias=true')
+    if (get('curriculum_mode') != 'fixed'
+            or get('distillation', {}).get('teacher_nodes') != [0, 2, 5, 7, 10]
+            or get('teacher_endpoint') is not None or get('training_input') is not None
+            or get('pcd_dynamic', {}).get('shadow_enabled', False)):
+        raise ValueError('endpoint_finetune requires fixed Teacher10/Student4 with its own endpoint-only objective')
+    return options
+
+
+def finetune_metadata(options, student=None):
+    import torch
+    return dict(config=dict(options), target='cached_teacher_T10_from_same_noisy_T0',
+                loss='mean_per_point_squared_l2', loss_weight=1.0,
+                student_rollout='continuous_without_teacher_inputs_or_interstage_detach',
+                student_mode='eval_with_autograd', batchnorm_running_statistics='fixed_from_initial_student',
+                frozen_parameters=pre_bn_conv_biases(student, torch) if student is not None else None,
+                other_parameters='trainable_including_bn_affine', optimizer='fresh_AdamW',
+                best_selection='val_rollout_score_including_epoch0', clean_target_used=False)
+
+
+def continuous_endpoint_loss(student, state, target, sigma0, forward_fn,
+                             teacher_nodes=(0, 2, 5, 7, 10), teacher_decay=0.95,
+                             gradient_checkpointing=True):
+    """One micro-batch through the connected four-step Student rollout."""
+    import torch
+    from torch.utils.checkpoint import checkpoint
+    state, target, sigma0 = state.detach(), target.detach(), sigma0.detach()
+    if not torch.isfinite(state).all() or not torch.isfinite(target).all():
+        raise FloatingPointError('Nonfinite cached Teacher endpoint/input')
+    for start, stop in zip(teacher_nodes[:-1], teacher_nodes[1:]):
+        sigma = sigma0 * teacher_decay ** start
+
+        # Bind interval values for delayed checkpoint recomputation.
+        def step(points, start_step=start, target_step=stop, interval_sigma=sigma):
+            return forward_fn(student, points, interval_sigma, start_step, target_step)
+
+        state = checkpoint(step, state, use_reentrant=False) if gradient_checkpointing else step(state)
+    loss = (state - target).square().sum(-1).mean()
+    if not torch.isfinite(loss):
+        raise FloatingPointError('Nonfinite endpoint loss')
+    return loss
+
+
 def pre_bn_conv_biases(student, torch):
     """Find biases of consecutive Conv -> BatchNorm children in Sequential."""
     names = set()
@@ -152,7 +207,6 @@ def accumulate_teacher_endpoint(student, nodes, sigma0, options, epoch, forward_
 
     import numpy as np
     import torch
-    from torch.utils.checkpoint import checkpoint
 
     if tuple(teacher_nodes) != (0, 2, 5, 7, 10):
         raise ValueError('Endpoint alignment requires the fixed 10-to-4 nodes')
@@ -187,18 +241,9 @@ def accumulate_teacher_endpoint(student, nodes, sigma0, options, epoch, forward_
                 end = offset + options['patch_batch']
                 state = nodes[0, offset:end].detach().to(device)
                 target = nodes[-1, offset:end].detach().to(device)
-                if not torch.isfinite(state).all() or not torch.isfinite(target).all():
-                    raise FloatingPointError('Nonfinite cached Teacher endpoint/input')
-                for start, stop in zip(teacher_nodes[:-1], teacher_nodes[1:]):
-                    sigma = sigmas[offset:end] * teacher_decay ** start
-
-                    # Bind interval values for delayed checkpoint recomputation.
-                    def step(points, start_step=start, target_step=stop, interval_sigma=sigma):
-                        return forward_fn(student, points, interval_sigma, start_step, target_step)
-
-                    state = (checkpoint(step, state, use_reentrant=False)
-                             if options['gradient_checkpointing'] else step(state))
-                loss = (state - target).square().sum(-1).mean()
+                loss = continuous_endpoint_loss(
+                    student, state, target, sigmas[offset:end], forward_fn,
+                    teacher_nodes, teacher_decay, options['gradient_checkpointing'])
                 if not torch.isfinite(loss) or not loss.requires_grad:
                     raise FloatingPointError('Endpoint loss is nonfinite or has no gradient')
                 size = target.shape[0]

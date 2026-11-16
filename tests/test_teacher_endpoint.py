@@ -4,8 +4,12 @@ These tests are provided for manual use only; no PointGPT/CUDA imports.
 """
 
 import copy
+import importlib.util
 import math
 import random
+from pathlib import Path
+import tempfile
+from types import SimpleNamespace
 import unittest
 
 import numpy as np
@@ -13,7 +17,8 @@ import torch
 
 from utils.teacher_endpoint import (accumulate_teacher_endpoint, endpoint_grad_ratio,
                                     endpoint_metadata, gradient_norm, pre_bn_conv_biases,
-                                    resolve_teacher_endpoint)
+                                    resolve_teacher_endpoint, resolve_endpoint_finetune,
+                                    continuous_endpoint_loss)
 
 
 def options(patch_batch=1, checkpointing=True):
@@ -72,6 +77,79 @@ def set_local_gradients(model):
 
 
 class TeacherEndpointTests(unittest.TestCase):
+    def test_endpoint_finetune_config_requires_its_own_objective(self):
+        settings = dict(patch_batch=1, gradient_checkpointing=True, freeze_pre_bn_conv_bias=True)
+        config = dict(curriculum_mode='fixed', distillation=dict(teacher_nodes=[0, 2, 5, 7, 10]),
+                      endpoint_finetune=settings)
+        self.assertEqual(resolve_endpoint_finetune(config), settings)
+        self.assertIsNone(resolve_endpoint_finetune({}))
+        for field, value in [('training_input', dict(type='scheduled_rollout')), ('teacher_endpoint', options())]:
+            with self.assertRaises(ValueError):
+                resolve_endpoint_finetune(dict(config, **{field: value}))
+
+    def test_direct_endpoint_update_preserves_bias_buffers_and_matches_full_batch_gradient(self):
+        nodes, sigmas = fixtures()
+        nodes.requires_grad_()
+        reference = ToyConvStudent().eval()
+        reference.encoder[0].bias.requires_grad_(False)
+        state = nodes[0].detach()
+        for start, stop in zip((0, 2, 5, 7), (2, 5, 7, 10)):
+            state = reference(state, sigmas * 0.95 ** start, start, stop)
+        loss = (state - nodes[-1].detach()).square().sum(-1).mean()
+        loss.backward()
+        for checkpointing in (False, True):
+            model = ToyConvStudent().eval()
+            model.encoder[0].bias.requires_grad_(False)
+            before = {name: value.clone() for name, value in model.named_buffers()}
+            bias = model.encoder[0].bias.detach().clone()
+            parameters = [p for p in model.parameters() if p.requires_grad]
+            optimizer = torch.optim.AdamW(parameters, lr=1e-6, weight_decay=0)
+            for index in range(3):
+                micro_loss = continuous_endpoint_loss(
+                    model, nodes[0, index:index + 1], nodes[-1, index:index + 1], sigmas[index:index + 1],
+                    forward, gradient_checkpointing=checkpointing)
+                (micro_loss / 3).backward()
+            for actual, expected in zip(model.parameters(), reference.parameters()):
+                if expected.grad is not None:
+                    torch.testing.assert_close(actual.grad, expected.grad)
+            self.assertIsNone(model.encoder[0].bias.grad)
+            original_weight = model.decoder.weight.detach().clone()
+            optimizer.step()
+            self.assertFalse(torch.equal(model.decoder.weight, original_weight))
+            torch.testing.assert_close(model.encoder[0].bias, bias)
+            for name, value in model.named_buffers():
+                torch.testing.assert_close(value, before[name])
+        self.assertIsNone(nodes.grad)
+
+    def test_epoch_zero_checkpoint_survives_worse_epochs_and_can_be_replaced(self):
+        path = Path(__file__).resolve().parents[1] / 'tools/runner_distill.py'
+        spec = importlib.util.spec_from_file_location('endpoint_test_runner', path)
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        settings = dict(patch_batch=1, gradient_checkpointing=True, freeze_pre_bn_conv_bias=True)
+        config = SimpleNamespace(curriculum_mode='fixed', distillation=runner.schedule((0, 2, 5, 7, 10)),
+                                 model={}, endpoint_finetune=settings)
+        student = ToyConvStudent().eval()
+        student.encoder[0].bias.requires_grad_(False)
+        student.endpoint_finetune_initialization = dict(source_epoch=6, checkpoint_sha256='fixture')
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            score, epoch, improved = runner.save_epoch_checkpoints(
+                output, student, None, 0, Path('teacher.pth'), config, dict(val_rollout_score=2.0), float('inf'), None)
+            self.assertEqual((score, epoch, improved), (2.0, 0, True))
+            before = (output / 'ckpt-best.pth').read_bytes()
+            score, epoch, improved = runner.save_epoch_checkpoints(
+                output, student, None, 1, Path('teacher.pth'), config, dict(val_rollout_score=2.1), score, epoch)
+            self.assertEqual((score, epoch, improved), (2.0, 0, False))
+            self.assertEqual((output / 'ckpt-best.pth').read_bytes(), before)
+            score, epoch, improved = runner.save_epoch_checkpoints(
+                output, student, None, 2, Path('teacher.pth'), config, dict(val_rollout_score=1.9), score, epoch)
+            saved = torch.load(output / 'ckpt-best.pth', map_location='cpu', weights_only=False)
+            self.assertEqual((score, epoch, improved), (1.9, 2, True))
+            self.assertEqual(saved['epoch'], 2)
+            self.assertEqual(saved['initialization']['source_epoch'], 6)
+            self.assertEqual(saved['endpoint_finetune_protocol']['frozen_parameters'], ['encoder.0.bias'])
+
     def test_optional_mask_preserves_legacy_options_and_rejects_non_bool(self):
         config = dict(curriculum_mode='fixed', distillation=dict(teacher_nodes=[0, 2, 5, 7, 10]),
                       training_input=dict(type='scheduled_rollout', student_target='teacher_from_student_input'),

@@ -1,5 +1,72 @@
 # Teacher10 endpoint alignment for the four-step Student
 
+## Short endpoint fine-tuning from best6
+
+Use `cfgs/PointGPT-L/distill_10to4_endpoint_finetune.yaml` with
+`--init_student_ckpt` for the second training phase. The supplied experiment
+starts from the complete masked endpoint best6 Student, including its BN
+running statistics and step-conditioning weights. The original Teacher
+checkpoint supplies the cached Teacher10 targets.
+
+The configuration runs three epochs with a fresh AdamW optimizer, learning
+rate 1e-6, batch size 8 and endpoint micro-batch size 1. Training samples use
+the existing 0.5%-2% noise range. Each noisy patch passes continuously through
+Student intervals `[0,2,5,7,10]`. The objective is the mean corresponding-point
+squared L2 distance from Student4(T0) to detached Teacher10(T0), with weight 1.
+
+Student runs in eval mode with autograd enabled and non-reentrant gradient
+checkpointing. Its BN buffers and pre-BN Conv biases are fixed at their loaded
+values. Other learned parameters, including BN affine parameters, participate
+in optimization when they receive gradients. Every epoch verifies the fixed
+buffers and biases before saving checkpoints.
+
+Before the first optimizer step, epoch0 evaluates both fixed-patch endpoint
+MSE and the existing whole-cloud validation Score. Epochs 1-3 use the same
+validation protocol. `ckpt-best.pth` selects the minimum validation Score over
+epochs 0-3. When best remains epoch0, its model state is the initial best6
+Student. Checkpoint metadata records both the new epoch and source epoch 6.
+`ckpt-last.pth` records the latest phase epoch and its optimizer state.
+
+Sync the runner, endpoint utility, configuration and six-condition test script
+to the server, then execute this block.
+
+```bash
+cd /workspace
+INIT_ROOT="/workspace/experiments/input_ablation/mixed_10to4_endpoint_masked_seed0_20261112_075942_40/train"
+RUN_ROOT="experiments/input_ablation/mixed_10to4_endpoint_finetune_seed0_$(date +%Y%m%d_%H%M%S)_$$"
+CUDA_VISIBLE_DEVICES=0 python -u tools/runner_distill.py --mode train \
+  --config cfgs/PointGPT-L/distill_10to4_endpoint_finetune.yaml \
+  --teacher_ckpt experiments/L_consistency_plus/ckpt-best.pth \
+  --init_student_ckpt "$INIT_ROOT/ckpt-best.pth" \
+  --output_dir "$RUN_ROOT/train" --device 0 --seed 0
+```
+
+`train.jsonl` contains four rows, starting with epoch0. Follow
+`val_loss_teacher_endpoint`, `val_rollout_score`, `best_epoch`, and the
+`frozen_buffers_verified` / `frozen_biases_verified` fields. The manifest and
+checkpoints record the initial Student SHA256 and source selection metadata.
+
+After training, run this block in the same shell. In a new shell, assign
+`TRAIN_ROOT` the absolute path of this fine-tuning run's `train` directory.
+
+```bash
+cd /workspace
+TRAIN_ROOT="$RUN_ROOT/train"
+CUDA_VISIBLE_DEVICES=0 python -u tools/test_teacher_endpoint_six.py \
+  --train_root "$TRAIN_ROOT" --device 0 --seed 0
+```
+
+The test helper verifies the complete epoch0-3 log and selected checkpoint,
+evaluates six conditions with 20 clouds each, and creates
+`six_condition_metrics_10to4_endpoint_finetune_<timestamp>_<pid>.zip`.
+The archive includes the three training records, selection and initialization
+metadata, and six sets of metrics. The last line prints its absolute ZIP path.
+
+The new path has received static syntax and code review. Manual regression
+tests cover endpoint gradients across micro-batches, frozen buffers and biases,
+and preservation or replacement of the epoch0 best checkpoint. Runtime and
+benchmark behavior await the server run.
+
 Base branch: `paper2-teacher10-student4`, commit
 `7bc43fc4db501392e487dcbb1fa7b7a40c757cb4`.
 
