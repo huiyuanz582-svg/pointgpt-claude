@@ -2,6 +2,21 @@
 
 会话改动记录 —— 不会替代 commit message 和 CLAUDE.md,只是给一个鸟瞰视角。
 
+## Session 2026-11-17: Teacher10 / Student4 六项效率比较
+
+新增独立手动入口 `tools/benchmark_teacher10_six.py` 和汇总绘图工具
+`utils/denoise_benchmark_report.py`。比较微调前、一轮、三轮四步学生，以及同一教师
+直接执行 2/4/6/8/10 步，覆盖六条件各 20 云。复用现有推理和 CD/P2M，保持评分不变。
+
+每组独立进程、一个模型，默认完整整云预热 2 次、正式计时 3 轮。
+计时包含分块、模型迭代和融合，排除 I/O、数据传输及质量指标。
+先完成全部计时与显存峰值统计，再计算质量，避免指标分配污染显存。
+记录原始耗时、allocated/reserved 峰值、吞吐量、参数量、checkpoint/输入/源码指纹。
+自动生成六条件耗时—CD/P2M 的 PNG/PDF、汇总 CSV/JSON 和一个 ZIP。
+支持同计划中断续跑，以及仅用已有结果重新绘图。详见 `docs/teacher10_efficiency.md`。
+
+没有运行训练、测试、GPU 诊断或 CPU 单测，没有提交代码。运行验证由用户在服务器执行。
+
 ## Session 2026-06-03:PointGPT 去噪重构(3 个 commit)
 
 ### 背景
