@@ -119,6 +119,9 @@ def main():
     variant = 'endpoint_masked' if (endpoint or {}).get('mask_pre_bn_conv_bias', False) else 'endpoint'
     if finetune is not None:
         variant = 'endpoint_finetune'
+        if finetune.get('local_weight', 0) > 0:
+            variant = ('local_endpoint_finetune' if finetune.get('endpoint_weight', 1) > 0
+                       else 'local_finetune')
     result_root = (args.output_root.expanduser().resolve() if args.output_root else
                    train.parent / f'six_condition_metrics_10to4_{variant}_{stamp}_{os.getpid()}')
     archive_path = result_root.with_suffix('.zip')

@@ -23,7 +23,8 @@ from utils.training_input import (resolve_training_input, teacher_input_probabil
 from utils.teacher_endpoint import (resolve_teacher_endpoint, endpoint_grad_ratio,
                                     endpoint_metadata, accumulate_teacher_endpoint,
                                     resolve_endpoint_finetune, finetune_metadata,
-                                    pre_bn_conv_biases, continuous_endpoint_loss)
+                                    pre_bn_conv_biases, continuous_endpoint_loss,
+                                    continuous_finetune_losses)
 
 TEACHER_NODES = (0, 4, 8, 12, 16)
 TEACHER10_NODES = (0, 2, 5, 7, 10)
@@ -993,6 +994,8 @@ def finetune_endpoint(args, config, builder, device, teacher_path, output):
     import inspect
     import torch
     options = resolve_endpoint_finetune(config)
+    local_weight = options.get('local_weight', 0.0)
+    endpoint_weight = options.get('endpoint_weight', 1.0)
     run_started = time.perf_counter()
     epochs = args.epochs or int(config.epochs)
     stop_epoch = args.stop_after_epoch or epochs
@@ -1022,6 +1025,11 @@ def finetune_endpoint(args, config, builder, device, teacher_path, output):
     teacher = builder.model_builder(config.model).to(device)
     builder.load_model(teacher, str(teacher_path))
     freeze_teacher(teacher)
+
+    def local_teacher_target(points, sigma0, start, stop):
+        return teacher_interval_target(teacher, points, sigma0, start, stop,
+                                       patch_batch=int(config.teacher_patch_batch))
+
     student = builder.model_builder(config.model).to(device)
     load_student_state(student, initial_state)
     del initial_state, initial
@@ -1048,11 +1056,13 @@ def finetune_endpoint(args, config, builder, device, teacher_path, output):
     (output / 'validation_manifest.json').write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding='utf-8')
     best_score, best_epoch = float('inf'), None
     print(f'[endpoint-finetune] source_epoch={initialization["source_epoch"]}; frozen_biases={excluded}; '
-          f'epochs={epochs}; lr={config.learning_rate}; epoch0 included in selection', flush=True)
+          f'epochs={epochs}; lr={config.learning_rate}; local_weight={local_weight}; '
+          f'endpoint_weight={endpoint_weight}; epoch0 included in selection', flush=True)
     with (output / 'train.jsonl').open('w', encoding='utf-8') as log:
         for epoch in range(stop_epoch + 1):
             epoch_started = time.perf_counter()
             total, seen, grad_norm_sum = 0.0, 0, 0.0
+            local_total, endpoint_total, stage_totals = 0.0, 0.0, [0.0] * 4
             student.eval()
             if epoch > 0:
                 for batch_index, (noisy, clean, sigmas, _centers, _scales, _names) in enumerate(loader):
@@ -1065,26 +1075,37 @@ def finetune_endpoint(args, config, builder, device, teacher_path, output):
                     if args.max_shapes:
                         noisy, sigmas = noisy[:args.max_shapes - seen], sigmas[:args.max_shapes - seen]
                     count = noisy.shape[0]
-                    nodes = capture_teacher(teacher, noisy, sigmas, int(config.teacher_patch_batch),
-                                            teacher_nodes=TEACHER10_NODES)
-                    sigma_batch = _sigma_batch(sigmas, count, device, nodes.dtype)
+                    # A local-only ablation does not need the extra global Teacher10 pass.
+                    nodes = (capture_teacher(teacher, noisy, sigmas, int(config.teacher_patch_batch),
+                                             teacher_nodes=TEACHER10_NODES) if endpoint_weight else None)
+                    inputs = nodes[0] if nodes is not None else noisy
+                    sigma_batch = _sigma_batch(sigmas, count, device, inputs.dtype)
                     optimizer.zero_grad(set_to_none=True)
                     for offset in range(0, count, options['patch_batch']):
                         end = min(count, offset + options['patch_batch'])
                         size = end - offset
-                        loss = continuous_endpoint_loss(
-                            student, nodes[0, offset:end].to(device), nodes[-1, offset:end].to(device),
+                        losses = continuous_finetune_losses(
+                            student, inputs[offset:end].to(device),
+                            nodes[-1, offset:end].to(device) if nodes is not None else None,
                             sigma_batch[offset:end], forward_student_interval,
+                            teacher_target_fn=local_teacher_target,
+                            local_weight=local_weight, endpoint_weight=endpoint_weight,
                             gradient_checkpointing=options['gradient_checkpointing'])
-                        (loss * (size / count)).backward()
-                        total += float(loss.detach()) * size
-                        del loss
+                        (losses['loss'] * (size / count)).backward()
+                        total += float(losses['loss'].detach()) * size
+                        if losses['endpoint'] is not None:
+                            endpoint_total += float(losses['endpoint'].detach()) * size
+                        if losses['local'] is not None:
+                            local_total += float(losses['local'].detach()) * size
+                            for stage, value in enumerate(losses['stages']):
+                                stage_totals[stage] += float(value.detach()) * size
+                        del losses
                     check_gradients(teacher, student)
                     grad_norm = torch.nn.utils.clip_grad_norm_(trainable, float(config.grad_norm_clip), error_if_nonfinite=True)
                     grad_norm_sum += float(grad_norm) * count
                     optimizer.step()
                     seen += count
-                    del nodes
+                    del nodes, inputs
                     print(f'[endpoint-finetune] epoch={epoch} batch={batch_index + 1}/{len(loader)} '
                           f'patches_seen={seen}', flush=True)
                 if not seen:
@@ -1104,15 +1125,24 @@ def finetune_endpoint(args, config, builder, device, teacher_path, output):
                 output, student, optimizer, epoch, teacher_path, config, validation, best_score, best_epoch)
             record = dict(epoch=epoch, phase='initial_validation' if epoch == 0 else 'endpoint_finetune',
                           patches=seen, teacher_steps=10, student_steps=4, teacher_nodes=list(TEACHER10_NODES),
-                          loss_teacher_endpoint=total / seen if seen else None,
+                          loss_teacher_endpoint=endpoint_total / seen if seen and endpoint_weight else None,
                           loss_total=total / seen if seen else None,
-                          endpoint_grad_norm_mean=grad_norm_sum / seen if seen else None,
                           best_epoch=best_epoch, best_val_rollout_score=best_score, is_best=improved,
                           initial_student_epoch=initialization['source_epoch'], frozen_buffers_verified=True,
                           frozen_biases_verified=True, total_planned_epochs=epochs,
                           stop_after_epoch=args.stop_after_epoch, train_seconds=train_seconds,
                           epoch_seconds=time.perf_counter() - epoch_started,
                           run_elapsed_seconds=time.perf_counter() - run_started, **validation)
+            if 'local_weight' in options:
+                record.update(
+                    loss_teacher_local=local_total / seen if seen and local_weight else None,
+                    loss_teacher_local_stages=[v / seen for v in stage_totals] if seen and local_weight else None,
+                    loss_teacher_local_weighted=local_weight * local_total / seen if seen else None,
+                    loss_teacher_endpoint_weighted=endpoint_weight * endpoint_total / seen if seen else None,
+                    local_weight=local_weight, endpoint_weight=endpoint_weight,
+                    finetune_grad_norm_mean=grad_norm_sum / seen if seen else None)
+            else:
+                record['endpoint_grad_norm_mean'] = grad_norm_sum / seen if seen else None
             log.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + '\n')
             log.flush()
             print(json.dumps(record, ensure_ascii=False, allow_nan=False), flush=True)

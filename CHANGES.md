@@ -2,6 +2,21 @@
 
 会话改动记录 —— 不会替代 commit message 和 CLAUDE.md,只是给一个鸟瞰视角。
 
+## Session 2026-11-18: 第二阶段局部教师与终点联合监督
+
+第二阶段新增可选 `local_weight` / `endpoint_weight`。学生连续四步，在每一步
+实际学生输入上生成冻结教师的 2/3/2/3 步局部目标；四项局部误差取平均，
+与原始 noisy 输入的 Teacher10 终点误差联合反传。教师目标 detach，学生阶段
+之间不 detach。增加联合与仅局部配置，保留原来的纯终点配置及其元数据。
+
+沿用同一 best6 初始化、固定 BN、冻结 pre-BN Conv bias、LR 1e-6、0.5%-2%
+训练噪声和原验证评分。日志分开记录局部、各阶段、终点及加权总损失；六项
+测试仍检查完整训练与源码指纹，并按目标类型命名 ZIP。联合训练额外使用
+10 步局部教师计算，学生推理仍四步。手动命令见
+`docs/teacher10_local_endpoint_finetune.md`。
+
+没有执行训练、推理、诊断或 CPU 单测，没有提交代码。性能改善待服务器验证。
+
 ## Session 2026-11-17: Teacher10 / Student4 六项效率比较
 
 新增独立手动入口 `tools/benchmark_teacher10_six.py` 和汇总绘图工具

@@ -57,30 +57,59 @@ def resolve_endpoint_finetune(config):
     if supplied is None:
         return None
     keys = {'patch_batch', 'gradient_checkpointing', 'freeze_pre_bn_conv_bias'}
-    if not isinstance(supplied, Mapping) or set(supplied) != keys:
-        raise ValueError('endpoint_finetune requires: ' + ', '.join(sorted(keys)))
+    weight_keys = {'local_weight', 'endpoint_weight'}
+    if (not isinstance(supplied, Mapping) or not keys.issubset(supplied)
+            or set(supplied) - keys - weight_keys
+            or (set(supplied) & weight_keys and not weight_keys.issubset(supplied))):
+        raise ValueError('endpoint_finetune requires: ' + ', '.join(sorted(keys))
+                         + '; optional pair: local_weight, endpoint_weight')
     options = dict(supplied)
     if type(options['patch_batch']) is not int or options['patch_batch'] < 1:
         raise ValueError('endpoint_finetune.patch_batch must be a positive integer')
     if type(options['gradient_checkpointing']) is not bool or options['freeze_pre_bn_conv_bias'] is not True:
         raise ValueError('endpoint_finetune requires boolean checkpointing and freeze_pre_bn_conv_bias=true')
+    if weight_keys.issubset(options):
+        for key in weight_keys:
+            value = options[key]
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value < 0):
+                raise ValueError(f'endpoint_finetune.{key} must be finite and nonnegative')
+            options[key] = float(value)
+        if options['local_weight'] == options['endpoint_weight'] == 0:
+            raise ValueError('endpoint_finetune requires at least one positive loss weight')
     if (get('curriculum_mode') != 'fixed'
             or get('distillation', {}).get('teacher_nodes') != [0, 2, 5, 7, 10]
             or get('teacher_endpoint') is not None or get('training_input') is not None
             or get('pcd_dynamic', {}).get('shadow_enabled', False)):
-        raise ValueError('endpoint_finetune requires fixed Teacher10/Student4 with its own endpoint-only objective')
+        raise ValueError('endpoint_finetune requires fixed Teacher10/Student4 with its own fine-tuning objective')
     return options
 
 
 def finetune_metadata(options, student=None):
     import torch
-    return dict(config=dict(options), target='cached_teacher_T10_from_same_noisy_T0',
-                loss='mean_per_point_squared_l2', loss_weight=1.0,
-                student_rollout='continuous_without_teacher_inputs_or_interstage_detach',
-                student_mode='eval_with_autograd', batchnorm_running_statistics='fixed_from_initial_student',
-                frozen_parameters=pre_bn_conv_biases(student, torch) if student is not None else None,
-                other_parameters='trainable_including_bn_affine', optimizer='fresh_AdamW',
-                best_selection='val_rollout_score_including_epoch0', clean_target_used=False)
+    metadata = dict(config=dict(options), target='cached_teacher_T10_from_same_noisy_T0',
+                    loss='mean_per_point_squared_l2', loss_weight=1.0,
+                    student_rollout='continuous_without_teacher_inputs_or_interstage_detach',
+                    student_mode='eval_with_autograd', batchnorm_running_statistics='fixed_from_initial_student',
+                    frozen_parameters=pre_bn_conv_biases(student, torch) if student is not None else None,
+                    other_parameters='trainable_including_bn_affine', optimizer='fresh_AdamW',
+                    best_selection='val_rollout_score_including_epoch0', clean_target_used=False)
+    # Preserve historical endpoint-only checkpoint metadata when weights are absent.
+    if 'local_weight' in options:
+        local, endpoint = options['local_weight'], options['endpoint_weight']
+        metadata.pop('loss_weight')
+        metadata.update(
+            objective=('local_endpoint' if local and endpoint else 'local' if local else 'endpoint'),
+            target=('input_matched_teacher_intervals_and_cached_teacher_T10' if local and endpoint
+                    else 'input_matched_teacher_intervals' if local else metadata['target']),
+            loss_weights=dict(local=local, endpoint=endpoint),
+            local_target='frozen_teacher_from_each_actual_student_input_with_nominal_interval_sigma',
+            local_teacher_intervals=[[0, 2], [2, 5], [5, 7], [7, 10]],
+            local_reduction='arithmetic_mean_of_four_mean_per_point_squared_l2_losses',
+            teacher_targets_detached=True,
+            student_gradient_scope='all_preceding_student_steps_for_each_active_loss',
+            teacher_training_steps_per_patch=(10 if local else 0) + (10 if endpoint else 0))
+    return metadata
 
 
 def continuous_endpoint_loss(student, state, target, sigma0, forward_fn,
@@ -104,6 +133,63 @@ def continuous_endpoint_loss(student, state, target, sigma0, forward_fn,
     if not torch.isfinite(loss):
         raise FloatingPointError('Nonfinite endpoint loss')
     return loss
+
+
+def continuous_finetune_losses(student, state, target, sigma0, forward_fn,
+                               teacher_target_fn=None, local_weight=0.0, endpoint_weight=1.0,
+                               teacher_nodes=(0, 2, 5, 7, 10), teacher_decay=0.95,
+                               gradient_checkpointing=True):
+    """Connected Student rollout with detached, input-matched local Teacher targets.
+
+    teacher_target_fn(points, sigma0, start, stop) receives the original sigma0;
+    the callback applies the nominal start-step decay. Teacher targets are made
+    outside Student checkpoint closures, so backward never reruns the Teacher.
+    Disabled loss terms are None, not a misleading measured zero.
+    """
+    import torch
+    from torch.utils.checkpoint import checkpoint
+    for weight in (local_weight, endpoint_weight):
+        if (isinstance(weight, bool) or not isinstance(weight, (int, float))
+                or not math.isfinite(weight) or weight < 0):
+            raise ValueError('Fine-tuning loss weights must be finite and nonnegative')
+    if local_weight == endpoint_weight == 0:
+        raise ValueError('At least one fine-tuning loss must be active')
+    if endpoint_weight and (target is None or target.shape != state.shape):
+        raise ValueError('Endpoint supervision requires a matching Teacher10 target')
+    if not local_weight:
+        endpoint = continuous_endpoint_loss(
+            student, state, target, sigma0, forward_fn, teacher_nodes, teacher_decay,
+            gradient_checkpointing)
+        return dict(loss=endpoint if endpoint_weight == 1 else endpoint * endpoint_weight,
+                    local=None, endpoint=endpoint, stages=None)
+    if teacher_target_fn is None:
+        raise ValueError('Local supervision requires an input-matched Teacher callback')
+    state, sigma0 = state.detach(), sigma0.detach()
+    target = target.detach() if endpoint_weight else None
+    if not torch.isfinite(state).all() or (target is not None and not torch.isfinite(target).all()):
+        raise FloatingPointError('Nonfinite fine-tuning input or Teacher10 target')
+    stages = []
+    for start, stop in zip(teacher_nodes[:-1], teacher_nodes[1:]):
+        with torch.no_grad():
+            local_target = teacher_target_fn(state.detach(), sigma0, start, stop).detach()
+        if local_target.shape != state.shape or not torch.isfinite(local_target).all():
+            raise FloatingPointError('Invalid input-matched local Teacher target')
+        sigma = sigma0 * teacher_decay ** start
+
+        def step(points, start_step=start, target_step=stop, interval_sigma=sigma):
+            return forward_fn(student, points, interval_sigma, start_step, target_step)
+
+        # No detach between Student stages: later losses also update earlier stages.
+        state = checkpoint(step, state, use_reentrant=False) if gradient_checkpointing else step(state)
+        stages.append((state - local_target).square().sum(-1).mean())
+    local = torch.stack(stages).mean()
+    endpoint = (state - target).square().sum(-1).mean() if endpoint_weight else None
+    loss = local * local_weight
+    if endpoint is not None:
+        loss = loss + endpoint * endpoint_weight
+    if not torch.isfinite(loss):
+        raise FloatingPointError('Nonfinite local/endpoint fine-tuning loss')
+    return dict(loss=loss, local=local, endpoint=endpoint, stages=stages)
 
 
 def pre_bn_conv_biases(student, torch):

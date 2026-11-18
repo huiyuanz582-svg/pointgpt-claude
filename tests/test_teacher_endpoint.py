@@ -18,7 +18,8 @@ import torch
 from utils.teacher_endpoint import (accumulate_teacher_endpoint, endpoint_grad_ratio,
                                     endpoint_metadata, gradient_norm, pre_bn_conv_biases,
                                     resolve_teacher_endpoint, resolve_endpoint_finetune,
-                                    continuous_endpoint_loss)
+                                    continuous_endpoint_loss, continuous_finetune_losses,
+                                    finetune_metadata)
 
 
 def options(patch_batch=1, checkpointing=True):
@@ -77,6 +78,96 @@ def set_local_gradients(model):
 
 
 class TeacherEndpointTests(unittest.TestCase):
+    def test_finetune_weights_preserve_legacy_and_validate_explicit_objectives(self):
+        settings = dict(patch_batch=1, gradient_checkpointing=True, freeze_pre_bn_conv_bias=True)
+        config = dict(curriculum_mode='fixed', distillation=dict(teacher_nodes=[0, 2, 5, 7, 10]),
+                      endpoint_finetune=settings)
+        self.assertEqual(resolve_endpoint_finetune(config), settings)
+        self.assertNotIn('loss_weights', finetune_metadata(settings))
+        self.assertEqual(finetune_metadata(settings)['loss_weight'], 1.0)
+        for local, endpoint, objective in ((1, 1, 'local_endpoint'), (1, 0, 'local'), (0, 1, 'endpoint')):
+            supplied = dict(settings, local_weight=local, endpoint_weight=endpoint)
+            resolved = resolve_endpoint_finetune(dict(config, endpoint_finetune=supplied))
+            self.assertEqual(resolved, supplied)
+            metadata = finetune_metadata(resolved)
+            self.assertEqual(metadata['objective'], objective)
+            self.assertEqual(metadata['loss_weights'], dict(local=local, endpoint=endpoint))
+        for extra in (dict(local_weight=1), dict(endpoint_weight=1),
+                      dict(local_weight=0, endpoint_weight=0),
+                      dict(local_weight=-1, endpoint_weight=1),
+                      dict(local_weight=True, endpoint_weight=1),
+                      dict(local_weight=1, endpoint_weight=float('nan')),
+                      dict(local_weight=float('inf'), endpoint_weight=1)):
+            with self.assertRaises(ValueError):
+                resolve_endpoint_finetune(dict(config, endpoint_finetune=dict(settings, **extra)))
+
+    def test_local_endpoint_targets_gradients_and_checkpointing_match_connected_reference(self):
+        nodes, sigmas = fixtures()
+        nodes.requires_grad_()
+        sigmas.requires_grad_()
+        teacher_weight = torch.nn.Parameter(torch.tensor(0.93, dtype=torch.float64))
+        intervals = list(zip((0, 2, 5, 7), (2, 5, 7, 10)))
+
+        def teacher_formula(points, sigma0, start, stop):
+            return points * teacher_weight ** (stop - start) + sigma0[:, None, None] * (stop + 1)
+
+        for local_weight, endpoint_weight in ((1.0, 1.0), (1.0, 0.0), (0.0, 1.0), (0.4, 1.7)):
+            reference = ToyStudent().eval()
+            state, expected_inputs, local_terms = nodes[0].detach(), [], []
+            for start, stop in intervals:
+                expected_inputs.append(state.detach().clone())
+                with torch.no_grad():
+                    target = teacher_formula(state.detach(), sigmas.detach(), start, stop)
+                state = forward(reference, state, sigmas.detach() * 0.95 ** start, start, stop)
+                local_terms.append((state - target).square().sum(-1).mean())
+            local = torch.stack(local_terms).mean()
+            endpoint = (state - nodes[-1].detach()).square().sum(-1).mean()
+            expected = local_weight * local + endpoint_weight * endpoint
+            expected.backward()
+            for checkpointing in (False, True):
+                # Include an uneven final micro-batch to exercise sample weighting.
+                for patch_batch in (1, 2, 3):
+                    model = ToyStudent().eval()
+                    calls, actual_loss = [], 0.0
+                    for offset in range(0, 3, patch_batch):
+                        end = min(offset + patch_batch, 3)
+
+                        def target_fn(points, sigma0, start, stop):
+                            self.assertGreater(local_weight, 0)
+                            self.assertFalse(points.requires_grad)
+                            self.assertFalse(sigma0.requires_grad)
+                            self.assertFalse(torch.is_grad_enabled())
+                            stage = intervals.index((start, stop))
+                            torch.testing.assert_close(points, expected_inputs[stage][offset:end])
+                            torch.testing.assert_close(sigma0, sigmas.detach()[offset:end])
+                            calls.append((start, stop))
+                            return teacher_formula(points, sigma0, start, stop)
+
+                        result = continuous_finetune_losses(
+                            model, nodes[0, offset:end], nodes[-1, offset:end] if endpoint_weight else None,
+                            sigmas[offset:end], forward, teacher_target_fn=target_fn,
+                            local_weight=local_weight, endpoint_weight=endpoint_weight,
+                            gradient_checkpointing=checkpointing)
+                        if local_weight:
+                            torch.testing.assert_close(result['local'], torch.stack(result['stages']).mean())
+                        else:
+                            self.assertIsNone(result['local'])
+                            self.assertIsNone(result['stages'])
+                        if not endpoint_weight:
+                            self.assertIsNone(result['endpoint'])
+                        count_before_backward = len(calls)
+                        (result['loss'] * ((end - offset) / 3)).backward()
+                        # Teacher targets are outside recomputed Student closures.
+                        self.assertEqual(len(calls), count_before_backward)
+                        actual_loss += float(result['loss'].detach()) * (end - offset) / 3
+                    self.assertEqual(calls, intervals * math.ceil(3 / patch_batch) if local_weight else [])
+                    self.assertAlmostEqual(actual_loss, float(expected.detach()), places=12)
+                    for actual, wanted in zip(model.parameters(), reference.parameters()):
+                        torch.testing.assert_close(actual.grad, wanted.grad)
+                    self.assertIsNone(teacher_weight.grad)
+                    self.assertIsNone(nodes.grad)
+                    self.assertIsNone(sigmas.grad)
+
     def test_endpoint_finetune_config_requires_its_own_objective(self):
         settings = dict(patch_batch=1, gradient_checkpointing=True, freeze_pre_bn_conv_bias=True)
         config = dict(curriculum_mode='fixed', distillation=dict(teacher_nodes=[0, 2, 5, 7, 10]),
