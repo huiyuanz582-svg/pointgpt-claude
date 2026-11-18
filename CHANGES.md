@@ -2,6 +2,21 @@
 
 会话改动记录 —— 不会替代 commit message 和 CLAUDE.md,只是给一个鸟瞰视角。
 
+## Session 2026-11-18: 基础 Teacher10→Student4 对照与效率评测
+
+新分支 `codex/paper2-teacher10-basic-distill` 增加基础10→4配置：从原教师初始化，
+固定节点 `[0,2,5,7,10]`，只用Teacher轨迹局部目标，完整20epochs；保留相同网络、
+step conditioning、训练噪声0.5%-2%和原选模评分，不使用Mixed、终点辅助或第二阶段微调。
+
+基础训练记录教师SHA256和训练/推理源码指纹。现有效率入口新增独立
+`--baseline_train_root` 模式：只测新基础学生的六条件，不重跑已有八组效率结果。
+沿用整云同步计时、2次预热/3轮测量、计时后质量计算，汇总CD/P2M/Score、延迟、
+吞吐、allocated/reserved峰值和参数量，保存120云质量、360条计时、图与ZIP。
+未在本次测量Teacher10时，相对加速比等列留空；不伪造历史教师为本次实测。
+
+训练、评测、续评测与ZIP说明见 `docs/teacher10_baseline_distill.md`。
+仅静态检查；没有执行训练、测试、CPU单测、GPU程序或提交。
+
 ## Session 2026-11-18: 第二阶段局部教师与终点联合监督
 
 第二阶段新增可选 `local_weight` / `endpoint_weight`。学生连续四步，在每一步

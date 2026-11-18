@@ -14,7 +14,8 @@ import statistics
 CONDITIONS = tuple((n, s) for n in (10000, 50000) for s in (0.01, 0.02, 0.03))
 STUDENTS = ('student_before', 'student_ft1', 'student_ft3')
 TEACHERS = tuple(f'teacher_{t}' for t in (2, 4, 6, 8, 10))
-LABELS = dict(student_before='Student4 before FT', student_ft1='Student4 FT 1 epoch',
+LABELS = dict(student_baseline='Student4 basic distillation',
+              student_before='Student4 before FT', student_ft1='Student4 FT 1 epoch',
               student_ft3='Student4 FT 3 epochs',
               **{f'teacher_{t}': f'Teacher {t} steps' for t in (2, 4, 6, 8, 10)})
 
@@ -150,15 +151,21 @@ def collect_results(root):
                                   peak_allocated_gib=max(int(r['peak_allocated_bytes']) for r in cloud_timing) / 1024 ** 3,
                                   peak_reserved_gib=max(int(r['peak_reserved_bytes']) for r in cloud_timing) / 1024 ** 3))
         timings.extend(dict(variant=row['variant'], condition=row['condition'], **r) for r in raw_timing)
-    expected = {(v, condition_label(n, s)) for v in STUDENTS + TEACHERS for n, s in CONDITIONS}
-    if len(rows) != 48 or {(r['variant'], r['condition']) for r in rows} != expected:
-        raise ValueError('Expected all 8 variants x 6 conditions')
+    mode = plan.get('benchmark_mode', 'teacher10_comparison')
+    if mode not in ('teacher10_comparison', 'baseline_10to4'):
+        raise ValueError(f'Unknown benchmark mode: {mode}')
+    variant_ids = ('student_baseline',) if mode == 'baseline_10to4' else STUDENTS + TEACHERS
+    expected = {(v, condition_label(n, s)) for v in variant_ids for n, s in CONDITIONS}
+    if (len(rows) != len(expected) or {(r['variant'], r['condition']) for r in rows} != expected
+            or {v['id'] for v in plan['variants']} != set(variant_ids)):
+        raise ValueError(f'Expected all {len(variant_ids)} variants x 6 conditions')
     teachers = {r['condition']: r for r in rows if r['variant'] == 'teacher_10'}
     for row in rows:
-        teacher = teachers[row['condition']]
-        row['speedup_vs_teacher10'] = teacher['latency_mean_ms'] / row['latency_mean_ms']
-        row['cd_change_vs_teacher10_pct'] = (row['cd_x1e4'] / teacher['cd_x1e4'] - 1) * 100
-        row['p2m_change_vs_teacher10_pct'] = (row['p2m_x1e4'] / teacher['p2m_x1e4'] - 1) * 100
+        teacher = teachers.get(row['condition'])
+        # 基础单模型评测不重跑教师，也不把历史计时伪装成本次测量。
+        row['speedup_vs_teacher10'] = teacher['latency_mean_ms'] / row['latency_mean_ms'] if teacher else None
+        row['cd_change_vs_teacher10_pct'] = (row['cd_x1e4'] / teacher['cd_x1e4'] - 1) * 100 if teacher else None
+        row['p2m_change_vs_teacher10_pct'] = (row['p2m_x1e4'] / teacher['p2m_x1e4'] - 1) * 100 if teacher else None
     write_csv(root / 'summary.csv', rows)
     write_csv(root / 'per_cloud.csv', per_cloud)
     write_csv(root / 'timing_runs.csv', timings)
@@ -175,13 +182,17 @@ def draw_curves(root, rows):
 
     plots = root / 'plots'
     plots.mkdir(exist_ok=True)
-    styles = dict(student_before=('#0072B2', 's'), student_ft1=('#009E73', '^'),
+    styles = dict(student_baseline=('#CC79A7', 'o'),
+                  student_before=('#0072B2', 's'), student_ft1=('#009E73', '^'),
                   student_ft3=('#D55E00', 'D'))
+    present = {row['variant'] for row in rows}
+    styles = {name: style for name, style in styles.items() if name in present}
 
     def panel(ax, selected, metric, title):
         teachers = sorted((r for r in selected if r['variant'] in TEACHERS), key=lambda r: r['steps'])
-        ax.plot([r['latency_mean_ms'] for r in teachers], [r[metric] for r in teachers],
-                color='#555555', marker='o', lw=1.5)
+        if teachers:
+            ax.plot([r['latency_mean_ms'] for r in teachers], [r[metric] for r in teachers],
+                    color='#555555', marker='o', lw=1.5)
         for row in selected:
             x, y = row['latency_mean_ms'], row[metric]
             if row['variant'] in TEACHERS:
@@ -195,7 +206,8 @@ def draw_curves(root, rows):
         ax.grid(alpha=0.22)
         ax.margins(x=0.12, y=0.18)
 
-    legend = [Line2D([], [], color='#555555', marker='o', label='Teacher prefixes (2/4/6/8/10)')]
+    legend = ([Line2D([], [], color='#555555', marker='o', label='Teacher prefixes (2/4/6/8/10)')]
+              if present.intersection(TEACHERS) else [])
     legend += [Line2D([], [], color=c, marker=m, linestyle='None', label=LABELS[v])
                for v, (c, m) in styles.items()]
     with plt.rc_context({'font.size': 10, 'pdf.fonttype': 42, 'ps.fonttype': 42}):

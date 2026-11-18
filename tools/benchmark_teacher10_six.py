@@ -1,7 +1,8 @@
-"""Manual quality/efficiency comparison of three Student4 checkpoints and Teacher prefixes.
+"""Manual Teacher10/Student4 quality and efficiency evaluation.
 
 Each variant/condition runs in a fresh, sequential subprocess with one model.
 No training, optimizer updates, trajectory capture, or checkpoint writes.
+--baseline_train_root evaluates only the new teacher-forced baseline (six jobs).
 """
 
 import argparse
@@ -38,7 +39,8 @@ INFERENCE_SOURCES = ('models/PointGPT.py', 'models/step_condition.py',
 SOURCES = INFERENCE_SOURCES + ('tools/runner_distill.py', 'tools/builder.py',
                               'utils/teacher_endpoint.py', 'utils/training_input.py',
                               'utils/misc.py', 'utils/p2m_loss.py', 'utils/gpu_memory.py',
-                              'tools/benchmark_teacher10_six.py', 'utils/denoise_benchmark_report.py')
+                              'tools/benchmark_teacher10_six.py', 'utils/denoise_benchmark_report.py',
+                              'utils/curriculum_config.py')
 TRAIN_RECORDS = ('manifest.json', 'validation_manifest.json', 'train.jsonl')
 
 
@@ -111,8 +113,95 @@ def inspect_training(train_root, variant_id, actual_sources):
                 source_differences_from_training=differences)
 
 
+def inspect_baseline_training(train_root):
+    """Reject partial plans, modified sources, or a non-basic objective."""
+    train_root = train_root.expanduser().resolve()
+    checkpoint = train_root / 'ckpt-best.pth'
+    for path in [checkpoint] + [train_root / name for name in TRAIN_RECORDS]:
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    manifest = load_json(train_root / 'manifest.json')
+    config, arguments = manifest['config'], manifest['arguments']
+    planned = arguments.get('epochs') or config['epochs']
+    if manifest.get('mode') != 'train' or planned != 20 or manifest['schedule'] != SCHEDULE:
+        raise ValueError('The basic control requires a completed 20-epoch Teacher10 -> Student4 run')
+    if (config.get('curriculum_mode', 'fixed') != 'fixed'
+            or config.get('training_input', {'type': 'teacher_forced'}) != {'type': 'teacher_forced'}
+            or config.get('teacher_endpoint') is not None or config.get('endpoint_finetune') is not None
+            or config.get('pcd_dynamic', {}).get('shadow_enabled', False)
+            or any(arguments.get(key) for key in ('init_student_ckpt', 'resume', 'max_shapes', 'max_patch_batches'))):
+        raise ValueError('Expected fresh teacher-forced local distillation without auxiliary objectives or limits')
+    if (manifest['training_input_protocol'].get('config') != {'type': 'teacher_forced'}
+            or manifest['training_input_protocol'].get('target') != 'teacher_target_node'
+            or config['distillation'] != SCHEDULE):
+        raise ValueError('Baseline input/target/schedule provenance mismatch')
+    data = config['dataset']['_base_']
+    if (data['DATASET'] != 'PUNet' or data['NOISE_MIN'] != 0.005 or data['NOISE_MAX'] != 0.02
+            or config.get('rollout_val_interval') != 1
+            or config.get('sor_enable', True) or config.get('surface_projection', {}).get('enable', False)):
+        raise ValueError('Baseline must retain training noise, per-epoch selection and the existing PUNet protocol')
+    controls = dict(epochs=20, total_bs=8, learning_rate=1e-5, weight_decay=0.0,
+                    grad_norm_clip=1.0, teacher_patch_batch=1, student_patch_batch=8,
+                    inference_patch_size=1024, seed_ratio=3, fuse_tau_ratio=0.5)
+    if any(config.get(key) != value for key, value in controls.items()):
+        raise ValueError('Baseline optimizer, training budget or patch settings differ from the declared control')
+    if (data.get('NOISE_LOG_UNIFORM') is not True or data.get('VAL_NUM') != 0
+            or data.get('VAL_RESOLUTION') != '10000_poisson' or data.get('VAL_NOISE_LEVELS') != [0.01]):
+        raise ValueError('Baseline sampling and 10k/1% validation must match the existing first-stage runs')
+    for key in ('TEST_NOISY_PATH', 'TEST_CLEAN_PATH', 'TEST_MESH_ROOT'):
+        if data.get(key):
+            raise ValueError(f'Use the standard six-condition PUNet inputs, without {key}')
+    required_sources = set(INFERENCE_SOURCES) | {
+        'tools/runner_distill.py', 'utils/teacher_endpoint.py', 'utils/training_input.py',
+        'utils/curriculum_config.py', 'tools/builder.py', 'utils/misc.py',
+        'utils/p2m_loss.py', 'utils/gpu_memory.py'}
+    recorded_sources = manifest.get('source_sha256', {})
+    if not required_sources.issubset(recorded_sources):
+        raise ValueError('Missing baseline training source fingerprints; use this branch before training')
+    for name, expected in recorded_sources.items():
+        if name not in SOURCES or sha256_file(ROOT / name) != expected:
+            raise ValueError(f'Current source differs from the baseline training manifest: {name}')
+    protocol = manifest.get('baseline_distillation_protocol', {})
+    teacher = Path(manifest['checkpoint'])
+    if (protocol.get('objective') != 'teacher_forced_local_10to4'
+            or protocol.get('teacher_nodes') != NODES
+            or not teacher.is_file() or sha256_file(teacher) != protocol.get('teacher_checkpoint_sha256')):
+        raise ValueError('Missing or mismatched original Teacher provenance')
+    validation = load_json(train_root / 'validation_manifest.json')
+    if validation.get('schedule') != SCHEDULE or validation.get('teacher_forced') is not True:
+        raise ValueError('Baseline validation manifest differs from training')
+    logs = [json.loads(line) for line in (train_root / 'train.jsonl').read_text(encoding='utf-8-sig').splitlines()
+            if line.strip()]
+    if [row['epoch'] for row in logs] != list(range(1, planned + 1)):
+        raise ValueError('Baseline training has not completed all 20 epochs')
+    if any(row.get('training_input') != 'teacher_forced'
+           or row.get('total_planned_epochs') != planned
+           or row.get('val_rollout_clouds') != 20
+           or not math.isfinite(float(row['val_rollout_score'])) for row in logs):
+        raise ValueError('Invalid baseline input policy, training plan or full-cloud validation')
+    best = min(logs, key=lambda row: row['val_rollout_score'])
+    if (logs[-1]['best_epoch'] != best['epoch'] or not math.isclose(
+            logs[-1]['best_val_rollout_score'], best['val_rollout_score'], rel_tol=1e-10)):
+        raise ValueError('Baseline best-checkpoint tracking is inconsistent')
+    return dict(id='student_baseline', kind='student', steps=4, train_root=str(train_root),
+                checkpoint=str(checkpoint), checkpoint_sha256=sha256_file(checkpoint),
+                epoch=best['epoch'], validation_score=best['val_rollout_score'],
+                planned_epochs=planned, training_manifest=manifest,
+                training_record_sha256={name: sha256_file(train_root / name) for name in TRAIN_RECORDS},
+                source_differences_from_training={})
+
+
 def make_plan(args):
     current_sources = source_hashes()
+    if args.baseline_train_root is not None:
+        variant = inspect_baseline_training(args.baseline_train_root)
+        config = copy.deepcopy(variant['training_manifest']['config'])
+        config['test_patch_batch'] = args.patch_batch
+        settings = measurement_settings(args, config, current_sources)
+        jobs = [dict(variant=variant, condition=condition_label(n, s), points=n, noise=s, config=config)
+                for n, s in CONDITIONS]
+        return dict(schema_version=1, benchmark_mode='baseline_10to4', settings=settings,
+                    variants=[variant], jobs=jobs)
     roots = (args.before_train_root, args.one_epoch_train_root, args.three_epoch_train_root)
     variants = [inspect_training(root, label, current_sources) for root, label in zip(roots, STUDENTS)]
     teacher = args.teacher_ckpt.expanduser().resolve()
@@ -143,7 +232,14 @@ def make_plan(args):
     for key in ('TEST_NOISY_PATH', 'TEST_CLEAN_PATH', 'TEST_MESH_ROOT'):
         if config['dataset']['_base_'].get(key):
             raise ValueError(f'Use the standard six-condition PUNet inputs, without {key}')
-    settings = dict(seed=args.seed, device=args.device, repeats=args.repeats, warmup=args.warmup,
+    settings = measurement_settings(args, config, current_sources)
+    jobs = [dict(variant=v, condition=condition_label(n, s), points=n, noise=s, config=config)
+            for n, s in CONDITIONS for v in variants]
+    return dict(schema_version=1, settings=settings, variants=variants, jobs=jobs)
+
+
+def measurement_settings(args, config, current_sources):
+    return dict(seed=args.seed, device=args.device, repeats=args.repeats, warmup=args.warmup,
                     patch_batch=args.patch_batch, cpu_threads=int(config.get('cpu_threads', 8)),
                     timing_scope='GPU-resident normalized noisy cloud -> GPU denoised cloud; FPS/KNN/patches/rollout/fusion',
                     timing_excludes='loading/normalization/H2D/D2H/quality metrics/file I/O/RNG setup',
@@ -153,9 +249,6 @@ def make_plan(args):
                     memory_scope='PyTorch allocator peak including one resident model and input; excludes metric phase',
                     memory_limit_note='The configured 48 GiB cap is not a measured peak',
                     source_sha256=current_sources)
-    jobs = [dict(variant=v, condition=condition_label(n, s), points=n, noise=s, config=config)
-            for n, s in CONDITIONS for v in variants]
-    return dict(schema_version=1, settings=settings, variants=variants, jobs=jobs)
 
 
 def load_checkpoint(torch, path):
@@ -177,7 +270,11 @@ def validate_student(saved, variant):
             selection.get('value', float('inf')), variant['validation_score'], rel_tol=1e-10):
         raise ValueError('Checkpoint and best validation score differ')
     for name in ('teacher_endpoint', 'endpoint_finetune', 'training_input'):
-        if saved.get(name) != config.get(name):
+        expected = config.get(name)
+        # Teacher-forced is the legacy default and is omitted from checkpoints.
+        if name == 'training_input' and expected == {'type': 'teacher_forced'}:
+            expected = None
+        if saved.get(name) != expected:
             raise ValueError(f'Checkpoint objective mismatch: {name}')
     for name in ('teacher_endpoint_protocol', 'endpoint_finetune_protocol', 'initialization'):
         if saved.get(name) != manifest.get(name):
@@ -390,6 +487,8 @@ def package(root):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--baseline_train_root', type=Path,
+                        help='Evaluate only a completed basic 10->4 run: six quality/efficiency jobs')
     parser.add_argument('--before_train_root', type=Path)
     parser.add_argument('--one_epoch_train_root', type=Path)
     parser.add_argument('--three_epoch_train_root', type=Path)
@@ -414,8 +513,10 @@ def main():
         build_report(root)
         package(root)
         return
-    if any(getattr(args, key) is None for key in (
-            'before_train_root', 'one_epoch_train_root', 'three_epoch_train_root', 'teacher_ckpt')):
+    legacy_keys = ('before_train_root', 'one_epoch_train_root', 'three_epoch_train_root', 'teacher_ckpt')
+    if args.baseline_train_root is not None and any(getattr(args, key) is not None for key in legacy_keys):
+        parser.error('--baseline_train_root cannot be combined with the historical eight-variant inputs')
+    if args.baseline_train_root is None and any(getattr(args, key) is None for key in legacy_keys):
         parser.error('Provide all three train roots and --teacher_ckpt')
     if not 0 <= args.seed < 2 ** 32 or args.device < 0 or min(args.repeats, args.warmup, args.patch_batch) < 1:
         parser.error('Require nonnegative device/uint32 seed and positive repeats/warmup/patch_batch')
@@ -428,8 +529,9 @@ def main():
     plan = make_plan(args)
     check_saved_checkpoints(plan)
     stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    prefix = 'teacher10_baseline4' if args.baseline_train_root is not None else 'teacher10_student4'
     root = (args.output_root.expanduser().resolve() if args.output_root else
-            ROOT / 'experiments/efficiency' / f'teacher10_student4_{stamp}_{os.getpid()}')
+            ROOT / 'experiments/efficiency' / f'{prefix}_{stamp}_{os.getpid()}')
     plan_path = root / 'plan.json'
     if args.resume:
         if load_json(plan_path) != plan:
@@ -451,12 +553,15 @@ def main():
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / name, dest)
         shutil.copyfile(ROOT / 'docs/teacher10_efficiency.md', root / 'measurement_protocol.md')
-    print(f'RESULT_ROOT={root}\n48 jobs, each 20 clouds x {args.repeats} timed repeats', flush=True)
+        if args.baseline_train_root is not None:
+            shutil.copyfile(ROOT / 'docs/teacher10_baseline_distill.md', root / 'baseline_protocol.md')
+    print(f'RESULT_ROOT={root}\n{len(plan["jobs"])} jobs, each 20 clouds x {args.repeats} timed repeats', flush=True)
     # Different method order per condition reduces a fixed early/late ordering
     # effect. Processes remain strictly sequential; no GPU concurrency is used.
     order = []
+    variant_count = len(plan['variants'])
     for condition_index in range(len(CONDITIONS)):
-        indices = list(range(condition_index * 8, (condition_index + 1) * 8))
+        indices = list(range(condition_index * variant_count, (condition_index + 1) * variant_count))
         random.Random(args.seed + condition_index).shuffle(indices)
         order.extend(indices)
     compared_inputs, compared_environment = {}, []

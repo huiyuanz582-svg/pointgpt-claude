@@ -3,6 +3,10 @@
 入口为 `tools/benchmark_teacher10_six.py`，汇总和绘图由
 `utils/denoise_benchmark_report.py` 完成。只在服务器上手动运行。
 
+本文描述默认的历史八组比较。新增 `--baseline_train_root` 为独立的基础10→4模式，
+只评测新基础学生六项质量/效率并打包，不启动本文的八组比较；训练和命令见
+[基础蒸馏说明](teacher10_baseline_distill.md)。
+
 ## 比较对象
 
 - `student_before`：masked endpoint 的微调前 best checkpoint。

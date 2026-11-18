@@ -1741,13 +1741,35 @@ def main():
             manifest['teacher_endpoint_protocol'] = endpoint_metadata(endpoint)
         if finetune is not None:
             manifest['endpoint_finetune_protocol'] = finetune_metadata(finetune)
-        if endpoint is not None or finetune is not None:
+        basic_teacher10 = (args.mode == 'train' and teacher_nodes == TEACHER10_NODES
+                           and getattr(config, 'curriculum_mode', 'fixed') == 'fixed'
+                           and resolved_curriculum['training_input']['type'] == 'teacher_forced'
+                           and endpoint is None and finetune is None)
+        if endpoint is not None or finetune is not None or basic_teacher10:
             source_files = ('tools/runner_distill.py', 'utils/teacher_endpoint.py',
                             'utils/training_input.py', 'models/PointGPT.py', 'models/step_condition.py',
                             'tools/runner_finetune.py', 'datasets/ScoreDenoiseDataset.py')
             manifest['source_sha256'] = {
                 name: hashlib.sha256((REPO_ROOT / name).read_bytes()).hexdigest()
                 for name in source_files}
+        if basic_teacher10:
+            # 基础对照也保留完整来源；不改变损失、推理或历史实验审计。
+            for name in ('utils/curriculum_config.py', 'tools/builder.py', 'utils/misc.py',
+                         'utils/p2m_loss.py', 'utils/gpu_memory.py'):
+                manifest['source_sha256'][name] = hashlib.sha256((REPO_ROOT / name).read_bytes()).hexdigest()
+            digest = hashlib.sha256()
+            with checkpoint_path.open('rb') as teacher_file:
+                for block in iter(lambda: teacher_file.read(1024 * 1024), b''):
+                    digest.update(block)
+            manifest['baseline_distillation_protocol'] = dict(
+                objective='teacher_forced_local_10to4',
+                initialization='original_denoising_teacher_plus_new_step_condition',
+                teacher_checkpoint_sha256=digest.hexdigest(),
+                teacher_nodes=list(TEACHER10_NODES),
+                target='cached_teacher_next_node',
+                loss='mean_of_four_mean_per_point_squared_l2_losses',
+                student_gradient_scope='independent_teacher_forced_intervals',
+                teacher_targets_detached=True, clean_target_used=False)
         if resolved_curriculum['metric']['type'] == 'rollout_aware':
             manifest['rollout_curriculum'] = resolved_curriculum
         json.dump(manifest, handle, indent=2, ensure_ascii=False)
