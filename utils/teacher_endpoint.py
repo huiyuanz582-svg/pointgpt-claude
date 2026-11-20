@@ -59,10 +59,10 @@ def resolve_endpoint_finetune(config):
     keys = {'patch_batch', 'gradient_checkpointing', 'freeze_pre_bn_conv_bias'}
     weight_keys = {'local_weight', 'endpoint_weight'}
     if (not isinstance(supplied, Mapping) or not keys.issubset(supplied)
-            or set(supplied) - keys - weight_keys
+            or set(supplied) - keys - weight_keys - {'dense_noise_adaptation'}
             or (set(supplied) & weight_keys and not weight_keys.issubset(supplied))):
         raise ValueError('endpoint_finetune requires: ' + ', '.join(sorted(keys))
-                         + '; optional pair: local_weight, endpoint_weight')
+                         + '; optional pair: local_weight, endpoint_weight; optional dense_noise_adaptation')
     options = dict(supplied)
     if type(options['patch_batch']) is not int or options['patch_batch'] < 1:
         raise ValueError('endpoint_finetune.patch_batch must be a positive integer')
@@ -77,6 +77,23 @@ def resolve_endpoint_finetune(config):
             options[key] = float(value)
         if options['local_weight'] == options['endpoint_weight'] == 0:
             raise ValueError('endpoint_finetune requires at least one positive loss weight')
+    if 'dense_noise_adaptation' in options:
+        adaptation = options['dense_noise_adaptation']
+        adaptation_keys = {'min_source_points', 'noise_ramp_start', 'noise_ramp_end', 'reference_sha256'}
+        if (not isinstance(adaptation, Mapping) or set(adaptation) != adaptation_keys
+                or not weight_keys.issubset(options)
+                or min(options['local_weight'], options['endpoint_weight']) <= 0):
+            raise ValueError('dense_noise_adaptation requires both positive weights and: '
+                             + ', '.join(sorted(adaptation_keys)))
+        start, end = adaptation['noise_ramp_start'], adaptation['noise_ramp_end']
+        points, digest = adaptation['min_source_points'], adaptation['reference_sha256']
+        if (type(points) is not int or points < 1
+                or any(type(value) not in (int, float) for value in (start, end))
+                or not 0.005 <= start < end <= 0.02
+                or not isinstance(digest, str) or len(digest) != 64
+                or any(char not in '0123456789abcdef' for char in digest)):
+            raise ValueError('Invalid dense_noise_adaptation point count, noise ramp or reference SHA256')
+        options['dense_noise_adaptation'] = dict(adaptation)
     if (get('curriculum_mode') != 'fixed'
             or get('distillation', {}).get('teacher_nodes') != [0, 2, 5, 7, 10]
             or get('teacher_endpoint') is not None or get('training_input') is not None
@@ -109,18 +126,27 @@ def finetune_metadata(options, student=None):
             teacher_targets_detached=True,
             student_gradient_scope='all_preceding_student_steps_for_each_active_loss',
             teacher_training_steps_per_patch=(10 if local else 0) + (10 if endpoint else 0))
+    if 'dense_noise_adaptation' in options:
+        metadata.pop('teacher_training_steps_per_patch')
+        metadata.update(
+            objective='dense_noise_local_with_student_endpoint_anchor',
+            target='input_matched_teacher_intervals_and_frozen_initial_student_endpoint',
+            loss_weights=dict(local=local, reference_endpoint=endpoint),
+            local_reduction='per_patch_noise_ramp_times_four_stage_mean_then_batch_mean',
+            local_weight_support='dense_source_clouds_with_sigma_above_ramp_start',
+            reference_target='frozen_initial_student_four_steps_from_same_noisy_patch',
+            reference_target_detached=True,
+            reference_steps_per_patch=4,
+            teacher_steps_per_active_patch=10,
+            experimental_candidate='predeclared_epoch_1')
     return metadata
 
 
-def continuous_endpoint_loss(student, state, target, sigma0, forward_fn,
+def student_rollout_endpoint(student, state, sigma0, forward_fn,
                              teacher_nodes=(0, 2, 5, 7, 10), teacher_decay=0.95,
-                             gradient_checkpointing=True):
-    """One micro-batch through the connected four-step Student rollout."""
-    import torch
+                             gradient_checkpointing=False):
+    """Apply the four conditioned updates to a patch batch."""
     from torch.utils.checkpoint import checkpoint
-    state, target, sigma0 = state.detach(), target.detach(), sigma0.detach()
-    if not torch.isfinite(state).all() or not torch.isfinite(target).all():
-        raise FloatingPointError('Nonfinite cached Teacher endpoint/input')
     for start, stop in zip(teacher_nodes[:-1], teacher_nodes[1:]):
         sigma = sigma0 * teacher_decay ** start
 
@@ -129,6 +155,19 @@ def continuous_endpoint_loss(student, state, target, sigma0, forward_fn,
             return forward_fn(student, points, interval_sigma, start_step, target_step)
 
         state = checkpoint(step, state, use_reentrant=False) if gradient_checkpointing else step(state)
+    return state
+
+
+def continuous_endpoint_loss(student, state, target, sigma0, forward_fn,
+                             teacher_nodes=(0, 2, 5, 7, 10), teacher_decay=0.95,
+                             gradient_checkpointing=True):
+    """One micro-batch through the connected four-step Student rollout."""
+    import torch
+    state, target, sigma0 = state.detach(), target.detach(), sigma0.detach()
+    if not torch.isfinite(state).all() or not torch.isfinite(target).all():
+        raise FloatingPointError('Nonfinite cached Teacher endpoint/input')
+    state = student_rollout_endpoint(student, state, sigma0, forward_fn, teacher_nodes,
+                                     teacher_decay, gradient_checkpointing)
     loss = (state - target).square().sum(-1).mean()
     if not torch.isfinite(loss):
         raise FloatingPointError('Nonfinite endpoint loss')
@@ -138,12 +177,14 @@ def continuous_endpoint_loss(student, state, target, sigma0, forward_fn,
 def continuous_finetune_losses(student, state, target, sigma0, forward_fn,
                                teacher_target_fn=None, local_weight=0.0, endpoint_weight=1.0,
                                teacher_nodes=(0, 2, 5, 7, 10), teacher_decay=0.95,
-                               gradient_checkpointing=True):
+                               gradient_checkpointing=True, local_patch_weights=None):
     """Connected Student rollout with detached, input-matched local Teacher targets.
 
     teacher_target_fn(points, sigma0, start, stop) receives the original sigma0;
     the callback applies the nominal start-step decay. Teacher targets are made
     outside Student checkpoint closures, so backward never reruns the Teacher.
+    Optional local_patch_weights reduce over the full batch, including zero-weight
+    patches. The endpoint target may come from a frozen reference Student.
     Disabled loss terms are None, not a misleading measured zero.
     """
     import torch
@@ -167,13 +208,21 @@ def continuous_finetune_losses(student, state, target, sigma0, forward_fn,
     state, sigma0 = state.detach(), sigma0.detach()
     target = target.detach() if endpoint_weight else None
     if not torch.isfinite(state).all() or (target is not None and not torch.isfinite(target).all()):
-        raise FloatingPointError('Nonfinite fine-tuning input or Teacher10 target')
+        raise FloatingPointError('Nonfinite fine-tuning input or endpoint target')
+    if local_patch_weights is not None:
+        weights = local_patch_weights.detach().to(state)
+        if weights.shape != (len(state),) or not ((weights >= 0) & (weights <= 1)).all():
+            raise ValueError('Expected one local weight in [0, 1] per patch')
+        active = (weights > 0).nonzero(as_tuple=True)[0]
     stages = []
     for start, stop in zip(teacher_nodes[:-1], teacher_nodes[1:]):
-        with torch.no_grad():
-            local_target = teacher_target_fn(state.detach(), sigma0, start, stop).detach()
-        if local_target.shape != state.shape or not torch.isfinite(local_target).all():
-            raise FloatingPointError('Invalid input-matched local Teacher target')
+        if local_patch_weights is None or active.numel():
+            with torch.no_grad():
+                inputs = state.detach() if local_patch_weights is None else state.detach()[active]
+                sigmas = sigma0 if local_patch_weights is None else sigma0[active]
+                local_target = teacher_target_fn(inputs, sigmas, start, stop).detach()
+            if local_target.shape != inputs.shape or not torch.isfinite(local_target).all():
+                raise FloatingPointError('Invalid input-matched local Teacher target')
         sigma = sigma0 * teacher_decay ** start
 
         def step(points, start_step=start, target_step=stop, interval_sigma=sigma):
@@ -181,7 +230,13 @@ def continuous_finetune_losses(student, state, target, sigma0, forward_fn,
 
         # No detach between Student stages: later losses also update earlier stages.
         state = checkpoint(step, state, use_reentrant=False) if gradient_checkpointing else step(state)
-        stages.append((state - local_target).square().sum(-1).mean())
+        if local_patch_weights is None:
+            stages.append((state - local_target).square().sum(-1).mean())
+        elif active.numel():
+            per_patch = (state[active] - local_target).square().sum(-1).mean(-1)
+            stages.append((per_patch * weights[active]).sum() / len(state))
+        else:
+            stages.append(state.new_zeros(()))
     local = torch.stack(stages).mean()
     endpoint = (state - target).square().sum(-1).mean() if endpoint_weight else None
     loss = local * local_weight

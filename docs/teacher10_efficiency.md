@@ -3,6 +3,9 @@
 入口为 `tools/benchmark_teacher10_six.py`，汇总和绘图由
 `utils/denoise_benchmark_report.py` 完成。只在服务器上手动运行。
 
+高密度噪声微调候选用 `--dense_noise_train_root` 单独完成六场景质量与效率统计，
+命令见 `docs/teacher10_dense_noise_finetune.md`。以下介绍八组历史比较和共享的计时口径。
+
 ## 比较对象
 
 - `student_before`：masked endpoint 的微调前 best checkpoint。

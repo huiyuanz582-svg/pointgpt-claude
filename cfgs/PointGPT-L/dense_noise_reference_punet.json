@@ -1,0 +1,18 @@
+{
+  "reference_archive": "six_condition_metrics_10to4_local_endpoint_finetune_20261118_060916_15768.zip",
+  "reference_archive_sha256": "c4fda06850ef53560f07ff49bdcab7db1586464b97c2c7ec578d7ec41c652989",
+  "reference_checkpoint_sha256": "94da5dd125e92bec221bb3a9a72b0896ca48eaef86c05bd057516517950e5a12",
+  "vanilla_kd_archive": "basic_10to4_quality_efficiency_20261119_081530_40.zip",
+  "vanilla_kd_archive_sha256": "33ddd8344de74acf9667650fe10cb60d2dd2a8370aed01a6e39153a2d1611952",
+  "test_seed": 0,
+  "target_condition": "50k_3pct",
+  "reference_metrics": {
+    "10k_1pct": {"cd_x1e4": 2.033173030614853, "p2m_x1e4": 0.5596057936549187},
+    "10k_2pct": {"cd_x1e4": 3.070055741071701, "p2m_x1e4": 1.0668508619070054},
+    "10k_3pct": {"cd_x1e4": 3.9078824877738954, "p2m_x1e4": 1.7435386240482331},
+    "50k_1pct": {"cd_x1e4": 0.5853822529315948, "p2m_x1e4": 0.3320201948285103},
+    "50k_2pct": {"cd_x1e4": 0.8415603831410408, "p2m_x1e4": 0.5350534781813622},
+    "50k_3pct": {"cd_x1e4": 1.2847433358430862, "p2m_x1e4": 0.8675933316349983}
+  },
+  "vanilla_kd_target_metrics": {"cd_x1e4": 1.2461316764354706, "p2m_x1e4": 0.830398990213871}
+}

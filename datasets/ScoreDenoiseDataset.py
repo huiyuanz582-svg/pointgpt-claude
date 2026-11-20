@@ -423,6 +423,10 @@ def denoise_collate_fn_test(batch):
         noise_std = torch.tensor(noise_std_list, dtype=torch.float32)
 
     return noisy, clean, noise_std, center_list, scale_list, name_list
+
+
+def denoise_collate_with_source_points(batch):
+    return (*denoise_collate_fn_test(batch), torch.tensor([item['source_points'] for item in batch]))
     
 def global_sample(pcl, target_n=10000, mode='fps'):
     """
@@ -608,6 +612,7 @@ class PairedPatchDataset(Dataset):
             # 训练阶段：随机种子点 + KNN 切固定大小 patch，让不同分辨率样本可以同 batch
             if self.flag == 'train':
                 N = data['pcl_clean'].shape[0]
+                data['source_points'] = N
                 patch_size = min(self.patch_size, N)
                 seed = torch.randint(0, N, (1,)).item()
                 seed_pnt = data['pcl_noisy'][seed:seed + 1]               # [1, 3]
@@ -697,7 +702,7 @@ class ScoreDenoise(pl.LightningDataModule):
         return val_names
     
 # 训练数据加载函数 划分成小点云块 添加噪声、旋转、缩放
-    def train_dataloader(self):
+    def train_dataloader(self, include_source_points=False):
         # 构建数据增强流程
         transforms = [
             # RandomScale([0.8, 1.2]),
@@ -742,15 +747,16 @@ class ScoreDenoise(pl.LightningDataModule):
             patch_ratio=1.0, on_the_fly=True, noise_min=self.noise_min, noise_max=self.noise_max,
             transform=noise_tran, flag='train', oversample_factor=self.train_oversample,
         )
+        collate = denoise_collate_with_source_points if include_source_points else denoise_collate_fn_test
         # print(train_dset[0]['pcl_noisy'].shape,train_dset[0]['pcl_clean'].shape,'----------------------------')
         # return
         if self.args.distributed:
             sampler = torch.utils.data.distributed.DistributedSampler(
                 train_dset, shuffle=True)
-            dataloader = DataLoader(train_dset, batch_size=self.train_batch_size, num_workers=self.num_workers,drop_last=True,collate_fn=denoise_collate_fn_test,worker_init_fn=worker_init_fn,sampler=sampler)
+            dataloader = DataLoader(train_dset, batch_size=self.train_batch_size, num_workers=self.num_workers,drop_last=True,collate_fn=collate,worker_init_fn=worker_init_fn,sampler=sampler)
         else:
             sampler = None
-            dataloader = DataLoader(train_dset, batch_size=self.train_batch_size,shuffle=True, num_workers=self.num_workers,drop_last=True,collate_fn=denoise_collate_fn_test)
+            dataloader = DataLoader(train_dset, batch_size=self.train_batch_size,shuffle=True, num_workers=self.num_workers,drop_last=True,collate_fn=collate)
 
         return sampler,dataloader
 # 验证数据加载函数：返回【从训练集留出的完整点云】+ 固定噪声（独立于 test，防泄漏）。

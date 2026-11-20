@@ -24,7 +24,7 @@ from utils.teacher_endpoint import (resolve_teacher_endpoint, endpoint_grad_rati
                                     endpoint_metadata, accumulate_teacher_endpoint,
                                     resolve_endpoint_finetune, finetune_metadata,
                                     pre_bn_conv_biases, continuous_endpoint_loss,
-                                    continuous_finetune_losses)
+                                    continuous_finetune_losses, student_rollout_endpoint)
 
 TEACHER_NODES = (0, 4, 8, 12, 16)
 TEACHER10_NODES = (0, 2, 5, 7, 10)
@@ -647,14 +647,14 @@ def _patch_options(config, batch):
                 fuse_tau_ratio=float(config.fuse_tau_ratio))
 
 
-def _train_loader(config):
+def _train_loader(config, include_source_points=False):
     """直接复用原 train_dataloader，包括 oversample、shuffle、drop_last 和 collate。"""
     from datasets.ScoreDenoiseDataset import ScoreDenoise
     cfg = copy.deepcopy(config.dataset._base_)
     # 与 main.py / builder.dataset_builder 的 baseline batch size 下发方式一致。
     cfg.TRAIN_BATCH_SIZE = int(config.total_bs)
     data_module = ScoreDenoise(argparse.Namespace(distributed=False), cfg)
-    _, loader = data_module.train_dataloader()
+    _, loader = data_module.train_dataloader(include_source_points=include_source_points)
     if not len(loader):
         raise ValueError('原训练 DataLoader 没有完整 batch')
     return loader
@@ -994,6 +994,7 @@ def finetune_endpoint(args, config, builder, device, teacher_path, output):
     import inspect
     import torch
     options = resolve_endpoint_finetune(config)
+    adaptation = options.get('dense_noise_adaptation')
     local_weight = options.get('local_weight', 0.0)
     endpoint_weight = options.get('endpoint_weight', 1.0)
     run_started = time.perf_counter()
@@ -1001,9 +1002,14 @@ def finetune_endpoint(args, config, builder, device, teacher_path, output):
     stop_epoch = args.stop_after_epoch or epochs
     if not 1 <= stop_epoch <= epochs:
         raise ValueError('stop_after_epoch must be within the declared fine-tuning plan')
+    if adaptation and (epochs != 1 or args.max_patch_batches or args.max_shapes):
+        raise ValueError('Dense-noise adaptation requires one complete epoch')
     dataset = config.dataset._base_
     if not (0.005 <= float(dataset.NOISE_MIN) <= float(dataset.NOISE_MAX) <= 0.02):
         raise ValueError('Endpoint fine-tuning requires training noise within 0.5%-2%')
+    if adaptation and not (dataset.NOISE_MIN <= adaptation['noise_ramp_start']
+                           < adaptation['noise_ramp_end'] <= dataset.NOISE_MAX):
+        raise ValueError('Dense-noise ramp must lie within the configured training noise range')
     initial_path = Path(args.init_student_ckpt)
     load_options = dict(map_location='cpu')
     if 'weights_only' in inspect.signature(torch.load).parameters:
@@ -1018,10 +1024,14 @@ def finetune_endpoint(args, config, builder, device, teacher_path, output):
     with initial_path.open('rb') as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b''):
             digest.update(block)
+    if adaptation and digest.hexdigest() != adaptation['reference_sha256']:
+        raise ValueError('Initial Student does not match the dense-noise reference checkpoint SHA256')
     initialization = dict(checkpoint=str(initial_path), checkpoint_sha256=digest.hexdigest(),
                           source_epoch=initial['epoch'], source_selection=initial.get('selection'),
                           source_teacher_checkpoint=initial.get('teacher_checkpoint'),
                           source_teacher_endpoint=initial.get('teacher_endpoint'), optimizer_state='fresh')
+    if adaptation:
+        initialization['source_endpoint_finetune'] = initial.get('endpoint_finetune')
     teacher = builder.model_builder(config.model).to(device)
     builder.load_model(teacher, str(teacher_path))
     freeze_teacher(teacher)
@@ -1032,6 +1042,12 @@ def finetune_endpoint(args, config, builder, device, teacher_path, output):
 
     student = builder.model_builder(config.model).to(device)
     load_student_state(student, initial_state)
+    reference = None
+    if adaptation:
+        # Copy only after the conditioned state is loaded. Deepcopy preserves RNG
+        # for the training sampler and gives the reference its own frozen buffers.
+        reference = copy.deepcopy(student)
+        freeze_teacher(reference)
     del initial_state, initial
     student.requires_grad_(True).eval()
     excluded = pre_bn_conv_biases(student, torch)
@@ -1049,7 +1065,7 @@ def finetune_endpoint(args, config, builder, device, teacher_path, output):
     manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
     manifest.update(initialization=initialization, endpoint_finetune_protocol=finetune_metadata(options, student))
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding='utf-8')
-    loader = _train_loader(config)
+    loader = _train_loader(config, include_source_points=bool(adaptation))
     bank, metadata = _validation_bank(config, teacher)
     metadata.update(metric='val_loss_teacher_endpoint', teacher_forced=False,
                     target='cached_teacher_T10_from_same_noisy_T0', selection_metric='val_rollout_score')
@@ -1063,34 +1079,51 @@ def finetune_endpoint(args, config, builder, device, teacher_path, output):
             epoch_started = time.perf_counter()
             total, seen, grad_norm_sum = 0.0, 0, 0.0
             local_total, endpoint_total, stage_totals = 0.0, 0.0, [0.0] * 4
+            active_patches, local_weight_sum = 0, 0.0
             student.eval()
             if epoch > 0:
-                for batch_index, (noisy, clean, sigmas, _centers, _scales, _names) in enumerate(loader):
+                for batch_index, batch in enumerate(loader):
                     if args.max_patch_batches and batch_index >= args.max_patch_batches:
                         break
                     if args.max_shapes and seen >= args.max_shapes:
                         break
+                    noisy, clean, sigmas = batch[:3]
                     if noisy.shape != clean.shape or sigmas is None:
                         raise ValueError('Training requires aligned noisy/clean patches and per-patch sigma')
                     if args.max_shapes:
                         noisy, sigmas = noisy[:args.max_shapes - seen], sigmas[:args.max_shapes - seen]
                     count = noisy.shape[0]
-                    # A local-only ablation does not need the extra global Teacher10 pass.
+                    patch_weights = None
+                    if adaptation:
+                        start, end = adaptation['noise_ramp_start'], adaptation['noise_ramp_end']
+                        patch_weights = ((sigmas - start) / (end - start)).clamp(0, 1)
+                        patch_weights *= batch[6] >= adaptation['min_source_points']
+                        active_patches += int((patch_weights > 0).sum())
+                        local_weight_sum += float(patch_weights.sum())
+                    # The anchored variant uses the initial Student as its endpoint target.
                     nodes = (capture_teacher(teacher, noisy, sigmas, int(config.teacher_patch_batch),
-                                             teacher_nodes=TEACHER10_NODES) if endpoint_weight else None)
+                                             teacher_nodes=TEACHER10_NODES)
+                             if endpoint_weight and reference is None else None)
                     inputs = nodes[0] if nodes is not None else noisy
                     sigma_batch = _sigma_batch(sigmas, count, device, inputs.dtype)
                     optimizer.zero_grad(set_to_none=True)
                     for offset in range(0, count, options['patch_batch']):
                         end = min(count, offset + options['patch_batch'])
                         size = end - offset
+                        patch = inputs[offset:end].to(device)
+                        patch_sigma = sigma_batch[offset:end]
+                        target = nodes[-1, offset:end].to(device) if nodes is not None else None
+                        if reference is not None:
+                            with torch.no_grad():
+                                target = student_rollout_endpoint(
+                                    reference, patch, patch_sigma, forward_student_interval,
+                                    teacher_nodes=TEACHER10_NODES, teacher_decay=TEACHER_DECAY)
                         losses = continuous_finetune_losses(
-                            student, inputs[offset:end].to(device),
-                            nodes[-1, offset:end].to(device) if nodes is not None else None,
-                            sigma_batch[offset:end], forward_student_interval,
+                            student, patch, target, patch_sigma, forward_student_interval,
                             teacher_target_fn=local_teacher_target,
                             local_weight=local_weight, endpoint_weight=endpoint_weight,
-                            gradient_checkpointing=options['gradient_checkpointing'])
+                            gradient_checkpointing=options['gradient_checkpointing'],
+                            local_patch_weights=patch_weights[offset:end] if patch_weights is not None else None)
                         (losses['loss'] * (size / count)).backward()
                         total += float(losses['loss'].detach()) * size
                         if losses['endpoint'] is not None:
@@ -1110,6 +1143,8 @@ def finetune_endpoint(args, config, builder, device, teacher_path, output):
                           f'patches_seen={seen}', flush=True)
                 if not seen:
                     raise RuntimeError('No endpoint fine-tuning updates were performed')
+                if adaptation and not active_patches:
+                    raise RuntimeError('No training patches activated dense-noise supervision')
             torch.cuda.synchronize(device)
             train_seconds = time.perf_counter() - epoch_started
             validation = validate_endpoint(student, bank, int(config.validation_seed))
@@ -1143,6 +1178,11 @@ def finetune_endpoint(args, config, builder, device, teacher_path, output):
                     finetune_grad_norm_mean=grad_norm_sum / seen if seen else None)
             else:
                 record['endpoint_grad_norm_mean'] = grad_norm_sum / seen if seen else None
+            if adaptation:
+                record.update(loss_reference_endpoint=record.pop('loss_teacher_endpoint'),
+                              loss_reference_endpoint_weighted=record.pop('loss_teacher_endpoint_weighted'),
+                              dense_noise_active_patches=active_patches,
+                              dense_noise_local_weight_mean=local_weight_sum / seen if seen else None)
             log.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + '\n')
             log.flush()
             print(json.dumps(record, ensure_ascii=False, allow_nan=False), flush=True)
@@ -1737,6 +1777,8 @@ def main():
                 dict(type='continuous_student_rollout', first_stage='noisy_T0',
                      target='cached_teacher_T10', student_state_detached=False)
                 if finetune is not None else training_input_metadata(resolved_curriculum['training_input']))
+            if finetune and 'dense_noise_adaptation' in finetune:
+                manifest['training_input_protocol']['target'] = 'frozen_initial_student_endpoint_and_teacher_intervals'
         if endpoint is not None:
             manifest['teacher_endpoint_protocol'] = endpoint_metadata(endpoint)
         if finetune is not None:
@@ -1748,6 +1790,10 @@ def main():
             manifest['source_sha256'] = {
                 name: hashlib.sha256((REPO_ROOT / name).read_bytes()).hexdigest()
                 for name in source_files}
+        if finetune and 'dense_noise_adaptation' in finetune:
+            for name in ('datasets/scoredenoise/transforms.py', 'tools/test_teacher_endpoint_six.py',
+                         'cfgs/PointGPT-L/dense_noise_reference_punet.json'):
+                manifest['source_sha256'][name] = hashlib.sha256((REPO_ROOT / name).read_bytes()).hexdigest()
         if resolved_curriculum['metric']['type'] == 'rollout_aware':
             manifest['rollout_curriculum'] = resolved_curriculum
         json.dump(manifest, handle, indent=2, ensure_ascii=False)

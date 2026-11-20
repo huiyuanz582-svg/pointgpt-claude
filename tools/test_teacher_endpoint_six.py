@@ -15,6 +15,7 @@ import sys
 import zipfile
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+DENSE_NOISE_REFERENCE = REPO_ROOT / 'cfgs/PointGPT-L/dense_noise_reference_punet.json'
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -53,9 +54,30 @@ def check_metrics(output, points, noise, checkpoint, expected_schedule):
     return dict(condition=output.name, cd_x1e4=cd, p2m_x1e4=p2m, score=cd + 0.3 * p2m)
 
 
+def dense_noise_acceptance(results, reference):
+    metrics = ('cd_x1e4', 'p2m_x1e4')
+    old_by_condition = reference['reference_metrics']
+    new_by_condition = {row['condition']: row for row in results}
+    if len(results) != 6 or new_by_condition.keys() != old_by_condition.keys():
+        raise ValueError('Acceptance requires all six reference conditions')
+    target = reference['target_condition']
+    comparisons = []
+    for condition, original in old_by_condition.items():
+        candidate = {key: new_by_condition[condition][key] for key in metrics}
+        delta = {key: candidate[key] - original[key] for key in metrics}
+        passed = (all(value < 0 for value in delta.values()) if condition == target
+                  else all(value <= 0 for value in delta.values()))
+        comparisons.append(dict(condition=condition, reference=original, candidate=candidate,
+                                delta=delta, passed=passed))
+    vanilla_kd = reference['vanilla_kd_target_metrics']
+    return dict(accepted=all(row['passed'] for row in comparisons), comparisons=comparisons,
+                beats_vanilla_kd_at_50k_3pct=all(new_by_condition[target][key] < vanilla_kd[key]
+                                               for key in metrics), reference_protocol=reference)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--train_root', type=Path, required=True, help='The train directory containing ckpt-best.pth')
+    parser.add_argument('--train_root', type=Path, required=True, help='A completed training run directory')
     parser.add_argument('--output_root', type=Path, help='Fresh result directory; default is next to train')
     parser.add_argument('--device', type=int, default=0)
     parser.add_argument('--seed', type=int, default=0)
@@ -63,8 +85,7 @@ def main():
     if args.device < 0 or args.seed < 0:
         raise ValueError('device and seed must be nonnegative')
     train = args.train_root.expanduser().resolve()
-    checkpoint = train / 'ckpt-best.pth'
-    for path in (checkpoint, train / 'manifest.json', train / 'validation_manifest.json', train / 'train.jsonl'):
+    for path in (train / 'manifest.json', train / 'validation_manifest.json', train / 'train.jsonl'):
         if not path.is_file():
             raise FileNotFoundError(path)
     training = json.loads((train / 'manifest.json').read_text(encoding='utf-8'))
@@ -72,6 +93,7 @@ def main():
     from utils.teacher_endpoint import resolve_teacher_endpoint, resolve_endpoint_finetune
     endpoint = resolve_teacher_endpoint(config)
     finetune = resolve_endpoint_finetune(config)
+    adaptation = (finetune or {}).get('dense_noise_adaptation')
     if endpoint is None and finetune is None:
         raise ValueError('This command requires a Teacher10 endpoint-alignment run')
     if config['dataset']['_base_']['DATASET'] != 'PUNet':
@@ -89,19 +111,36 @@ def main():
         if sha256_file(REPO_ROOT / name) != expected:
             raise ValueError(f'Current source differs from the training manifest: {name}')
 
+    evaluated = best
+    checkpoint = train / 'ckpt-best.pth'
+    reference = None
+    if adaptation:
+        reference = json.loads(DENSE_NOISE_REFERENCE.read_text(encoding='utf-8'))
+        if (planned_epochs != 1 or logs[1]['dense_noise_active_patches'] <= 0
+                or args.seed != reference['test_seed']
+                or adaptation['reference_sha256'] != reference['reference_checkpoint_sha256']
+                or training['initialization']['checkpoint_sha256'] != reference['reference_checkpoint_sha256']):
+            raise ValueError('Dense-noise acceptance requires the pinned reference, seed and full epoch-1 run')
+        # Evaluate the predeclared candidate even if the legacy validation score
+        # selected epoch 0. All six scenes use the same epoch-1 parameters.
+        evaluated = logs[1]
+        checkpoint = train / 'ckpt-last.pth'
+    if not checkpoint.is_file():
+        raise FileNotFoundError(checkpoint)
+
     # Read the actual selected checkpoint before starting GPU inference.
     import torch
     load_options = dict(map_location='cpu')
     if 'weights_only' in inspect.signature(torch.load).parameters:
         load_options['weights_only'] = False
     saved = torch.load(checkpoint, **load_options)
-    if (saved['epoch'] != best['epoch'] or saved['distillation'] != training['schedule']
+    if (saved['epoch'] != evaluated['epoch'] or saved['distillation'] != training['schedule']
             or saved.get('teacher_endpoint') != endpoint
             or saved.get('training_input') != config.get('training_input')
             or saved.get('teacher_endpoint_protocol') != training.get('teacher_endpoint_protocol')
             or saved.get('endpoint_finetune') != finetune
             or saved.get('endpoint_finetune_protocol') != training.get('endpoint_finetune_protocol')):
-        raise ValueError('ckpt-best.pth does not match this run / best epoch / objective')
+        raise ValueError(f'{checkpoint.name} does not match this run / evaluated epoch / objective')
     endpoint_protocol = saved.get('teacher_endpoint_protocol')
     if ((endpoint or {}).get('mask_pre_bn_conv_bias', False)
             and (not isinstance(endpoint_protocol, dict) or not endpoint_protocol.get('excluded_parameters'))):
@@ -117,7 +156,9 @@ def main():
     import yaml
     stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     variant = 'endpoint_masked' if (endpoint or {}).get('mask_pre_bn_conv_bias', False) else 'endpoint'
-    if finetune is not None:
+    if adaptation:
+        variant = 'dense_noise_finetune'
+    elif finetune is not None:
         variant = 'endpoint_finetune'
         if finetune.get('local_weight', 0) > 0:
             variant = ('local_endpoint_finetune' if finetune.get('endpoint_weight', 1) > 0
@@ -131,7 +172,7 @@ def main():
     config_root = result_root / 'configs'
     config_root.mkdir()
     selection = dict(checkpoint=str(checkpoint), checkpoint_sha256=sha256_file(checkpoint),
-                     epoch=best['epoch'], validation_score=best['val_rollout_score'],
+                     epoch=evaluated['epoch'], validation_score=evaluated['val_rollout_score'],
                      schedule=training['schedule'], teacher_endpoint=endpoint,
                      teacher_endpoint_protocol=endpoint_protocol,
                      test_seed=args.seed, results=[])
@@ -140,7 +181,10 @@ def main():
                          endpoint_finetune_protocol=training['endpoint_finetune_protocol'],
                          initialization=training['initialization'],
                          epoch0_validation_score=logs[0]['val_rollout_score'])
-    print(f'TRAIN_ROOT={train}\nbest_epoch={best["epoch"]}\nRESULT_ROOT={result_root}', flush=True)
+    if adaptation:
+        selection.update(selection_rule='predeclared_epoch_1', validation_best_epoch=best['epoch'])
+    print(f'TRAIN_ROOT={train}\nevaluated_epoch={evaluated["epoch"]}\n'
+          f'best_epoch={best["epoch"]}\nRESULT_ROOT={result_root}', flush=True)
     outputs = []
     for points in (10000, 50000):
         for noise in (0.01, 0.02, 0.03):
@@ -165,14 +209,22 @@ def main():
             print(json.dumps(metrics), flush=True)
     selection_path = result_root / 'selected_checkpoint.json'
     selection_path.write_text(json.dumps(selection, indent=2) + '\n', encoding='utf-8')
+    if adaptation:
+        acceptance = dense_noise_acceptance(selection['results'], reference)
+        acceptance_path = result_root / 'quality_acceptance.json'
+        acceptance_path.write_text(json.dumps(acceptance, indent=2, allow_nan=False) + '\n', encoding='utf-8')
     with zipfile.ZipFile(archive_path, 'x', zipfile.ZIP_DEFLATED) as archive:
         for name in ('train.jsonl', 'manifest.json', 'validation_manifest.json'):
             archive.write(train / name, f'training/{name}')
         archive.write(selection_path, 'selected_checkpoint.json')
+        if adaptation:
+            archive.write(acceptance_path, 'quality_acceptance.json')
         for label, output in outputs:
             for name in ('manifest.json', 'test_summary.json', 'test_metrics.csv'):
                 archive.write(output / name, f'{label}/{name}')
     print(f'ZIP={archive_path}', flush=True)
+    if adaptation:
+        print(f'ACCEPT_CANDIDATE={int(acceptance["accepted"])}', flush=True)
 
 
 if __name__ == '__main__':
