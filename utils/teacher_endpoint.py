@@ -80,7 +80,8 @@ def resolve_endpoint_finetune(config):
     if 'dense_noise_adaptation' in options:
         adaptation = options['dense_noise_adaptation']
         adaptation_keys = {'min_source_points', 'noise_ramp_start', 'noise_ramp_end', 'reference_sha256'}
-        if (not isinstance(adaptation, Mapping) or set(adaptation) != adaptation_keys
+        if (not isinstance(adaptation, Mapping) or not adaptation_keys.issubset(adaptation)
+                or set(adaptation) - adaptation_keys - {'interval_gain_calibration'}
                 or not weight_keys.issubset(options)
                 or min(options['local_weight'], options['endpoint_weight']) <= 0):
             raise ValueError('dense_noise_adaptation requires both positive weights and: '
@@ -94,12 +95,41 @@ def resolve_endpoint_finetune(config):
                 or any(char not in '0123456789abcdef' for char in digest)):
             raise ValueError('Invalid dense_noise_adaptation point count, noise ramp or reference SHA256')
         options['dense_noise_adaptation'] = dict(adaptation)
+        if 'interval_gain_calibration' in adaptation:
+            gain = adaptation['interval_gain_calibration']
+            if (not isinstance(gain, Mapping) or set(gain) != {'max_delta', 'full_noise'}
+                    or any(type(value) not in (int, float) for value in gain.values())
+                    or not 0 < gain['max_delta'] <= 0.5
+                    or not end < gain['full_noise'] <= 1):
+                raise ValueError('Interval calibration requires max_delta in (0, 0.5] and full_noise above the ramp')
     if (get('curriculum_mode') != 'fixed'
             or get('distillation', {}).get('teacher_nodes') != [0, 2, 5, 7, 10]
             or get('teacher_endpoint') is not None or get('training_input') is not None
             or get('pcd_dynamic', {}).get('shadow_enabled', False)):
         raise ValueError('endpoint_finetune requires fixed Teacher10/Student4 with its own fine-tuning objective')
     return options
+
+
+def checkpoint_interval_calibration(options, deltas):
+    """Resolve the four learned gains and the inference gate from checkpoint metadata."""
+    adaptation = (options or {}).get('dense_noise_adaptation') or {}
+    gain = adaptation.get('interval_gain_calibration')
+    if gain is None and deltas is None:
+        return None
+    if (gain is None or not isinstance(deltas, (list, tuple)) or len(deltas) != 4
+            or any(type(x) not in (int, float) or not -gain['max_delta'] <= x <= gain['max_delta']
+                   for x in deltas)):
+        raise ValueError('Checkpoint interval gain deltas must match the calibration configuration')
+    return dict(min_source_points=adaptation['min_source_points'], start_noise=adaptation['noise_ramp_end'],
+                full_noise=gain['full_noise'], deltas=list(deltas))
+
+
+def inference_interval_gain_deltas(calibration, points, sigma0):
+    if calibration is None or points < calibration['min_source_points'] or sigma0 <= calibration['start_noise']:
+        return None
+    scale = min(1.0, (sigma0 - calibration['start_noise'])
+                / (calibration['full_noise'] - calibration['start_noise']))
+    return [scale * value for value in calibration['deltas']]
 
 
 def finetune_metadata(options, student=None):
@@ -126,7 +156,22 @@ def finetune_metadata(options, student=None):
             teacher_targets_detached=True,
             student_gradient_scope='all_preceding_student_steps_for_each_active_loss',
             teacher_training_steps_per_patch=(10 if local else 0) + (10 if endpoint else 0))
-    if 'dense_noise_adaptation' in options:
+    adaptation = options.get('dense_noise_adaptation') or {}
+    if 'interval_gain_calibration' in adaptation:
+        metadata.pop('teacher_training_steps_per_patch')
+        metadata.update(
+            objective='dense_noise_interval_gain_calibration',
+            target='input_matched_teacher_intervals_and_paired_clean_patch',
+            loss_weights=dict(local=local, clean_endpoint=endpoint),
+            local_reduction='per_patch_noise_ramp_times_four_stage_mean_then_active_batch_mean',
+            local_weight_support='dense_source_clouds_with_sigma_above_ramp_start',
+            clean_target_used=True,
+            other_parameters='all_original_student_parameters_frozen',
+            trained_parameters='four_bounded_interval_gain_deltas',
+            inference_gate='source_points_and_known_input_sigma',
+            teacher_steps_per_active_patch=10,
+            experimental_candidate='predeclared_epoch_1')
+    elif adaptation:
         metadata.pop('teacher_training_steps_per_patch')
         metadata.update(
             objective='dense_noise_local_with_student_endpoint_anchor',
@@ -184,7 +229,7 @@ def continuous_finetune_losses(student, state, target, sigma0, forward_fn,
     the callback applies the nominal start-step decay. Teacher targets are made
     outside Student checkpoint closures, so backward never reruns the Teacher.
     Optional local_patch_weights reduce over the full batch, including zero-weight
-    patches. The endpoint target may come from a frozen reference Student.
+    patches. The endpoint target may be a frozen rollout or an aligned clean patch.
     Disabled loss terms are None, not a misleading measured zero.
     """
     import torch

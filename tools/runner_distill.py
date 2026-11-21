@@ -24,7 +24,8 @@ from utils.teacher_endpoint import (resolve_teacher_endpoint, endpoint_grad_rati
                                     endpoint_metadata, accumulate_teacher_endpoint,
                                     resolve_endpoint_finetune, finetune_metadata,
                                     pre_bn_conv_biases, continuous_endpoint_loss,
-                                    continuous_finetune_losses, student_rollout_endpoint)
+                                    continuous_finetune_losses, student_rollout_endpoint,
+                                    checkpoint_interval_calibration, inference_interval_gain_deltas)
 
 TEACHER_NODES = (0, 4, 8, 12, 16)
 TEACHER10_NODES = (0, 2, 5, 7, 10)
@@ -168,6 +169,8 @@ def load_student_checkpoint(student, checkpoint_path, builder, expected_nodes=No
     else:
         student.load_state_dict(weights, strict=True)
     student.distillation_teacher_nodes = saved_nodes
+    student.interval_gain_calibration = checkpoint_interval_calibration(
+        checkpoint.get('endpoint_finetune'), checkpoint.get('interval_gain_deltas'))
 
 
 def restore_dynamic_curriculum(checkpoint, config):
@@ -607,6 +610,10 @@ def infer_student(student, noisy, sigma0, patch_options, denoise_fn=None,
         denoise_fn = patch_based_denoise
     student.eval()
     model_for_patches = student
+    gain_deltas = None
+    calibration = getattr(student, 'interval_gain_calibration', None)
+    if calibration is not None:
+        gain_deltas = inference_interval_gain_deltas(calibration, len(noisy), float(sigma0))
     if getattr(student, 'step_condition', None) is not None or teacher_nodes != TEACHER_NODES:
         calls = 0
         def fixed_interval_forward(points, clean=None, type='val', name='', noise_std=None):
@@ -620,8 +627,11 @@ def infer_student(student, noisy, sigma0, patch_options, denoise_fn=None,
                 # sets displacement magnitude. Keep the patch/fusion implementation.
                 initial_sigma = float(torch.as_tensor(sigma0).reshape(-1)[0])
                 noise_std = torch.full_like(noise_std, initial_sigma * TEACHER_DECAY ** teacher_nodes[stage])
-            return forward_student_interval(student, points, noise_std,
-                                            teacher_nodes[stage], teacher_nodes[stage + 1])
+            prediction = forward_student_interval(student, points, noise_std,
+                                                  teacher_nodes[stage], teacher_nodes[stage + 1])
+            if gain_deltas is not None:
+                prediction = prediction + gain_deltas[stage] * (prediction - points)
+            return prediction
         model_for_patches = fixed_interval_forward
     with torch.no_grad():
         result = denoise_fn(
@@ -929,6 +939,9 @@ def _save_checkpoint(path, student, optimizer, epoch, teacher_path, config, sele
         payload['endpoint_finetune'] = finetune
         payload['endpoint_finetune_protocol'] = finetune_metadata(finetune, student)
         payload['initialization'] = student.endpoint_finetune_initialization
+        calibration = getattr(student, 'interval_gain_calibration', None)
+        if calibration is not None:
+            payload['interval_gain_deltas'] = calibration['deltas']
     if optimizer is not None:
         payload['optimizer'] = optimizer.state_dict()
     torch.save(payload, temporary)
@@ -995,6 +1008,7 @@ def finetune_endpoint(args, config, builder, device, teacher_path, output):
     import torch
     options = resolve_endpoint_finetune(config)
     adaptation = options.get('dense_noise_adaptation')
+    gain_options = (adaptation or {}).get('interval_gain_calibration')
     local_weight = options.get('local_weight', 0.0)
     endpoint_weight = options.get('endpoint_weight', 1.0)
     run_started = time.perf_counter()
@@ -1043,13 +1057,15 @@ def finetune_endpoint(args, config, builder, device, teacher_path, output):
     student = builder.model_builder(config.model).to(device)
     load_student_state(student, initial_state)
     reference = None
-    if adaptation:
+    if adaptation and gain_options is None:
         # Copy only after the conditioned state is loaded. Deepcopy preserves RNG
         # for the training sampler and gives the reference its own frozen buffers.
         reference = copy.deepcopy(student)
         freeze_teacher(reference)
+    frozen_backbone = ({key.replace('module.', ''): value for key, value in initial_state.items()}
+                       if gain_options else None)
     del initial_state, initial
-    student.requires_grad_(True).eval()
+    student.requires_grad_(gain_options is None).eval()
     excluded = pre_bn_conv_biases(student, torch)
     if not excluded:
         raise ValueError('Expected pre-BatchNorm Conv biases in the initial Student')
@@ -1059,7 +1075,17 @@ def finetune_endpoint(args, config, builder, device, teacher_path, output):
     student.endpoint_finetune_initialization = initialization
     frozen_values = {name: parameters_by_name[name].detach().clone() for name in excluded}
     frozen_buffers = {name: value.detach().clone() for name, value in student.named_buffers()}
-    trainable = [parameter for parameter in student.parameters() if parameter.requires_grad]
+    gain_logits = torch.nn.Parameter(torch.zeros(4, device=device)) if gain_options else None
+    trainable = ([gain_logits] if gain_logits is not None else
+                 [parameter for parameter in student.parameters() if parameter.requires_grad])
+
+    def forward_calibrated(model, points, sigma, start, stop):
+        prediction = forward_student_interval(model, points, sigma, start, stop)
+        stage = TEACHER10_NODES.index(start)
+        delta = gain_options['max_delta'] * gain_logits[stage].tanh()
+        return prediction + delta * (prediction - points)
+
+    training_forward = forward_calibrated if gain_logits is not None else forward_student_interval
     optimizer = torch.optim.AdamW(trainable, lr=float(config.learning_rate), weight_decay=float(config.weight_decay))
     manifest_path = output / 'manifest.json'
     manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
@@ -1092,7 +1118,7 @@ def finetune_endpoint(args, config, builder, device, teacher_path, output):
                         raise ValueError('Training requires aligned noisy/clean patches and per-patch sigma')
                     if args.max_shapes:
                         noisy, sigmas = noisy[:args.max_shapes - seen], sigmas[:args.max_shapes - seen]
-                    count = noisy.shape[0]
+                    batch_patch_count = count = noisy.shape[0]
                     patch_weights = None
                     if adaptation:
                         start, end = adaptation['noise_ramp_start'], adaptation['noise_ramp_end']
@@ -1100,10 +1126,18 @@ def finetune_endpoint(args, config, builder, device, teacher_path, output):
                         patch_weights *= batch[6] >= adaptation['min_source_points']
                         active_patches += int((patch_weights > 0).sum())
                         local_weight_sum += float(patch_weights.sum())
+                        if gain_logits is not None:
+                            active = patch_weights > 0
+                            if not active.any():
+                                seen += batch_patch_count
+                                continue
+                            noisy, clean, sigmas = noisy[active], clean[active], sigmas[active]
+                            patch_weights = patch_weights[active]
+                            count = len(noisy)
                     # The anchored variant uses the initial Student as its endpoint target.
                     nodes = (capture_teacher(teacher, noisy, sigmas, int(config.teacher_patch_batch),
                                              teacher_nodes=TEACHER10_NODES)
-                             if endpoint_weight and reference is None else None)
+                             if endpoint_weight and reference is None and gain_logits is None else None)
                     inputs = nodes[0] if nodes is not None else noisy
                     sigma_batch = _sigma_batch(sigmas, count, device, inputs.dtype)
                     optimizer.zero_grad(set_to_none=True)
@@ -1113,13 +1147,15 @@ def finetune_endpoint(args, config, builder, device, teacher_path, output):
                         patch = inputs[offset:end].to(device)
                         patch_sigma = sigma_batch[offset:end]
                         target = nodes[-1, offset:end].to(device) if nodes is not None else None
-                        if reference is not None:
+                        if gain_logits is not None:
+                            target = clean[offset:end].to(device)
+                        elif reference is not None:
                             with torch.no_grad():
                                 target = student_rollout_endpoint(
                                     reference, patch, patch_sigma, forward_student_interval,
                                     teacher_nodes=TEACHER10_NODES, teacher_decay=TEACHER_DECAY)
                         losses = continuous_finetune_losses(
-                            student, patch, target, patch_sigma, forward_student_interval,
+                            student, patch, target, patch_sigma, training_forward,
                             teacher_target_fn=local_teacher_target,
                             local_weight=local_weight, endpoint_weight=endpoint_weight,
                             gradient_checkpointing=options['gradient_checkpointing'],
@@ -1133,11 +1169,14 @@ def finetune_endpoint(args, config, builder, device, teacher_path, output):
                             for stage, value in enumerate(losses['stages']):
                                 stage_totals[stage] += float(value.detach()) * size
                         del losses
-                    check_gradients(teacher, student)
+                    if gain_logits is None:
+                        check_gradients(teacher, student)
+                    elif gain_logits.grad is None:
+                        raise RuntimeError('Missing interval gain gradient')
                     grad_norm = torch.nn.utils.clip_grad_norm_(trainable, float(config.grad_norm_clip), error_if_nonfinite=True)
                     grad_norm_sum += float(grad_norm) * count
                     optimizer.step()
-                    seen += count
+                    seen += batch_patch_count
                     del nodes, inputs
                     print(f'[endpoint-finetune] epoch={epoch} batch={batch_index + 1}/{len(loader)} '
                           f'patches_seen={seen}', flush=True)
@@ -1147,6 +1186,12 @@ def finetune_endpoint(args, config, builder, device, teacher_path, output):
                     raise RuntimeError('No training patches activated dense-noise supervision')
             torch.cuda.synchronize(device)
             train_seconds = time.perf_counter() - epoch_started
+            if gain_logits is not None:
+                deltas = (gain_options['max_delta'] * gain_logits.detach().tanh()).cpu().tolist()
+                student.interval_gain_calibration = checkpoint_interval_calibration(options, deltas)
+                if any(not torch.equal(value.detach().cpu(), frozen_backbone[name])
+                       for name, value in student.state_dict().items()):
+                    raise RuntimeError('Interval calibration changed the original Student state')
             validation = validate_endpoint(student, bank, int(config.validation_seed))
             validation.update(validate_rollout(student, config, teacher_nodes=TEACHER10_NODES))
             if any(module.training for module in student.modules()):
@@ -1158,10 +1203,11 @@ def finetune_endpoint(args, config, builder, device, teacher_path, output):
                 raise RuntimeError('Frozen pre-BN Conv bias changed during endpoint fine-tuning')
             best_score, best_epoch, improved = save_epoch_checkpoints(
                 output, student, optimizer, epoch, teacher_path, config, validation, best_score, best_epoch)
+            loss_patches = active_patches if gain_logits is not None else seen
             record = dict(epoch=epoch, phase='initial_validation' if epoch == 0 else 'endpoint_finetune',
                           patches=seen, teacher_steps=10, student_steps=4, teacher_nodes=list(TEACHER10_NODES),
-                          loss_teacher_endpoint=endpoint_total / seen if seen and endpoint_weight else None,
-                          loss_total=total / seen if seen else None,
+                          loss_teacher_endpoint=endpoint_total / loss_patches if loss_patches and endpoint_weight else None,
+                          loss_total=total / loss_patches if loss_patches else None,
                           best_epoch=best_epoch, best_val_rollout_score=best_score, is_best=improved,
                           initial_student_epoch=initialization['source_epoch'], frozen_buffers_verified=True,
                           frozen_biases_verified=True, total_planned_epochs=epochs,
@@ -1170,19 +1216,22 @@ def finetune_endpoint(args, config, builder, device, teacher_path, output):
                           run_elapsed_seconds=time.perf_counter() - run_started, **validation)
             if 'local_weight' in options:
                 record.update(
-                    loss_teacher_local=local_total / seen if seen and local_weight else None,
-                    loss_teacher_local_stages=[v / seen for v in stage_totals] if seen and local_weight else None,
-                    loss_teacher_local_weighted=local_weight * local_total / seen if seen else None,
-                    loss_teacher_endpoint_weighted=endpoint_weight * endpoint_total / seen if seen else None,
+                    loss_teacher_local=local_total / loss_patches if loss_patches and local_weight else None,
+                    loss_teacher_local_stages=[v / loss_patches for v in stage_totals] if loss_patches and local_weight else None,
+                    loss_teacher_local_weighted=local_weight * local_total / loss_patches if loss_patches else None,
+                    loss_teacher_endpoint_weighted=endpoint_weight * endpoint_total / loss_patches if loss_patches else None,
                     local_weight=local_weight, endpoint_weight=endpoint_weight,
-                    finetune_grad_norm_mean=grad_norm_sum / seen if seen else None)
+                    finetune_grad_norm_mean=grad_norm_sum / loss_patches if loss_patches else None)
             else:
                 record['endpoint_grad_norm_mean'] = grad_norm_sum / seen if seen else None
             if adaptation:
-                record.update(loss_reference_endpoint=record.pop('loss_teacher_endpoint'),
-                              loss_reference_endpoint_weighted=record.pop('loss_teacher_endpoint_weighted'),
-                              dense_noise_active_patches=active_patches,
+                endpoint_name = 'loss_reference_endpoint' if gain_logits is None else 'loss_clean_endpoint'
+                record[endpoint_name] = record.pop('loss_teacher_endpoint')
+                record[endpoint_name + '_weighted'] = record.pop('loss_teacher_endpoint_weighted')
+                record.update(dense_noise_active_patches=active_patches,
                               dense_noise_local_weight_mean=local_weight_sum / seen if seen else None)
+            if gain_logits is not None:
+                record.update(interval_gain_deltas=deltas, calibration_backbone_verified=True)
             log.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + '\n')
             log.flush()
             print(json.dumps(record, ensure_ascii=False, allow_nan=False), flush=True)
@@ -1778,7 +1827,10 @@ def main():
                      target='cached_teacher_T10', student_state_detached=False)
                 if finetune is not None else training_input_metadata(resolved_curriculum['training_input']))
             if finetune and 'dense_noise_adaptation' in finetune:
-                manifest['training_input_protocol']['target'] = 'frozen_initial_student_endpoint_and_teacher_intervals'
+                adaptation = finetune['dense_noise_adaptation']
+                manifest['training_input_protocol']['target'] = (
+                    'paired_clean_patch_and_teacher_intervals' if 'interval_gain_calibration' in adaptation
+                    else 'frozen_initial_student_endpoint_and_teacher_intervals')
         if endpoint is not None:
             manifest['teacher_endpoint_protocol'] = endpoint_metadata(endpoint)
         if finetune is not None:

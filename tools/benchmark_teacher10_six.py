@@ -30,6 +30,7 @@ if str(ROOT) not in sys.path:
 from utils.denoise_benchmark_report import (
     CONDITIONS, DENSE_NOISE_STUDENT, STUDENTS, build_report, condition_label,
     read_result, summarize, write_csv, write_json)
+from utils.teacher_endpoint import checkpoint_interval_calibration, inference_interval_gain_deltas
 
 NODES = [0, 2, 5, 7, 10]
 SCHEDULE = dict(teacher_nodes=NODES, teacher_steps=10, teacher_eta=0.3, teacher_decay=0.95,
@@ -104,6 +105,9 @@ def inspect_training(train_root, variant_id, actual_sources, reference=None):
             if sha256_file(ROOT / name) != expected:
                 raise ValueError(f'Current source differs from the training manifest: {name}')
         evaluated = logs[1]
+        if 'interval_gain_calibration' in adaptation and not all(
+                row.get('calibration_backbone_verified') for row in logs):
+            raise ValueError('Missing verification of the frozen Student backbone')
     elif variant_id == 'student_before':
         if finetune or not config.get('teacher_endpoint', {}).get('mask_pre_bn_conv_bias'):
             raise ValueError('The before checkpoint must be the masked endpoint Student4')
@@ -137,6 +141,9 @@ def inspect_training(train_root, variant_id, actual_sources, reference=None):
                    source_differences_from_training=differences)
     if dense_noise:
         variant.update(selection_rule='predeclared_epoch_1', validation_best_epoch=best['epoch'])
+        calibration = checkpoint_interval_calibration(options, evaluated.get('interval_gain_deltas'))
+        if calibration is not None:
+            variant['interval_gain_calibration'] = calibration
     return variant
 
 
@@ -201,6 +208,12 @@ def make_plan(args):
     plan = dict(schema_version=1, settings=settings, variants=variants, jobs=jobs)
     if quality_reference is not None:
         plan.update(benchmark_mode='dense_noise_finetune', quality_reference=quality_reference)
+        calibration = variants[0].get('interval_gain_calibration')
+        if calibration is not None:
+            active = {job['condition'] for job in jobs if inference_interval_gain_deltas(
+                calibration, job['points'], job['noise']) is not None}
+            if active != {quality_reference['target_condition']}:
+                raise ValueError('Interval calibration must leave the five protected scenes on the original path')
     return plan
 
 
@@ -230,6 +243,10 @@ def validate_student(saved, variant):
             raise ValueError(f'Checkpoint provenance mismatch: {name}')
     if saved.get('teacher_checkpoint') != manifest['checkpoint']:
         raise ValueError('Checkpoint and recorded Teacher differ')
+    calibration = checkpoint_interval_calibration(saved.get('endpoint_finetune'), saved.get('interval_gain_deltas'))
+    if calibration != variant.get('interval_gain_calibration'):
+        raise ValueError('Checkpoint interval gains differ from the recorded epoch')
+    return calibration
 
 
 def check_saved_checkpoints(plan):
@@ -294,19 +311,23 @@ def worker(plan_path, job_index):
         saved = load_checkpoint(torch, variant['checkpoint'])
         checkpoint_epoch = saved.get('epoch', -1)
         model = builder.model_builder(config.model)
+        calibration = None
         weights = saved.get('base_model') if saved.get('model') is None else saved['model']
         if weights is None:
             raise ValueError('Checkpoint is missing its model state')
         if variant['kind'] == 'student':
-            validate_student(saved, variant)
+            calibration = validate_student(saved, variant)
             if not any(k.replace('module.', '').startswith('step_condition.') for k in weights):
                 raise ValueError('Student checkpoint has no trained step condition')
             runner.load_student_state(model, weights)
+            model.interval_gain_calibration = calibration
         else:
             model.load_state_dict({k.replace('module.', ''): v for k, v in weights.items()}, strict=True)
         del weights, saved
         model = model.to(device).eval().requires_grad_(False)
         parameters = sum(p.numel() for p in model.parameters())
+        if calibration is not None:
+            parameters += len(calibration['deltas'])
         options = runner._patch_options(config, settings['patch_batch'])
 
         def infer(noisy):
@@ -359,6 +380,9 @@ def worker(plan_path, job_index):
                         quality_protocol=dict(cd='ChamferDistanceL2, clean unit sphere, x1e4',
                                               p2m='compute_p2m(test), bidirectional mesh unit sphere, x1e4',
                                               score='CD + 0.3 * P2M', aggregation='equal weight per cloud'))
+        if calibration is not None:
+            manifest['applied_interval_gain_deltas'] = inference_interval_gain_deltas(
+                calibration, job['points'], job['noise'])
         write_json(output / 'manifest.json', manifest)
         # Metrics are evaluated only AFTER all timed repeats. Mesh/CD allocations
         # can therefore never pollute inference memory peaks or timing warmup.
@@ -516,7 +540,10 @@ def main():
             shutil.copyfile(ROOT / name, dest)
         shutil.copyfile(ROOT / 'docs/teacher10_efficiency.md', root / 'measurement_protocol.md')
         if args.dense_noise_train_root is not None:
-            shutil.copyfile(ROOT / 'docs/teacher10_dense_noise_finetune.md', root / 'dense_noise_protocol.md')
+            protocol = ('teacher10_dense_noise_step_calibration.md'
+                        if plan['variants'][0].get('interval_gain_calibration')
+                        else 'teacher10_dense_noise_finetune.md')
+            shutil.copyfile(ROOT / 'docs' / protocol, root / 'dense_noise_protocol.md')
     print(f'RESULT_ROOT={root}\n{len(plan["jobs"])} jobs, each 20 clouds x {args.repeats} timed repeats', flush=True)
     # Different method order per condition reduces a fixed early/late ordering
     # effect. Processes remain strictly sequential; no GPU concurrency is used.
