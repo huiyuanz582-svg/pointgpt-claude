@@ -46,12 +46,31 @@ def read_csv(path):
         return list(csv.DictReader(handle))
 
 
-def summarize(timings, quality, points, repeats):
+def summarize(timings, quality, points, repeats, *, expected_clouds=20, measure_efficiency=True,
+              allow_filtered_output=False):
     """Equal cloud weights; every cloud must have exactly the same repeat count."""
     names = [r['name'] for r in quality]
-    if len(names) != 20 or len(set(names)) != 20:
-        raise ValueError('Expected quality results for exactly 20 unique clouds')
-    if len(timings) != 20 * repeats:
+    if expected_clouds < 1 or len(names) != expected_clouds or len(set(names)) != expected_clouds:
+        raise ValueError(f'Expected quality results for exactly {expected_clouds} unique clouds')
+    for row in quality:
+        output_points = int(row['output_points'])
+        valid_output = 0 < output_points <= points if allow_filtered_output else output_points == points
+        if int(row['input_points']) != points or not valid_output:
+            raise ValueError('Quality point counts differ from the condition')
+        for field in ('cd_x1e4', 'p2m_x1e4'):
+            if not math.isfinite(float(row[field])) or float(row[field]) < 0:
+                raise ValueError(f'Invalid quality metric: {field}')
+    cd = statistics.mean(float(r['cd_x1e4']) for r in quality)
+    p2m = statistics.mean(float(r['p2m_x1e4']) for r in quality)
+    if not measure_efficiency:
+        if timings:
+            raise ValueError('Quality-only conditions must not contain timing records')
+        return dict(clouds=expected_clouds, timing_observations=0, repeats=0,
+                    cd_x1e4=cd, p2m_x1e4=p2m, score=cd + 0.3 * p2m,
+                    **{key: None for key in ('latency_mean_ms', 'latency_median_ms', 'latency_std_ms',
+                       'round_mean_std_ms', 'clouds_per_second', 'points_per_second',
+                       'peak_allocated_gib', 'peak_reserved_gib')}, round_mean_ms=[])
+    if repeats < 1 or len(timings) != expected_clouds * repeats:
         raise ValueError('Incomplete timing records')
     seen = set()
     for row in timings:
@@ -67,19 +86,11 @@ def summarize(timings, quality, points, repeats):
             raise ValueError('Inconsistent allocated/reserved memory peaks')
         if int(row['input_points']) != points or int(row['output_points']) != points:
             raise ValueError('Timing point counts differ from the condition')
-    for row in quality:
-        if int(row['input_points']) != points or int(row['output_points']) != points:
-            raise ValueError('Quality point counts differ from the condition')
-        for field in ('cd_x1e4', 'p2m_x1e4'):
-            if not math.isfinite(float(row[field])) or float(row[field]) < 0:
-                raise ValueError(f'Invalid quality metric: {field}')
     latencies = [float(r['latency_ms']) for r in timings]
     mean_ms = statistics.mean(latencies)
     round_means = [statistics.mean(float(r['latency_ms']) for r in timings if int(r['repeat']) == i)
                    for i in range(repeats)]
-    cd = statistics.mean(float(r['cd_x1e4']) for r in quality)
-    p2m = statistics.mean(float(r['p2m_x1e4']) for r in quality)
-    return dict(clouds=20, timing_observations=len(timings), repeats=repeats,
+    return dict(clouds=expected_clouds, timing_observations=len(timings), repeats=repeats,
                 cd_x1e4=cd, p2m_x1e4=p2m, score=cd + 0.3 * p2m,
                 latency_mean_ms=mean_ms, latency_median_ms=statistics.median(latencies),
                 latency_std_ms=statistics.pstdev(latencies),
@@ -98,10 +109,14 @@ def read_result(output, job, settings):
         raise ValueError(f'Incomplete or incompatible result: {output}')
     timing = read_csv(output / 'timing_runs.csv')
     quality = read_csv(output / 'test_metrics.csv')
-    check = summarize(timing, quality, job['points'], settings['repeats'])
+    check = summarize(timing, quality, job['points'], settings['repeats'],
+                      expected_clouds=job.get('expected_clouds', 20),
+                      measure_efficiency=job.get('measure_efficiency', True))
     for key, value in check.items():
         observed = summary[key]
-        if isinstance(value, list):
+        if value is None:
+            equal = observed is None
+        elif isinstance(value, list):
             equal = len(value) == len(observed) and all(
                 math.isclose(a, b, rel_tol=1e-10, abs_tol=1e-10) for a, b in zip(value, observed))
         else:

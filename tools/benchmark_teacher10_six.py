@@ -54,9 +54,9 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
-def source_hashes():
+def source_hashes(extra=()):
     return {name: hashlib.sha256((ROOT / name).read_bytes().replace(b'\r\n', b'\n')).hexdigest()
-            for name in SOURCES}
+            for name in SOURCES + tuple(extra)}
 
 
 def load_json(path):
@@ -235,7 +235,7 @@ def check_saved_checkpoints(plan):
 def worker(plan_path, job_index):
     plan = load_json(plan_path)
     job, settings = plan['jobs'][job_index], plan['settings']
-    if source_hashes() != settings['source_sha256']:
+    if source_hashes(settings.get('extra_source_files', ())) != settings['source_sha256']:
         raise ValueError('Source files changed after the comparison plan was created')
     for key in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'NUMEXPR_NUM_THREADS'):
         os.environ[key] = str(settings['cpu_threads'])
@@ -287,6 +287,9 @@ def worker(plan_path, job_index):
                 raise ValueError('Student checkpoint has no trained step condition')
             runner.load_student_state(model, weights)
         else:
+            if saved.get('distillation') is not None or any(
+                    k.replace('module.', '').startswith('step_condition.') for k in weights):
+                raise ValueError('The Teacher path points to a distilled Student checkpoint')
             model.load_state_dict({k.replace('module.', ''): v for k, v in weights.items()}, strict=True)
         del weights, saved
         model = model.to(device).eval().requires_grad_(False)
@@ -319,8 +322,11 @@ def worker(plan_path, job_index):
             clouds.append(dict(name=name, noisy=noisy[0].clone(), clean=clean.clone(),
                                center=tensors[2].clone(), scale=tensors[3].clone(), sha256=digest.hexdigest()))
         del loader
-        if len(clouds) != 20 or len({c['name'] for c in clouds}) != 20:
-            raise ValueError('Each condition requires exactly 20 unique PUNet clouds')
+        expected_clouds = job.get('expected_clouds', 20)
+        if len(clouds) != expected_clouds or len({c['name'] for c in clouds}) != expected_clouds:
+            raise ValueError(f'Each condition requires exactly {expected_clouds} unique clouds')
+        if 'expected_names' in job and {c['name'] for c in clouds} != set(job['expected_names']):
+            raise ValueError('Loaded cloud names differ from the complete planned test set')
         if any(c['noisy'].dtype != torch.float32 for c in clouds):
             raise ValueError('Expected float32 input')
         properties = torch.cuda.get_device_properties(device)
@@ -346,9 +352,10 @@ def worker(plan_path, job_index):
         write_json(output / 'manifest.json', manifest)
         # Metrics are evaluated only AFTER all timed repeats. Mesh/CD allocations
         # can therefore never pollute inference memory peaks or timing warmup.
+        measure_efficiency = job.get('measure_efficiency', True)
         torch.cuda.empty_cache()
         warm_input = clouds[0]['noisy'].to(device)
-        for _ in range(settings['warmup']):
+        for _ in range(settings['warmup'] if measure_efficiency else 0):
             warm_output = infer(warm_input)
             torch.cuda.synchronize(device)
             del warm_output
@@ -359,35 +366,41 @@ def worker(plan_path, job_index):
         with (output / 'timing_runs.csv').open('w', newline='', encoding='utf-8') as handle:
             writer = csv.DictWriter(handle, fieldnames=timing_fields)
             writer.writeheader()
-            for repeat in range(settings['repeats']):
+            for repeat in range(settings['repeats'] if measure_efficiency else 1):
                 seed()  # Warmup/repeats do not advance the quality measurement RNG.
                 for cloud in clouds:
                     noisy = cloud['noisy'].to(device)
-                    torch.cuda.synchronize(device)
-                    allocated_before = torch.cuda.memory_allocated(device)
-                    torch.cuda.reset_peak_memory_stats(device)
-                    start = time.perf_counter_ns()
+                    if measure_efficiency:
+                        torch.cuda.synchronize(device)
+                        allocated_before = torch.cuda.memory_allocated(device)
+                        torch.cuda.reset_peak_memory_stats(device)
+                        start = time.perf_counter_ns()
                     prediction = infer(noisy)
-                    torch.cuda.synchronize(device)
-                    elapsed_ms = (time.perf_counter_ns() - start) / 1e6
-                    peak_allocated = torch.cuda.max_memory_allocated(device)
-                    peak_reserved = torch.cuda.max_memory_reserved(device)
+                    if measure_efficiency:
+                        torch.cuda.synchronize(device)
+                        elapsed_ms = (time.perf_counter_ns() - start) / 1e6
+                        peak_allocated = torch.cuda.max_memory_allocated(device)
+                        peak_reserved = torch.cuda.max_memory_reserved(device)
                     if prediction.shape != noisy.shape or not bool(torch.isfinite(prediction).all()):
                         raise ValueError(f'Invalid denoised cloud: {cloud["name"]}')
-                    row = dict(name=cloud['name'], repeat=repeat, input_points=noisy.shape[0],
-                               output_points=prediction.shape[0], latency_ms=elapsed_ms,
-                               allocated_before_bytes=allocated_before,
-                               peak_allocated_bytes=peak_allocated, peak_reserved_bytes=peak_reserved)
-                    timings.append(row)
-                    writer.writerow(row)
-                    handle.flush()
+                    if measure_efficiency:
+                        row = dict(name=cloud['name'], repeat=repeat, input_points=noisy.shape[0],
+                                   output_points=prediction.shape[0], latency_ms=elapsed_ms,
+                                   allocated_before_bytes=allocated_before,
+                                   peak_allocated_bytes=peak_allocated, peak_reserved_bytes=peak_reserved)
+                        timings.append(row)
+                        writer.writerow(row)
+                        handle.flush()
                     if repeat == 0:
                         predictions[cloud['name']] = prediction.detach().cpu()
                     del prediction, noisy
+                    elapsed = f'{elapsed_ms:.2f} ms' if measure_efficiency else 'quality inference'
                     print(f'[{variant["id"]}/{job["condition"]}] repeat={repeat + 1} '
-                          f'{cloud["name"]}: {elapsed_ms:.2f} ms', flush=True)
+                          f'{cloud["name"]}: {elapsed}', flush=True)
         ops = runner.baseline_metric_ops(config, device)
-        quality = []
+        quality, quality_sor = [], []
+        sor_config = copy.deepcopy(config)
+        sor_config.sor_enable = True
         mesh_root = Path(ops['mesh_root'])
         manifest['mesh_sha256'] = {}
         for cloud in clouds:
@@ -396,12 +409,29 @@ def worker(plan_path, job_index):
                 predictions[name].to(device), cloud['clean'], cloud['center'], cloud['scale'], name, config, ops)
             quality.append(dict(name=name, sigma0=job['noise'], input_points=job['points'],
                                 output_points=world.shape[0], **metrics))
+            if job.get('evaluate_sor_both', False):
+                sor_world, sor_metrics = runner.evaluate_baseline_metrics(
+                    predictions[name].to(device), cloud['clean'], cloud['center'], cloud['scale'],
+                    name, sor_config, ops)
+                quality_sor.append(dict(name=name, sigma0=job['noise'], input_points=job['points'],
+                                        output_points=sor_world.shape[0], **sor_metrics))
+                del sor_world
             manifest['mesh_sha256'][name] = sha256_file(mesh_root / 'test' / f'{name}.off')
             del world
         write_csv(output / 'test_metrics.csv', quality)
+        if quality_sor:
+            write_csv(output / 'test_metrics_sor.csv', quality_sor)
+            sor_summary = summarize([], quality_sor, job['points'], 0,
+                                    expected_clouds=expected_clouds, measure_efficiency=False,
+                                    allow_filtered_output=True)
+            write_json(output / 'summary_sor.json', dict(complete=True, **sor_summary))
+            manifest['quality_protocol']['sor_comparison'] = dict(
+                modes=['off', 'on'], same_prediction=True, nb_neighbors=20, std_ratio=2.0,
+                timing_includes_sor=False)
         manifest['quality_protocol']['mesh_root'] = str(mesh_root)
         write_json(output / 'manifest.json', manifest)
-        summary = summarize(timings, quality, job['points'], settings['repeats'])
+        summary = summarize(timings, quality, job['points'], settings['repeats'],
+                            expected_clouds=expected_clouds, measure_efficiency=measure_efficiency)
         write_json(output / 'summary.json', dict(complete=True, **summary))
         print(json.dumps(summary, allow_nan=False), flush=True)
 
