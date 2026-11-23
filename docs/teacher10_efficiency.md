@@ -3,6 +3,35 @@
 入口为 `tools/benchmark_teacher10_six.py`，汇总和绘图由
 `utils/denoise_benchmark_report.py` 完成。只在服务器上手动运行。
 
+## 只测原联合监督 Student4 的六场景效率
+
+该模型按 `codex/paper2-teacher10-endpoint-finetune`（`dd9ad01`）训练，
+使用 `mixed_10to4_local_endpoint_finetune_1epoch_seed0_20261118_035447_40/train/ckpt-best.pth`。
+单模型评测入口在同一分支上。将最新的 `tools/benchmark_teacher10_six.py`、
+`utils/denoise_benchmark_report.py` 和本说明同步到服务器。训练及推理源码沿用
+`dd9ad01`。命令核对一轮联合监督训练记录及精确权重哈希。
+
+```bash
+conda activate pointgpt && (
+set -euo pipefail
+cd /workspace
+
+TRAIN_ROOT="experiments/input_ablation/mixed_10to4_local_endpoint_finetune_1epoch_seed0_20261118_035447_40/train"
+OUT_ROOT="experiments/efficiency/local_endpoint_quality_efficiency_$(date +%Y%m%d_%H%M%S)_$$"
+
+CUDA_VISIBLE_DEVICES=0 python -u tools/benchmark_teacher10_six.py \
+  --local_endpoint_train_root "$TRAIN_ROOT" \
+  --expected_checkpoint_sha256 94da5dd125e92bec221bb3a9a72b0896ca48eaef86c05bd057516517950e5a12 \
+  --output_root "$OUT_ROOT" --device 0 --seed 0 --patch_batch 1 --warmup 2 --repeats 3
+)
+```
+
+运行 PU-Net 10k/50k × 1%/2%/3%，每场景 20 云、2 次预热、3 轮正式计时，
+共 360 条计时。沿用下文的计时协议。首轮输出用于计算 CD/P2M。ZIP 包含六场景
+`summary.csv`、逐云指标、逐次计时、硬件与权重身份记录。单模型模式仅测本方法。
+本次 ZIP 的 Teacher10 加速比留空，可用历史同场景 Teacher10 时间另算跨运行参考比值。
+若中断，复用打印的 `RESULT_ROOT` 作为 `--output_root`，并加 `--resume`。
+
 ## 比较对象
 
 - `student_before`：masked endpoint 的微调前 best checkpoint。

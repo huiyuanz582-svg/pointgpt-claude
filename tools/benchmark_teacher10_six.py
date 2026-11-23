@@ -1,7 +1,8 @@
-"""Manual quality/efficiency comparison of three Student4 checkpoints and Teacher prefixes.
+"""Manual six-condition quality and efficiency evaluation.
 
 Each variant/condition runs in a fresh, sequential subprocess with one model.
 No training, optimizer updates, trajectory capture, or checkpoint writes.
+Use --local_endpoint_train_root to evaluate just the original joint Student4.
 """
 
 import argparse
@@ -27,7 +28,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from utils.denoise_benchmark_report import (
-    CONDITIONS, STUDENTS, build_report, condition_label, read_result, summarize, write_csv, write_json)
+    CONDITIONS, LOCAL_ENDPOINT_STUDENT, STUDENTS, build_report, condition_label,
+    read_result, summarize, write_csv, write_json)
 
 NODES = [0, 2, 5, 7, 10]
 SCHEDULE = dict(teacher_nodes=NODES, teacher_steps=10, teacher_eta=0.3, teacher_decay=0.95,
@@ -35,6 +37,8 @@ SCHEDULE = dict(teacher_nodes=NODES, teacher_steps=10, teacher_eta=0.3, teacher_
                 student_decay=[0.95 ** (u - t) for t, u in zip(NODES[:-1], NODES[1:])])
 INFERENCE_SOURCES = ('models/PointGPT.py', 'models/step_condition.py',
                      'tools/runner_finetune.py', 'datasets/ScoreDenoiseDataset.py')
+JOINT_TRAINING_SOURCES = INFERENCE_SOURCES + ('tools/runner_distill.py', 'utils/teacher_endpoint.py',
+                                             'utils/training_input.py')
 SOURCES = INFERENCE_SOURCES + ('tools/runner_distill.py', 'tools/builder.py',
                               'utils/teacher_endpoint.py', 'utils/training_input.py',
                               'utils/misc.py', 'utils/p2m_loss.py', 'utils/gpu_memory.py',
@@ -79,7 +83,7 @@ def inspect_training(train_root, variant_id, actual_sources):
     best = min(logs, key=lambda r: r['val_rollout_score'])
     if logs[-1]['best_epoch'] != best['epoch'] or manifest['schedule'] != SCHEDULE:
         raise ValueError(f'Best tracking or Teacher10 schedule mismatch: {train_root}')
-    expected_epochs = {'student_ft1': 1, 'student_ft3': 3}
+    expected_epochs = {'student_ft1': 1, 'student_ft3': 3, LOCAL_ENDPOINT_STUDENT: 1}
     if variant_id == 'student_before':
         if finetune or not config.get('teacher_endpoint', {}).get('mask_pre_bn_conv_bias'):
             raise ValueError('The before checkpoint must be the masked endpoint Student4')
@@ -94,12 +98,22 @@ def inspect_training(train_root, variant_id, actual_sources):
         raise ValueError('This benchmark requires PUNet')
     if config.get('sor_enable', True) or config.get('surface_projection', {}).get('enable', False):
         raise ValueError('This comparison requires the existing SOR/projection-disabled protocol')
-    differences = {name: dict(training=expected, current=actual_sources.get(name))
-                   for name, expected in manifest.get('source_sha256', {}).items()
-                   if expected != actual_sources.get(name)}
-    for name in INFERENCE_SOURCES:
-        if manifest.get('source_sha256', {}).get(name) != actual_sources[name]:
-            raise ValueError(f'Inference implementation differs from the training record: {name}')
+    recorded_sources = manifest.get('source_sha256', {})
+    differences = {}
+    if variant_id == LOCAL_ENDPOINT_STUDENT:
+        protocol = manifest.get('endpoint_finetune_protocol', {})
+        if (manifest.get('mode') != 'train' or protocol.get('objective') != 'local_endpoint'
+                or not protocol.get('frozen_parameters') or logs[0].get('phase') != 'initial_validation'):
+            raise ValueError('Expected the completed 1-epoch local + endpoint fine-tuning run')
+        for name in JOINT_TRAINING_SOURCES:
+            if recorded_sources.get(name) not in (actual_sources[name], sha256_file(ROOT / name)):
+                raise ValueError(f'Current source differs from the joint Student training record: {name}')
+    else:
+        differences = {name: dict(training=expected, current=actual_sources.get(name))
+                       for name, expected in recorded_sources.items() if expected != actual_sources.get(name)}
+        for name in INFERENCE_SOURCES:
+            if recorded_sources.get(name) != actual_sources[name]:
+                raise ValueError(f'Inference implementation differs from the training record: {name}')
     # runner_distill/teacher_endpoint may differ after adding the fine-tuning
     # training path. Record these differences; load all three with one current
     # infer_student implementation and keep the immutable inference files equal.
@@ -111,8 +125,7 @@ def inspect_training(train_root, variant_id, actual_sources):
                 source_differences_from_training=differences)
 
 
-def make_plan(args):
-    current_sources = source_hashes()
+def comparison_variants(args, current_sources):
     roots = (args.before_train_root, args.one_epoch_train_root, args.three_epoch_train_root)
     variants = [inspect_training(root, label, current_sources) for root, label in zip(roots, STUDENTS)]
     teacher = args.teacher_ckpt.expanduser().resolve()
@@ -137,9 +150,23 @@ def make_plan(args):
     variants.extend(dict(id=f'teacher_{steps}', kind='teacher', steps=steps,
                          checkpoint=str(teacher), checkpoint_sha256=teacher_hash)
                     for steps in (2, 4, 6, 8, 10))
-    config = copy.deepcopy(reference)
+    return variants
+
+
+def make_plan(args):
+    current_sources = source_hashes()
+    local_endpoint = args.local_endpoint_train_root is not None
+    if local_endpoint:
+        variant = inspect_training(args.local_endpoint_train_root, LOCAL_ENDPOINT_STUDENT, current_sources)
+        if (args.expected_checkpoint_sha256 is not None
+                and variant['checkpoint_sha256'] != args.expected_checkpoint_sha256.lower()):
+            raise ValueError('ckpt-best.pth SHA256 differs from the given checkpoint identity')
+        variants = [variant]
+    else:
+        variants = comparison_variants(args, current_sources)
+    config = copy.deepcopy(variants[0]['training_manifest']['config'])
     config['test_patch_batch'] = args.patch_batch
-    # Dataset/normalization and score code are shared by all eight variants.
+    # Dataset/normalization and score code are shared by both modes.
     for key in ('TEST_NOISY_PATH', 'TEST_CLEAN_PATH', 'TEST_MESH_ROOT'):
         if config['dataset']['_base_'].get(key):
             raise ValueError(f'Use the standard six-condition PUNet inputs, without {key}')
@@ -155,7 +182,10 @@ def make_plan(args):
                     source_sha256=current_sources)
     jobs = [dict(variant=v, condition=condition_label(n, s), points=n, noise=s, config=config)
             for n, s in CONDITIONS for v in variants]
-    return dict(schema_version=1, settings=settings, variants=variants, jobs=jobs)
+    plan = dict(schema_version=1, settings=settings, variants=variants, jobs=jobs)
+    if local_endpoint:
+        plan['benchmark_mode'] = 'local_endpoint_finetune'
+    return plan
 
 
 def load_checkpoint(torch, path):
@@ -394,6 +424,9 @@ def main():
     parser.add_argument('--one_epoch_train_root', type=Path)
     parser.add_argument('--three_epoch_train_root', type=Path)
     parser.add_argument('--teacher_ckpt', type=Path)
+    parser.add_argument('--local_endpoint_train_root', type=Path,
+                        help='Evaluate only the joint Student4 ckpt-best in all six conditions')
+    parser.add_argument('--expected_checkpoint_sha256', help='Verify the joint Student4 checkpoint identity')
     parser.add_argument('--output_root', type=Path)
     parser.add_argument('--device', type=int, default=0)
     parser.add_argument('--seed', type=int, default=0)
@@ -414,9 +447,17 @@ def main():
         build_report(root)
         package(root)
         return
-    if any(getattr(args, key) is None for key in (
-            'before_train_root', 'one_epoch_train_root', 'three_epoch_train_root', 'teacher_ckpt')):
-        parser.error('Provide all three train roots and --teacher_ckpt')
+    comparison_inputs = (args.before_train_root, args.one_epoch_train_root,
+                         args.three_epoch_train_root, args.teacher_ckpt)
+    local_endpoint = args.local_endpoint_train_root is not None
+    if local_endpoint:
+        if any(value is not None for value in comparison_inputs):
+            parser.error('--local_endpoint_train_root runs a standalone Student evaluation')
+    else:
+        if any(value is None for value in comparison_inputs):
+            parser.error('Provide --local_endpoint_train_root or all three train roots and --teacher_ckpt')
+        if args.expected_checkpoint_sha256 is not None:
+            parser.error('--expected_checkpoint_sha256 requires --local_endpoint_train_root')
     if not 0 <= args.seed < 2 ** 32 or args.device < 0 or min(args.repeats, args.warmup, args.patch_batch) < 1:
         parser.error('Require nonnegative device/uint32 seed and positive repeats/warmup/patch_batch')
     if args.resume and args.output_root is None:
@@ -428,8 +469,9 @@ def main():
     plan = make_plan(args)
     check_saved_checkpoints(plan)
     stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    prefix = 'local_endpoint_quality_efficiency' if local_endpoint else 'teacher10_student4'
     root = (args.output_root.expanduser().resolve() if args.output_root else
-            ROOT / 'experiments/efficiency' / f'teacher10_student4_{stamp}_{os.getpid()}')
+            ROOT / 'experiments/efficiency' / f'{prefix}_{stamp}_{os.getpid()}')
     plan_path = root / 'plan.json'
     if args.resume:
         if load_json(plan_path) != plan:
@@ -451,12 +493,13 @@ def main():
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / name, dest)
         shutil.copyfile(ROOT / 'docs/teacher10_efficiency.md', root / 'measurement_protocol.md')
-    print(f'RESULT_ROOT={root}\n48 jobs, each 20 clouds x {args.repeats} timed repeats', flush=True)
+    print(f'RESULT_ROOT={root}\n{len(plan["jobs"])} jobs, each 20 clouds x {args.repeats} timed repeats', flush=True)
     # Different method order per condition reduces a fixed early/late ordering
     # effect. Processes remain strictly sequential; no GPU concurrency is used.
     order = []
+    variant_count = len(plan['variants'])
     for condition_index in range(len(CONDITIONS)):
-        indices = list(range(condition_index * 8, (condition_index + 1) * 8))
+        indices = list(range(condition_index * variant_count, (condition_index + 1) * variant_count))
         random.Random(args.seed + condition_index).shuffle(indices)
         order.extend(indices)
     compared_inputs, compared_environment = {}, []
