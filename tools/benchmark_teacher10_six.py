@@ -8,6 +8,7 @@ Use --local_endpoint_train_root to evaluate just the original joint Student4.
 import argparse
 import copy
 import csv
+from contextlib import ExitStack
 from datetime import datetime, timezone
 import hashlib
 import inspect
@@ -232,6 +233,38 @@ def check_saved_checkpoints(plan):
         del saved
 
 
+def timed_inference(torch, infer, noisy, device, sor=None):
+    """Measure a shared inference prefix and, optionally, its full SOR extension.
+
+    Both intervals start at the same GPU input and finish with GPU output. No
+    metrics, validation, logging or prediction archival runs between endpoints.
+    """
+    torch.cuda.synchronize(device)
+    allocated_before = torch.cuda.memory_allocated(device)
+    torch.cuda.reset_peak_memory_stats(device)
+    start = time.perf_counter_ns()
+    prediction = infer(noisy)
+    torch.cuda.synchronize(device)
+    elapsed_ms = (time.perf_counter_ns() - start) / 1e6
+    peak_allocated = torch.cuda.max_memory_allocated(device)
+    peak_reserved = torch.cuda.max_memory_reserved(device)
+    sor_prediction, sor_row = None, None
+    if sor is not None:
+        # Open3D SOR runs on CPU. Include its D2H and H2D transfers so both
+        # configurations have the same GPU-to-GPU input/output boundary.
+        sor_prediction = sor(prediction).to(device)
+        torch.cuda.synchronize(device)
+        sor_elapsed_ms = (time.perf_counter_ns() - start) / 1e6
+        sor_row = dict(input_points=noisy.shape[0], output_points=sor_prediction.shape[0],
+                       latency_ms=sor_elapsed_ms, allocated_before_bytes=allocated_before,
+                       peak_allocated_bytes=torch.cuda.max_memory_allocated(device),
+                       peak_reserved_bytes=torch.cuda.max_memory_reserved(device))
+    row = dict(input_points=noisy.shape[0], output_points=prediction.shape[0], latency_ms=elapsed_ms,
+               allocated_before_bytes=allocated_before, peak_allocated_bytes=peak_allocated,
+               peak_reserved_bytes=peak_reserved)
+    return prediction, row, sor_prediction, sor_row
+
+
 def worker(plan_path, job_index):
     plan = load_json(plan_path)
     job, settings = plan['jobs'][job_index], plan['settings']
@@ -260,7 +293,7 @@ def worker(plan_path, job_index):
     with exit_on_cuda_oom():
         from tools import builder
         from tools import runner_distill as runner
-        from tools.runner_finetune import patch_based_denoise
+        from tools.runner_finetune import patch_based_denoise, sor_filter
 
         def seed():
             random.seed(settings['seed'])
@@ -353,48 +386,65 @@ def worker(plan_path, job_index):
         # Metrics are evaluated only AFTER all timed repeats. Mesh/CD allocations
         # can therefore never pollute inference memory peaks or timing warmup.
         measure_efficiency = job.get('measure_efficiency', True)
+        measure_sor = job.get('measure_sor_efficiency', False)
+        if measure_sor and (not measure_efficiency or not job.get('evaluate_sor_both', False)):
+            raise ValueError('SOR timing requires an efficiency scene with both SOR quality modes')
         torch.cuda.empty_cache()
         warm_input = clouds[0]['noisy'].to(device)
         for _ in range(settings['warmup'] if measure_efficiency else 0):
             warm_output = infer(warm_input)
+            if measure_sor:
+                warm_sor = sor_filter(warm_output).to(device)
+                del warm_sor
             torch.cuda.synchronize(device)
             del warm_output
         del warm_input
-        timings, predictions = [], {}
+        timings, predictions, timings_sor, predictions_sor = [], {}, [], {}
         timing_fields = ['name', 'repeat', 'input_points', 'output_points', 'latency_ms',
                          'allocated_before_bytes', 'peak_allocated_bytes', 'peak_reserved_bytes']
-        with (output / 'timing_runs.csv').open('w', newline='', encoding='utf-8') as handle:
+        with ExitStack() as stack:
+            handle = stack.enter_context((output / 'timing_runs.csv').open('w', newline='', encoding='utf-8'))
             writer = csv.DictWriter(handle, fieldnames=timing_fields)
             writer.writeheader()
+            if measure_sor:
+                sor_handle = stack.enter_context(
+                    (output / 'timing_runs_sor.csv').open('w', newline='', encoding='utf-8'))
+                sor_writer = csv.DictWriter(sor_handle, fieldnames=timing_fields)
+                sor_writer.writeheader()
             for repeat in range(settings['repeats'] if measure_efficiency else 1):
                 seed()  # Warmup/repeats do not advance the quality measurement RNG.
                 for cloud in clouds:
                     noisy = cloud['noisy'].to(device)
                     if measure_efficiency:
-                        torch.cuda.synchronize(device)
-                        allocated_before = torch.cuda.memory_allocated(device)
-                        torch.cuda.reset_peak_memory_stats(device)
-                        start = time.perf_counter_ns()
-                    prediction = infer(noisy)
-                    if measure_efficiency:
-                        torch.cuda.synchronize(device)
-                        elapsed_ms = (time.perf_counter_ns() - start) / 1e6
-                        peak_allocated = torch.cuda.max_memory_allocated(device)
-                        peak_reserved = torch.cuda.max_memory_reserved(device)
+                        prediction, row, sor_prediction, sor_row = timed_inference(
+                            torch, infer, noisy, device, sor=sor_filter if measure_sor else None)
+                    else:
+                        prediction = infer(noisy)
                     if prediction.shape != noisy.shape or not bool(torch.isfinite(prediction).all()):
                         raise ValueError(f'Invalid denoised cloud: {cloud["name"]}')
                     if measure_efficiency:
-                        row = dict(name=cloud['name'], repeat=repeat, input_points=noisy.shape[0],
-                                   output_points=prediction.shape[0], latency_ms=elapsed_ms,
-                                   allocated_before_bytes=allocated_before,
-                                   peak_allocated_bytes=peak_allocated, peak_reserved_bytes=peak_reserved)
+                        row.update(name=cloud['name'], repeat=repeat)
                         timings.append(row)
                         writer.writerow(row)
                         handle.flush()
+                    if measure_sor:
+                        if (sor_prediction.ndim != 2 or sor_prediction.shape[1] != 3
+                                or not 0 < sor_prediction.shape[0] <= noisy.shape[0]
+                                or not bool(torch.isfinite(sor_prediction).all())):
+                            raise ValueError(f'Invalid SOR cloud: {cloud["name"]}')
+                        sor_row.update(name=cloud['name'], repeat=repeat)
+                        timings_sor.append(sor_row)
+                        sor_writer.writerow(sor_row)
+                        sor_handle.flush()
+                        if repeat == 0:
+                            predictions_sor[cloud['name']] = sor_prediction.detach().cpu()
+                        del sor_prediction
                     if repeat == 0:
                         predictions[cloud['name']] = prediction.detach().cpu()
                     del prediction, noisy
-                    elapsed = f'{elapsed_ms:.2f} ms' if measure_efficiency else 'quality inference'
+                    elapsed = f'{row["latency_ms"]:.2f} ms' if measure_efficiency else 'quality inference'
+                    if measure_sor:
+                        elapsed += f', including SOR {sor_row["latency_ms"]:.2f} ms'
                     print(f'[{variant["id"]}/{job["condition"]}] repeat={repeat + 1} '
                           f'{cloud["name"]}: {elapsed}', flush=True)
         ops = runner.baseline_metric_ops(config, device)
@@ -410,9 +460,11 @@ def worker(plan_path, job_index):
             quality.append(dict(name=name, sigma0=job['noise'], input_points=job['points'],
                                 output_points=world.shape[0], **metrics))
             if job.get('evaluate_sor_both', False):
+                # Reuse the actual first timed SOR output; do not filter it a second time.
+                sor_input = predictions_sor[name] if measure_sor else predictions[name]
                 sor_world, sor_metrics = runner.evaluate_baseline_metrics(
-                    predictions[name].to(device), cloud['clean'], cloud['center'], cloud['scale'],
-                    name, sor_config, ops)
+                    sor_input.to(device), cloud['clean'], cloud['center'], cloud['scale'],
+                    name, config if measure_sor else sor_config, ops)
                 quality_sor.append(dict(name=name, sigma0=job['noise'], input_points=job['points'],
                                         output_points=sor_world.shape[0], **sor_metrics))
                 del sor_world
@@ -421,13 +473,13 @@ def worker(plan_path, job_index):
         write_csv(output / 'test_metrics.csv', quality)
         if quality_sor:
             write_csv(output / 'test_metrics_sor.csv', quality_sor)
-            sor_summary = summarize([], quality_sor, job['points'], 0,
-                                    expected_clouds=expected_clouds, measure_efficiency=False,
+            sor_summary = summarize(timings_sor, quality_sor, job['points'], settings['repeats'],
+                                    expected_clouds=expected_clouds, measure_efficiency=measure_sor,
                                     allow_filtered_output=True)
             write_json(output / 'summary_sor.json', dict(complete=True, **sor_summary))
             manifest['quality_protocol']['sor_comparison'] = dict(
                 modes=['off', 'on'], same_prediction=True, nb_neighbors=20, std_ratio=2.0,
-                timing_includes_sor=False)
+                timing_includes_sor=measure_sor)
         manifest['quality_protocol']['mesh_root'] = str(mesh_root)
         write_json(output / 'manifest.json', manifest)
         summary = summarize(timings, quality, job['points'], settings['repeats'],

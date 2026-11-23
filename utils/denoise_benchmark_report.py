@@ -84,7 +84,9 @@ def summarize(timings, quality, points, repeats, *, expected_clouds=20, measure_
         if not (0 < int(row['allocated_before_bytes']) <= int(row['peak_allocated_bytes'])
                 <= int(row['peak_reserved_bytes'])):
             raise ValueError('Inconsistent allocated/reserved memory peaks')
-        if int(row['input_points']) != points or int(row['output_points']) != points:
+        output_points = int(row['output_points'])
+        valid_output = 0 < output_points <= points if allow_filtered_output else output_points == points
+        if int(row['input_points']) != points or not valid_output:
             raise ValueError('Timing point counts differ from the condition')
     latencies = [float(r['latency_ms']) for r in timings]
     mean_ms = statistics.mean(latencies)

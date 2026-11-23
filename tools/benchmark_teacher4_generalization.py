@@ -1,4 +1,4 @@
-"""Manual Teacher4 CD/P2M suite: PUNet lap/cov and PCNet, with six timing cases.
+"""Manual Teacher4 CD/P2M suite: six timing scenes with paired SOR-off/on results.
 
 The coordinator discovers existing test data. GPU jobs are sequential, with a
 fresh process per scene. Only --plan_only avoids model/checkpoint loading.
@@ -55,7 +55,11 @@ def make_plan(args):
     config, dataset_path = load_config(config_path, args.patch_batch)
     checkpoint = args.teacher_ckpt.expanduser().resolve()
     if not checkpoint.is_file():
-        raise FileNotFoundError(f'Missing original Teacher checkpoint: {checkpoint}')
+        raise FileNotFoundError(
+            f'Missing original Teacher checkpoint: {checkpoint}\n'
+            f'Project root in this process: {ROOT}\n'
+            'In Docker, use a container-visible path or a project-relative path such as '
+            'experiments/L_consistency_plus/ckpt-best.pth. Ensure the weights are mounted into the container.')
     checkpoint_hash = benchmark.sha256_file(checkpoint)
     if args.expected_checkpoint_sha256 and checkpoint_hash != args.expected_checkpoint_sha256.lower():
         raise ValueError('Teacher checkpoint SHA256 differs from the requested identity')
@@ -68,18 +72,20 @@ def make_plan(args):
                     patch_batch=args.patch_batch, cpu_threads=int(config.get('cpu_threads', 8)),
                     teacher_steps=4, teacher_step_size=0.3, teacher_decay=0.95,
                     timing_scope='GPU-resident normalized noisy cloud -> GPU denoised cloud; FPS/KNN/patches/rollout/fusion',
-                    timing_excludes='SOR/surface projection/loading/normalization/H2D/D2H/quality metrics/file I/O/RNG setup',
+                    sor_timing_scope='Same start as inference; extend through D2H, CPU SOR and H2D to GPU output',
+                    sor_timing_pairing='One inference per cloud/repeat; record off and on endpoints on the same clock',
+                    timing_excludes='surface projection/loading/normalization/external H2D-D2H/quality metrics/file I/O/RNG setup',
                     timing_clock='perf_counter_ns with CUDA synchronization before and after',
                     throughput_scope='serial inference-only: total clouds or input points / summed measured intervals',
                     quality_repeat=0, vote_times=1, precision='float32, no autocast',
-                    memory_scope='PyTorch allocator peak including one resident model and input; excludes metric phase',
+                    memory_scope='PyTorch allocator peak through each endpoint; includes one model/input; excludes metrics and CPU SOR RAM',
                     memory_limit_note='The configured memory budget is not a measured peak',
                     latency_std_scope='population SD over all clouds x repeats, not SD of the round means',
                     extra_source_files=list(EXTRA_SOURCES), source_sha256=benchmark.source_hashes(EXTRA_SOURCES))
     if settings['cpu_threads'] < 1:
         raise ValueError('cpu_threads must be positive')
     config_files = [config_path] + ([dataset_path] if dataset_path else [])
-    return dict(schema_version=1, benchmark_mode='teacher4_generalization', settings=settings,
+    return dict(schema_version=2, benchmark_mode='teacher4_generalization', settings=settings,
                 config_files_sha256={str(p): benchmark.sha256_file(p) for p in config_files},
                 variants=[variant], jobs=[scene_job(scene, variant, config) for scene in scenes],
                 ignored_other_noise_directories=ignored)
@@ -98,7 +104,8 @@ def print_plan(plan):
         print('Other noise directories excluded (neither lap nor cov):', flush=True)
         for path in plan['ignored_other_noise_directories']:
             print(f'  {path}', flush=True)
-    print('Six efficiency cases; SOR and metrics are excluded from measured latency.', flush=True)
+    print('Six timing scenes, ten efficiency rows: lap/cov SOR off + on; PCNet off only. '
+          'SOR-on time includes SOR and its CPU/GPU transfers; metrics are excluded.', flush=True)
 
 
 def run_worker(plan_path, index):
@@ -162,7 +169,7 @@ def main():
     benchmark.check_saved_checkpoints(plan)
     stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     root = (args.output_root.expanduser().resolve() if args.output_root else
-            ROOT / 'experiments/efficiency' / f'teacher4_generalization_{stamp}_{os.getpid()}')
+            ROOT / 'experiments/efficiency' / f'teacher4_generalization_sor_{stamp}_{os.getpid()}')
     plan_path = root / 'plan.json'
     if args.resume:
         if benchmark.load_json(plan_path) != plan:

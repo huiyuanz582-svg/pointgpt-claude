@@ -6,6 +6,7 @@ import math
 import os
 from pathlib import Path
 import re
+import statistics
 
 from utils.denoise_benchmark_report import (
     condition_label, read_csv, read_result, summarize, write_csv, write_json)
@@ -127,6 +128,7 @@ def discover_scenes(data_root, *, other_noise_root=None, pcnet_noisy_root=None,
                            clean_root=str(clean_dir.parent), mesh_root=str(mesh_dir.parent),
                            expected_clouds=len(clean), expected_names=sorted(clean),
                            input_files_sha256=hashes, evaluate_sor_both=family != 'pcnet',
+                           measure_sor_efficiency=family != 'pcnet' and (points, noise) in EFFICIENCY_CASES,
                            measure_efficiency=(points, noise) in EFFICIENCY_CASES))
     for family in FAMILIES:
         for points, noise in EFFICIENCY_CASES:
@@ -156,12 +158,39 @@ def verify_inputs(job):
             raise ValueError(f'Point cloud membership changed: {root}')
 
 
+def validate_paired_timings(core, with_sor):
+    """A SOR interval must extend the matching inference interval, not replace it."""
+    index = {(r['name'], int(r['repeat'])): r for r in core}
+    keys = [(r['name'], int(r['repeat'])) for r in with_sor]
+    if len(index) != len(core) or len(set(keys)) != len(keys) or set(keys) != set(index):
+        raise ValueError('SOR and inference timing observations must match one-to-one')
+    for row, key in zip(with_sor, keys):
+        original = index[key]
+        core_ms, total_ms = float(original['latency_ms']), float(row['latency_ms'])
+        if not math.isfinite(total_ms) or not math.isfinite(core_ms) or not 0 < core_ms <= total_ms:
+            raise ValueError('SOR total time must include the entire paired inference interval')
+        if (int(row['allocated_before_bytes']) != int(original['allocated_before_bytes'])
+                or int(row['input_points']) != int(original['input_points'])
+                or any(int(row[k]) < int(original[k])
+                       for k in ('peak_allocated_bytes', 'peak_reserved_bytes'))):
+            raise ValueError('Paired SOR memory/input records are inconsistent')
+    return index
+
+
 def read_sor_result(output, job, manifest):
     import json
     quality = read_csv(output / 'test_metrics_sor.csv')
     saved = json.loads((output / 'summary_sor.json').read_text(encoding='utf-8'))
-    actual = summarize([], quality, job['points'], 0, expected_clouds=job['expected_clouds'],
-                       measure_efficiency=False, allow_filtered_output=True)
+    measured = job.get('measure_sor_efficiency', False)
+    timing = read_csv(output / 'timing_runs_sor.csv') if measured else []
+    actual = summarize(timing, quality, job['points'], manifest['settings']['repeats'],
+                       expected_clouds=job['expected_clouds'],
+                       measure_efficiency=measured, allow_filtered_output=True)
+    if measured:
+        validate_paired_timings(read_csv(output / 'timing_runs.csv'), timing)
+        first_counts = {r['name']: int(r['output_points']) for r in timing if int(r['repeat']) == 0}
+        if any(int(r['output_points']) != first_counts[r['name']] for r in quality):
+            raise ValueError(f'SOR quality must use the actual first timed output: {output}')
     if not saved.get('complete') or saved != dict(complete=True, **actual):
         raise ValueError(f'Incomplete or inconsistent SOR results: {output}')
     if {r['name'] for r in quality} != set(job['expected_names']):
@@ -170,9 +199,9 @@ def read_sor_result(output, job, manifest):
         raise ValueError(f'SOR noise level differs from the plan: {output}')
     protocol = manifest['quality_protocol'].get('sor_comparison', {})
     if protocol != dict(modes=['off', 'on'], same_prediction=True, nb_neighbors=20,
-                        std_ratio=2.0, timing_includes_sor=False):
+                        std_ratio=2.0, timing_includes_sor=measured):
         raise ValueError(f'SOR protocol mismatch: {output}')
-    return actual, quality
+    return actual, quality, timing
 
 
 def validate_result(root, job, settings):
@@ -194,30 +223,42 @@ def build_report(root, plan):
         if not environments:
             environments.append(manifest['environment'])
         output = root / job['variant']['id'] / job['condition']
-        versions = [(False, summary, quality)]
+        core_index = {(r['name'], int(r['repeat'])): r for r in raw_timing}
+        versions = [(False, summary, quality, raw_timing)]
         if job['evaluate_sor_both']:
-            sor_summary, sor_quality = read_sor_result(output, job, manifest)
-            versions.append((True, sor_summary, sor_quality))
-        for sor, stats, cloud_rows in versions:
+            sor_summary, sor_quality, sor_timing = read_sor_result(output, job, manifest)
+            versions.append((True, sor_summary, sor_quality, sor_timing))
+        for sor, stats, cloud_rows, mode_timing in versions:
             row = dict(dataset=job['dataset'], condition=job['condition'], sor_enabled=sor,
                        variant='teacher_4', points=job['points'], noise=job['noise'], steps=4,
                        checkpoint_epoch=manifest['checkpoint_epoch'], parameters=manifest['parameters'],
                        parameters_m=manifest['parameters'] / 1e6,
-                       measure_efficiency=job['measure_efficiency'] and not sor)
+                       measure_efficiency=job['measure_efficiency']
+                       and (not sor or job.get('measure_sor_efficiency', False)),
+                       timing_scope='whole_cloud_inference_plus_sor' if sor else 'whole_cloud_inference')
             row.update({k: v for k, v in stats.items() if k not in ('round_mean_ms', 'complete')})
             measured = row['measure_efficiency']
             row['latency_mean_seconds'] = stats['latency_mean_ms'] / 1000 if measured else None
             row['latency_std_seconds'] = stats['latency_std_ms'] / 1000 if measured else None
             row['latency_mean_std_seconds'] = (
                 f'{row["latency_mean_seconds"]:.3f} ± {row["latency_std_seconds"]:.3f}' if measured else '')
+            row['core_latency_mean_seconds'] = summary['latency_mean_ms'] / 1000 if measured else None
+            row['sor_overhead_mean_seconds'] = (statistics.mean(
+                (float(r['latency_ms']) - float(core_index[(r['name'], int(r['repeat']))]['latency_ms'])) / 1000
+                for r in mode_timing) if measured else None)
             rows.append(row)
             per_cloud.extend(dict(dataset=job['dataset'], condition=job['condition'],
                                   sor_enabled=sor, variant='teacher_4', **q) for q in cloud_rows)
-        timings.extend(dict(dataset=job['dataset'], condition=job['condition'],
-                            variant='teacher_4', sor_in_timing=False, **r) for r in raw_timing)
+            for observation in mode_timing:
+                core_ms = float(core_index[(observation['name'], int(observation['repeat']))]['latency_ms'])
+                timings.append(dict(dataset=job['dataset'], condition=job['condition'],
+                                    variant='teacher_4', sor_enabled=sor, sor_in_timing=sor,
+                                    core_latency_ms=core_ms,
+                                    sor_overhead_ms=float(observation['latency_ms']) - core_ms, **observation))
     efficiency = [r for r in rows if r['measure_efficiency']]
-    if len(efficiency) != len(FAMILIES) * len(EFFICIENCY_CASES):
-        raise ValueError('Expected exactly six efficiency results')
+    expected_efficiency = 10 if plan.get('schema_version', 1) >= 2 else 6
+    if len(efficiency) != expected_efficiency:
+        raise ValueError(f'Expected exactly {expected_efficiency} efficiency results')
     write_csv(root / 'summary.csv', rows)
     write_csv(root / 'efficiency.csv', efficiency)
     write_csv(root / 'per_cloud.csv', per_cloud)
@@ -226,7 +267,9 @@ def build_report(root, plan):
                                           environment=environments[0], results=rows))
     lines = ['# Teacher4 generalization', '',
              'CD/P2M are scaled by 1e4 (lower is better). SOR on/off share the same prediction.',
-             'Efficiency is pure inference, excluding SOR/metrics/I/O; ± is the population SD of all timed clouds.',
+             'SOR-off: whole-cloud inference. SOR-on: inference + SOR including its CPU/GPU transfers.',
+             'Metrics/I/O/external transfers are excluded. ± is the population SD of all measured total intervals.',
+             'SOR GPU peaks do not include CPU memory used by Open3D.',
              'No Teacher10 is measured in this run; no speedup is inferred.', '',
              '| Dataset | Scene | SOR | Clouds | CD | P2M | Seconds/cloud | Peak allocated GiB |',
              '|---|---|---|---:|---:|---:|---:|---:|']
