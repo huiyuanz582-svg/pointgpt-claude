@@ -197,6 +197,9 @@ def load_checkpoint(torch, path):
 
 
 def validate_student(saved, variant):
+    if variant.get('checkpoint_validation') == 'fixed_10to4':
+        validate_fixed_student(saved, variant)
+        return
     manifest = variant['training_manifest']
     config = manifest['config']
     if (saved.get('epoch') != variant['epoch'] or saved.get('distillation') != SCHEDULE
@@ -215,6 +218,39 @@ def validate_student(saved, variant):
             raise ValueError(f'Checkpoint provenance mismatch: {name}')
     if saved.get('teacher_checkpoint') != manifest['checkpoint']:
         raise ValueError('Checkpoint and recorded Teacher differ')
+
+
+def validate_fixed_student(saved, variant):
+    """Validate the two frozen Student checkpoints without requiring moved logs."""
+    if (saved.get('distillation') != SCHEDULE
+            or saved.get('model_config') != variant['model_config']
+            or saved.get('epoch') != variant['expected_epoch']
+            or saved.get('best_epoch') != variant['expected_epoch']):
+        raise ValueError(f'{variant["id"]}: checkpoint model/schedule/selected epoch mismatch')
+    selection = saved.get('selection') or {}
+    score = selection.get('value')
+    if (selection.get('metric') != 'val_rollout_score'
+            or not isinstance(score, (int, float)) or not math.isfinite(score)):
+        raise ValueError(f'{variant["id"]}: missing finite best-checkpoint selection')
+    weights = saved.get('model')
+    if weights is None:
+        weights = saved.get('base_model')
+    if not weights or not any(k.replace('module.', '').startswith('step_condition.') for k in weights):
+        raise ValueError(f'{variant["id"]}: Student checkpoint has no trained step condition')
+    if variant['id'] == 'student_baseline':
+        # The saver deliberately omits the default teacher-forced input metadata.
+        training_input = saved.get('training_input') or {'type': 'teacher_forced'}
+        if (saved.get('teacher_endpoint') is not None or saved.get('endpoint_finetune') is not None
+                or training_input.get('type') != 'teacher_forced'):
+            raise ValueError('Ordinary distillation requires teacher-forced local training only')
+    elif variant['id'] == LOCAL_ENDPOINT_STUDENT:
+        protocol = saved.get('endpoint_finetune_protocol') or {}
+        finetune = saved.get('endpoint_finetune') or {}
+        if (protocol.get('objective') != 'local_endpoint'
+                or finetune.get('local_weight') != 1.0 or finetune.get('endpoint_weight') != 1.0):
+            raise ValueError('The method requires the frozen joint local + endpoint Student4')
+    else:
+        raise ValueError(f'Unsupported frozen Student role: {variant["id"]}')
 
 
 def check_saved_checkpoints(plan):

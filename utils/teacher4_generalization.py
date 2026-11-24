@@ -1,4 +1,4 @@
-"""CPU-only discovery and reporting for the manual Teacher4 evaluation suite."""
+"""CPU-only discovery and reporting for the manual generalization suites."""
 
 import copy
 import hashlib
@@ -214,15 +214,45 @@ def validate_result(root, job, settings):
     return result
 
 
+def validate_comparison_jobs(plan):
+    """Require the same complete data/measurement grid for all three models."""
+    expected = {'teacher_10': ('teacher', 10), 'student_baseline': ('student', 4),
+                'student_local_endpoint': ('student', 4)}
+    variants = plan['variants']
+    if (plan.get('schema_version') != 3 or len(variants) != 3
+            or {v['id']: (v['kind'], v['steps']) for v in variants} != expected):
+        raise ValueError('Comparison requires schema 3 and Teacher10 / Vanilla4 / Method4')
+    grids = {name: {} for name in expected}
+    for job in plan['jobs']:
+        name = job['variant']['id']
+        if name not in grids or job['condition'] in grids[name]:
+            raise ValueError('Duplicate or unexpected model/scene job')
+        if job['variant'] != next(v for v in variants if v['id'] == name):
+            raise ValueError('Job checkpoint differs from the selected model')
+        grids[name][job['condition']] = {k: v for k, v in job.items() if k != 'variant'}
+    reference = grids['teacher_10']
+    if not reference or any(grid != reference for grid in grids.values()):
+        raise ValueError('All models must evaluate identical data, configs and SOR/efficiency scenes')
+
+
 def build_report(root, plan):
+    comparison = plan.get('benchmark_mode') == 'generalization_comparison'
+    if comparison:
+        validate_comparison_jobs(plan)
     rows, per_cloud, timings, environments = [], [], [], []
+    shared_inputs = {}
     for job in plan['jobs']:
         summary, manifest, quality, raw_timing = validate_result(root, job, plan['settings'])
+        fingerprints = manifest['input_sha256'], manifest['mesh_sha256']
+        if shared_inputs.setdefault(job['condition'], fingerprints) != fingerprints:
+            raise ValueError(f'Input/mesh data changed across models: {job["condition"]}')
         if environments and manifest['environment'] != environments[0]:
             raise ValueError('Hardware/software/precision settings changed between jobs')
         if not environments:
             environments.append(manifest['environment'])
         output = root / job['variant']['id'] / job['condition']
+        variant_id = job['variant']['id']
+        steps = job['variant'].get('steps', 4)
         core_index = {(r['name'], int(r['repeat'])): r for r in raw_timing}
         versions = [(False, summary, quality, raw_timing)]
         if job['evaluate_sor_both']:
@@ -230,7 +260,7 @@ def build_report(root, plan):
             versions.append((True, sor_summary, sor_quality, sor_timing))
         for sor, stats, cloud_rows, mode_timing in versions:
             row = dict(dataset=job['dataset'], condition=job['condition'], sor_enabled=sor,
-                       variant='teacher_4', points=job['points'], noise=job['noise'], steps=4,
+                       variant=variant_id, points=job['points'], noise=job['noise'], steps=steps,
                        checkpoint_epoch=manifest['checkpoint_epoch'], parameters=manifest['parameters'],
                        parameters_m=manifest['parameters'] / 1e6,
                        measure_efficiency=job['measure_efficiency']
@@ -248,34 +278,55 @@ def build_report(root, plan):
                 for r in mode_timing) if measured else None)
             rows.append(row)
             per_cloud.extend(dict(dataset=job['dataset'], condition=job['condition'],
-                                  sor_enabled=sor, variant='teacher_4', **q) for q in cloud_rows)
+                                  sor_enabled=sor, variant=variant_id, **q) for q in cloud_rows)
             for observation in mode_timing:
                 core_ms = float(core_index[(observation['name'], int(observation['repeat']))]['latency_ms'])
                 timings.append(dict(dataset=job['dataset'], condition=job['condition'],
-                                    variant='teacher_4', sor_enabled=sor, sor_in_timing=sor,
+                                    variant=variant_id, sor_enabled=sor, sor_in_timing=sor,
                                     core_latency_ms=core_ms,
                                     sor_overhead_ms=float(observation['latency_ms']) - core_ms, **observation))
     efficiency = [r for r in rows if r['measure_efficiency']]
-    expected_efficiency = 10 if plan.get('schema_version', 1) >= 2 else 6
-    if len(efficiency) != expected_efficiency:
-        raise ValueError(f'Expected exactly {expected_efficiency} efficiency results')
+    variant_ids = {v['id'] for v in plan.get('variants', ())} or {j['variant']['id'] for j in plan['jobs']}
+    expected_per_variant = 10 if plan.get('schema_version', 1) >= 2 else 6
+    expected_efficiency = expected_per_variant * len(variant_ids)
+    if (len(efficiency) != expected_efficiency
+            or any(sum(r['variant'] == name for r in efficiency) != expected_per_variant
+                   for name in variant_ids)):
+        raise ValueError(f'Expected exactly {expected_per_variant} efficiency results per model '
+                         f'({expected_efficiency} total)')
+    keys = [(r['variant'], r['condition'], r['sor_enabled']) for r in rows]
+    if len(set(keys)) != len(keys):
+        raise ValueError('Duplicate model/scene/SOR results')
     write_csv(root / 'summary.csv', rows)
     write_csv(root / 'efficiency.csv', efficiency)
     write_csv(root / 'per_cloud.csv', per_cloud)
     write_csv(root / 'timing_runs.csv', timings)
     write_json(root / 'summary.json', dict(complete=True, settings=plan['settings'],
                                           environment=environments[0], results=rows))
-    lines = ['# Teacher4 generalization', '',
+    if comparison:
+        grouped = {}
+        for row in rows:
+            key = row['condition'], row['sor_enabled']
+            if key not in grouped:
+                grouped[key] = {k: row[k] for k in ('dataset', 'condition', 'points', 'noise',
+                                                    'sor_enabled', 'clouds')}
+            for field in ('cd_x1e4', 'p2m_x1e4', 'latency_mean_seconds', 'latency_std_seconds',
+                          'latency_mean_std_seconds', 'parameters_m', 'peak_allocated_gib',
+                          'peak_reserved_gib'):
+                grouped[key][f'{row["variant"]}_{field}'] = row[field]
+        write_csv(root / 'comparison.csv', list(grouped.values()))
+    lines = ['# ' + ('Teacher10 / Vanilla / Method generalization' if comparison else 'Teacher4 generalization'), '',
              'CD/P2M are scaled by 1e4 (lower is better). SOR on/off share the same prediction.',
              'SOR-off: whole-cloud inference. SOR-on: inference + SOR including its CPU/GPU transfers.',
              'Metrics/I/O/external transfers are excluded. ± is the population SD of all measured total intervals.',
              'SOR GPU peaks do not include CPU memory used by Open3D.',
-             'No Teacher10 is measured in this run; no speedup is inferred.', '',
-             '| Dataset | Scene | SOR | Clouds | CD | P2M | Seconds/cloud | Peak allocated GiB |',
-             '|---|---|---|---:|---:|---:|---:|---:|']
+             'Each model/scene runs in a fresh sequential process; no cross-run speedup is inferred.', '',
+             '| Dataset | Scene | Model | Steps | SOR | Clouds | CD | P2M | Seconds/cloud | Peak allocated GiB |',
+             '|---|---|---|---:|---|---:|---:|---:|---:|---:|']
     for row in rows:
         peak = f'{row["peak_allocated_gib"]:.4f}' if row['measure_efficiency'] else '—'
         lines.append(f'| {row["dataset"]} | {row["points"]}, {row["noise"]:.1%} | '
+                     f'{row["variant"]} | {row["steps"]} | '
                      f'{"on" if row["sor_enabled"] else "off"} | {row["clouds"]} | '
                      f'{row["cd_x1e4"]:.4f} | {row["p2m_x1e4"]:.4f} | '
                      f'{row["latency_mean_std_seconds"] or "—"} | {peak} |')

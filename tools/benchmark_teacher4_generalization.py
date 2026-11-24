@@ -50,7 +50,7 @@ def load_config(path, patch_batch):
     return config, dataset_path
 
 
-def make_plan(args):
+def make_plan(args, teacher_steps=4, extra_sources=EXTRA_SOURCES):
     config_path = args.config.expanduser().resolve()
     config, dataset_path = load_config(config_path, args.patch_batch)
     checkpoint = args.teacher_ckpt.expanduser().resolve()
@@ -66,11 +66,11 @@ def make_plan(args):
     scenes, ignored = discover_scenes(
         args.data_root, other_noise_root=args.other_noise_root, pcnet_noisy_root=args.pcnet_noisy_root,
         punet_root=args.punet_root, pcnet_root=args.pcnet_root)
-    variant = dict(id='teacher_4', kind='teacher', steps=4, checkpoint=str(checkpoint),
+    variant = dict(id=f'teacher_{teacher_steps}', kind='teacher', steps=teacher_steps, checkpoint=str(checkpoint),
                    checkpoint_sha256=checkpoint_hash)
     settings = dict(seed=args.seed, device=args.device, repeats=args.repeats, warmup=args.warmup,
                     patch_batch=args.patch_batch, cpu_threads=int(config.get('cpu_threads', 8)),
-                    teacher_steps=4, teacher_step_size=0.3, teacher_decay=0.95,
+                    teacher_steps=teacher_steps, teacher_step_size=0.3, teacher_decay=0.95,
                     timing_scope='GPU-resident normalized noisy cloud -> GPU denoised cloud; FPS/KNN/patches/rollout/fusion',
                     sor_timing_scope='Same start as inference; extend through D2H, CPU SOR and H2D to GPU output',
                     sor_timing_pairing='One inference per cloud/repeat; record off and on endpoints on the same clock',
@@ -81,7 +81,7 @@ def make_plan(args):
                     memory_scope='PyTorch allocator peak through each endpoint; includes one model/input; excludes metrics and CPU SOR RAM',
                     memory_limit_note='The configured memory budget is not a measured peak',
                     latency_std_scope='population SD over all clouds x repeats, not SD of the round means',
-                    extra_source_files=list(EXTRA_SOURCES), source_sha256=benchmark.source_hashes(EXTRA_SOURCES))
+                    extra_source_files=list(extra_sources), source_sha256=benchmark.source_hashes(extra_sources))
     if settings['cpu_threads'] < 1:
         raise ValueError('cpu_threads must be positive')
     config_files = [config_path] + ([dataset_path] if dataset_path else [])
@@ -92,9 +92,11 @@ def make_plan(args):
 
 
 def print_plan(plan):
-    print('Teacher4: step_size=0.3, decay=0.95, no training, no surface projection', flush=True)
+    print('Models: ' + ', '.join(f'{v["id"]} ({v["steps"]} steps)' for v in plan['variants']), flush=True)
+    print('Teacher step_size=0.3, decay=0.95; no training or surface projection', flush=True)
     for family in FAMILIES:
-        jobs = [j for j in plan['jobs'] if j['dataset'] == family]
+        jobs = [j for j in plan['jobs'] if j['dataset'] == family
+                and j['variant']['id'] == plan['variants'][0]['id']]
         print(f'{family}: {len(jobs)} scenes; SOR={"off" if family == "pcnet" else "off + on"}', flush=True)
         for job in jobs:
             mode = 'quality + efficiency' if job['measure_efficiency'] else 'quality only'
@@ -104,8 +106,11 @@ def print_plan(plan):
         print('Other noise directories excluded (neither lap nor cov):', flush=True)
         for path in plan['ignored_other_noise_directories']:
             print(f'  {path}', flush=True)
-    print('Six timing scenes, ten efficiency rows: lap/cov SOR off + on; PCNet off only. '
+    print(f'Six timing scenes per model, {10 * len(plan["variants"])} efficiency rows: '
+          'lap/cov SOR off + on; PCNet off only. '
           'SOR-on time includes SOR and its CPU/GPU transfers; metrics are excluded.', flush=True)
+    quality_rows = sum(2 if job['evaluate_sor_both'] else 1 for job in plan['jobs'])
+    print(f'Total: {len(plan["jobs"])} model/scene jobs, {quality_rows} quality rows.', flush=True)
 
 
 def run_worker(plan_path, index):
@@ -114,14 +119,14 @@ def run_worker(plan_path, index):
     variant = job['variant']
     verify_inputs(job)
     if benchmark.sha256_file(variant['checkpoint']) != variant['checkpoint_sha256']:
-        raise ValueError('Teacher checkpoint changed after planning')
+        raise ValueError('Model checkpoint changed after planning')
     benchmark.worker(plan_path, index)
     verify_inputs(job)
     if benchmark.sha256_file(variant['checkpoint']) != variant['checkpoint_sha256']:
-        raise ValueError('Teacher checkpoint changed during evaluation')
+        raise ValueError('Model checkpoint changed during evaluation')
 
 
-def main():
+def argument_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--teacher_ckpt', type=Path)
     parser.add_argument('--data_root', type=Path, default=ROOT / 'data')
@@ -142,25 +147,10 @@ def main():
     parser.add_argument('--report_only', type=Path, help='Rebuild tables/ZIP from completed records; no model')
     parser.add_argument('--worker_plan', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--job_index', type=int, help=argparse.SUPPRESS)
-    args = parser.parse_args()
-    os.chdir(ROOT)
-    if args.worker_plan:
-        if args.job_index is None:
-            parser.error('--worker_plan requires --job_index')
-        run_worker(args.worker_plan.resolve(), args.job_index)
-        return
-    if args.report_only:
-        root = args.report_only.expanduser().resolve()
-        build_report(root, benchmark.load_json(root / 'plan.json'))
-        benchmark.package(root)
-        return
-    if args.teacher_ckpt is None:
-        parser.error('--teacher_ckpt must point to the original Teacher weight file')
-    if not 0 <= args.seed < 2 ** 32 or args.device < 0 or min(args.patch_batch, args.warmup, args.repeats) < 1:
-        parser.error('Require uint32 seed, nonnegative device and positive patch_batch/warmup/repeats')
-    if args.resume and args.output_root is None:
-        parser.error('--resume requires the existing --output_root')
-    plan = make_plan(args)
+    return parser
+
+
+def execute_plan(args, plan, script_path, output_prefix, protocol_path):
     print_plan(plan)
     if args.plan_only:
         return
@@ -169,7 +159,7 @@ def main():
     benchmark.check_saved_checkpoints(plan)
     stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     root = (args.output_root.expanduser().resolve() if args.output_root else
-            ROOT / 'experiments/efficiency' / f'teacher4_generalization_sor_{stamp}_{os.getpid()}')
+            ROOT / 'experiments/efficiency' / f'{output_prefix}_{stamp}_{os.getpid()}')
     plan_path = root / 'plan.json'
     if args.resume:
         if benchmark.load_json(plan_path) != plan:
@@ -188,17 +178,17 @@ def main():
             target = root / 'configs' / f'{index}_{Path(path).name}'
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(path, target)
-        shutil.copyfile(ROOT / 'docs/teacher4_generalization.md', root / 'measurement_protocol.md')
+        shutil.copyfile(ROOT / protocol_path, root / 'measurement_protocol.md')
     print(f'RESULT_ROOT={root}', flush=True)
     environment = None
     for index, job in enumerate(plan['jobs']):
         output = root / job['variant']['id'] / job['condition']
         complete = (output / 'summary.json').is_file()
         if args.resume and complete:
-            print(f'[resume] {job["condition"]}', flush=True)
+            print(f'[resume] {job["variant"]["id"]}/{job["condition"]}', flush=True)
         else:
             output.mkdir(parents=True, exist_ok=True)
-            command = [sys.executable, '-u', str(Path(__file__).resolve()), '--worker_plan', str(plan_path),
+            command = [sys.executable, '-u', str(Path(script_path).resolve()), '--worker_plan', str(plan_path),
                        '--job_index', str(index)]
             with (output / 'run.log').open('w', encoding='utf-8') as log:
                 process = subprocess.Popen(command, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -219,11 +209,35 @@ def main():
         if environment is not None and environment != manifest['environment']:
             raise ValueError('Hardware/software/precision settings changed between jobs')
         environment = manifest['environment']
-    variant = plan['variants'][0]
-    if benchmark.sha256_file(variant['checkpoint']) != variant['checkpoint_sha256']:
-        raise ValueError('Teacher checkpoint changed during the suite')
+    for variant in plan['variants']:
+        if benchmark.sha256_file(variant['checkpoint']) != variant['checkpoint_sha256']:
+            raise ValueError(f'Model checkpoint changed during the suite: {variant["id"]}')
     build_report(root, plan)
     benchmark.package(root)
+
+
+def main():
+    parser = argument_parser()
+    args = parser.parse_args()
+    os.chdir(ROOT)
+    if args.worker_plan:
+        if args.job_index is None:
+            parser.error('--worker_plan requires --job_index')
+        run_worker(args.worker_plan.resolve(), args.job_index)
+        return
+    if args.report_only:
+        root = args.report_only.expanduser().resolve()
+        build_report(root, benchmark.load_json(root / 'plan.json'))
+        benchmark.package(root)
+        return
+    if args.teacher_ckpt is None:
+        parser.error('--teacher_ckpt must point to the original Teacher weight file')
+    if not 0 <= args.seed < 2 ** 32 or args.device < 0 or min(args.patch_batch, args.warmup, args.repeats) < 1:
+        parser.error('Require uint32 seed, nonnegative device and positive patch_batch/warmup/repeats')
+    if args.resume and args.output_root is None:
+        parser.error('--resume requires the existing --output_root')
+    execute_plan(args, make_plan(args), __file__, 'teacher4_generalization_sor',
+                 'docs/teacher4_generalization.md')
 
 
 if __name__ == '__main__':
